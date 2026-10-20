@@ -1,9 +1,11 @@
 from langchain_ollama import ChatOllama
-from config import OLLAMA_MODEL, OLLAMA_BASE_URL, MIN_CONFIDENCE, MAX_RISK_PER_TRADE
+from config import OLLAMA_MODEL, OLLAMA_BASE_URL, OLLAMA_API_KEY
+from settings import get_all_settings
 from state import TradingState
 import json, re
 
-llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1)
+_llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1, headers=_llm_headers)
 
 def analyst_agent(state: TradingState) -> dict:
     data = state["market_data"]
@@ -26,36 +28,51 @@ def analyst_agent(state: TradingState) -> dict:
 def risk_manager_agent(state: TradingState) -> dict:
     analyst = state["analyst_report"]
     data = state["market_data"]
+    settings = get_all_settings()
+    min_conf = settings["min_confidence"]
+    max_risk = settings["max_risk_per_trade"]
 
-    if analyst.get("confidence", 0) < MIN_CONFIDENCE:
-        return {"risk_report": {"approved": False, "veto": True, "reason": f"ثقة أقل من {MIN_CONFIDENCE}"}, "logs": ["مدير المخاطر: فيتو (ثقة منخفضة)"]}
+    if analyst.get("confidence", 0) < min_conf:
+        return {"risk_report": {"approved": False, "veto": True,
+            "reason": f"ثقة ({analyst.get('confidence', 0):.2f}) < حد ({min_conf:.2f})"},
+            "logs": [f"مدير المخاطر: فيتو — ثقة أقل من {min_conf:.2f}"]}
 
     rsi = data.get("rsi14", 50)
     sma20, sma50 = data.get("sma20", 0), data.get("sma50", 0)
     last = data.get("last_close", 0)
 
     if analyst.get("signal") == "BUY" and (rsi > 75 or (sma20 < sma50 and last < sma50)):
-        return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر شراء مرتفعة (RSI/اتجاه)"}, "logs": ["مدير المخاطر: فيتو (مخاطر شراء)"]}
+        return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر شراء مرتفعة"},
+                "logs": ["مدير المخاطر: فيتو (RSI/اتجاه)"]}
     if analyst.get("signal") == "SELL" and rsi < 25:
-        return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر بيع مرتفعة (RSI)"}, "logs": ["مدير المخاطر: فيتو (مخاطر بيع)"]}
+        return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر بيع مرتفعة"},
+                "logs": ["مدير المخاطر: فيتو (RSI)"]}
 
-    risk_amount = 10000 * MAX_RISK_PER_TRADE
+    risk_amount = 10000 * max_risk
     stop_distance = last * 0.02
     pos_size = max(1, int(risk_amount / stop_distance)) if stop_distance > 0 else 0
-    report = {"approved": True, "veto": False, "position_size": pos_size, "stop_loss": round(last * 0.98, 2), "take_profit": round(last * 1.04, 2)}
+    report = {"approved": True, "veto": False, "position_size": pos_size,
+              "stop_loss": round(last * 0.98, 2), "take_profit": round(last * 1.04, 2)}
     return {"risk_report": report, "logs": [f"مدير المخاطر: موافقة (حجم={pos_size})"]}
 
 def portfolio_manager_agent(state: TradingState) -> dict:
     risk = state["risk_report"]
     if risk.get("veto") or not risk.get("approved"):
-        return {"final_decision": "VETO" if risk.get("veto") else "HOLD", "consensus_reached": False, "logs": ["مدير المحفظة: لا تنفيذ (فيتو/رفض)"]}
+        return {"final_decision": "VETO" if risk.get("veto") else "HOLD",
+                "consensus_reached": False, "logs": ["مدير المحفظة: لا تنفيذ"]}
 
     signal = state["analyst_report"].get("signal", "HOLD")
     decision = {"BUY": "EXECUTE_BUY", "SELL": "EXECUTE_SELL"}.get(signal, "HOLD")
     order = None
     if decision.startswith("EXECUTE"):
-        order = {"symbol": state["symbol"], "side": "buy" if decision == "EXECUTE_BUY" else "sell", "qty": risk.get("position_size", 1), "stop_loss": risk.get("stop_loss"), "take_profit": risk.get("take_profit")}
-    return {"final_decision": decision, "order_details": order, "consensus_reached": decision != "HOLD", "logs": [f"مدير المحفظة: {decision} (إجماع مكتمل)"]}
+        order = {"symbol": state["symbol"],
+                 "side": "buy" if decision == "EXECUTE_BUY" else "sell",
+                 "qty": risk.get("position_size", 1),
+                 "stop_loss": risk.get("stop_loss"),
+                 "take_profit": risk.get("take_profit")}
+    return {"final_decision": decision, "order_details": order,
+            "consensus_reached": decision != "HOLD",
+            "logs": [f"مدير المحفظة: {decision}"]}
 
 def _parse_json(text: str) -> dict:
     try:
