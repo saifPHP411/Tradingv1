@@ -104,7 +104,7 @@ def compute_regime_at(spy_df: pd.DataFrame, ts) -> dict:
 
 
 def compute_score(indicators: dict, regime: dict) -> int:
-    """Composite signal score 0-100, matching live signals.py logic."""
+    """Composite signal score 0-100."""
     trend = 0
     if indicators["ema20"] > indicators["ema50"]:
         trend += 12
@@ -188,16 +188,12 @@ def simulate(
     df: pd.DataFrame,
     spy_df: pd.DataFrame | None,
     start_equity: float = 10000.0,
-    trailing_activation_pct: float = 5.0,   # ← معدّل: كان 2.0
-    trailing_distance_pct: float = 3.0,     # ← معدّل: كان 1.5
+    trailing_activation_pct: float = 5.0,
+    trailing_distance_pct: float = 3.0,
     max_hold_bars: int = 60,
 ) -> dict:
     """
     Candle-by-candle simulation with realistic fills, fees, slippage.
-
-    Entry: at NEXT bar's open + slippage (realistic)
-    Exit: intrabar check (SL first if both hit — conservative)
-    Trailing: activates at +X% profit, moves stop Y% below highest close
     """
     equity = start_equity
     equity_curve = []
@@ -259,7 +255,6 @@ def simulate(
             exit_reason = None
             exit_price = None
 
-            # Check SL first (conservative — worse assumption)
             if low <= position.stop:
                 exit_price = position.stop
                 exit_reason = "STOP"
@@ -267,12 +262,10 @@ def simulate(
                     exit_price = open_p
                     exit_reason = "STOP_GAP"
 
-            # Then TP (only if SL not hit this bar)
             elif high >= position.target:
                 exit_price = position.target
                 exit_reason = "TARGET"
 
-            # Max hold time
             elif position.bars_held >= max_hold_bars:
                 exit_price = close
                 exit_reason = "MAX_HOLD"
@@ -301,7 +294,6 @@ def simulate(
                 position = None
 
             else:
-                # Update trailing stop (only if in profit)
                 if close > position.highest_close:
                     position.highest_close = close
 
@@ -312,7 +304,7 @@ def simulate(
                     if new_stop > position.stop:
                         position.stop = new_stop
 
-        # ---- 3) Look for new signals (if no position, no pending) ----
+        # ---- 3) Look for new signals ----
         if position is None and pending_entry is None:
             ind = compute_indicators_at(df, i)
             if ind is None:
@@ -322,17 +314,23 @@ def simulate(
             regime = compute_regime_at(spy_df, ts)
             score = compute_score(ind, regime)
 
-            if score >= MIN_SIGNAL_SCORE and regime["regime"] != "BEAR":
+            # ⚠️ تعديل الخيار ب: فلتر اتجاه قوي إضافي
+            strong_uptrend = (
+                ind["last_close"] > ind["ema20"] and
+                ind["ema20"] > ind["ema50"] and
+                ind["adx"] > 25
+            )
+
+            if score >= MIN_SIGNAL_SCORE and regime["regime"] != "BEAR" and strong_uptrend:
                 atr = ind["atr14"]
                 stop_dist = atr * STOP_ATR_MULTIPLIER
                 target_dist = stop_dist * TAKE_PROFIT_RR
 
-                if stop_dist > 0 and stop_dist < close * 0.15:
+                if stop_dist > 0 and stop_dist < close * 0.20:  # سقف 20% للـStop الواسع
                     risk_mult = regime.get("size_multiplier", 1.0)
                     risk_amount = equity * MAX_RISK_PER_TRADE * risk_mult
                     qty = risk_amount / stop_dist
 
-                    # Cap by position %
                     max_notional = equity * MAX_POSITION_PCT
                     if qty * close > max_notional:
                         qty = max_notional / close
@@ -377,4 +375,4 @@ def simulate(
         "end_equity": round(equity, 2),
         "trades": trades,
         "equity_curve": equity_curve,
-    }
+                }
