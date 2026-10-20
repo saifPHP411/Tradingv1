@@ -88,11 +88,15 @@
     </div>
     <div>
       <label class="text-xs text-slate-400 block mb-1">الرموز (مفصولة بفاصلة)</label>
-      <input type="text" id="symbols" value="AAPL,MSFT,NVDA">
+      <input type="text" id="symbols" value="AAPL,NVDA,AMD,ASML,CRM,PANW,TSLA,JNJ,LLY,AMZN">
     </div>
     <div>
       <label class="text-xs text-slate-400 block mb-1">فاصل الدورة (دقائق)</label>
-      <input type="number" id="cycleInterval" min="1" max="120" value="5">
+      <input type="number" id="cycleInterval" min="1" max="120" value="15">
+    </div>
+    <div>
+      <label class="text-xs text-slate-400 block mb-1">رأس المال المخصص للتداول ($) — 0 = رصيد الحساب</label>
+      <input type="number" id="tradingCapital" min="0" step="100" value="0" placeholder="0">
     </div>
     <div class="flex items-center justify-between pt-2 border-t border-slate-700/50">
       <div>
@@ -256,6 +260,7 @@ async function loadSettings() {
     document.getElementById('maxRisk').value = s.max_risk_per_trade;
     document.getElementById('symbols').value = s.symbols.join(',');
     document.getElementById('cycleInterval').value = s.cycle_interval_minutes;
+    document.getElementById('tradingCapital').value = s.trading_capital;
   } catch(e) { console.error(e); }
 }
 
@@ -264,7 +269,8 @@ async function saveSettings() {
     min_confidence: parseFloat(document.getElementById('minConfidence').value),
     max_risk_per_trade: parseFloat(document.getElementById('maxRisk').value),
     symbols: document.getElementById('symbols').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),
-    cycle_interval_minutes: parseInt(document.getElementById('cycleInterval').value)
+    cycle_interval_minutes: parseInt(document.getElementById('cycleInterval').value),
+    trading_capital: parseFloat(document.getElementById('tradingCapital').value) || 0,
   };
   try {
     await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
