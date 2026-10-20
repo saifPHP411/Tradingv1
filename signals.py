@@ -15,7 +15,6 @@ def fetch_ohlcv(symbol: str, period: str = "6mo"):
 
 
 def compute_rsi_wilder(closes: np.ndarray, period: int = 14):
-    """Proper Wilder RSI using EMA-style smoothing."""
     if len(closes) < period + 1:
         return None
     deltas = np.diff(closes)
@@ -33,7 +32,6 @@ def compute_rsi_wilder(closes: np.ndarray, period: int = 14):
 
 
 def compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14):
-    """True ATR using Wilder smoothing."""
     if len(closes) < period + 1:
         return None
     tr = []
@@ -59,6 +57,92 @@ def compute_ema(closes, period):
     if len(closes) < period:
         return None
     return float(pd.Series(closes).ewm(span=period, adjust=False).mean().iloc[-1])
+
+
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    """Returns (macd_line, signal_line, histogram) for last bar."""
+    if len(closes) < slow + signal:
+        return None, None, None
+    s = pd.Series(closes)
+    ema_fast = s.ewm(span=fast, adjust=False).mean()
+    ema_slow = s.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - sig
+    return float(macd.iloc[-1]), float(sig.iloc[-1]), float(hist.iloc[-1])
+
+
+def compute_bollinger(closes, period=20, num_std=2):
+    """Returns (%B position, bandwidth) for last bar."""
+    if len(closes) < period:
+        return None, None
+    s = pd.Series(closes)
+    mid = s.rolling(period).mean()
+    std = s.rolling(period).std()
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    last_price = closes[-1]
+    u = upper.iloc[-1]
+    l = lower.iloc[-1]
+    if u == l or pd.isna(u) or pd.isna(l):
+        return None, None
+    pct_b = (last_price - l) / (u - l)
+    bandwidth = ((u - l) / mid.iloc[-1]) * 100 if mid.iloc[-1] > 0 else 0
+    return float(pct_b), float(bandwidth)
+
+
+def compute_adx(highs, lows, closes, period=14):
+    """ADX for trend strength. >25 = strong trend."""
+    if len(closes) < period * 2:
+        return None
+    plus_dm = []
+    minus_dm = []
+    tr_list = []
+    for i in range(1, len(closes)):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    plus_dm = np.array(plus_dm, dtype=float)
+    minus_dm = np.array(minus_dm, dtype=float)
+    tr_arr = np.array(tr_list, dtype=float)
+
+    def smooth(arr):
+        s = np.zeros_like(arr)
+        s[period - 1] = np.sum(arr[:period])
+        for i in range(period, len(arr)):
+            s[i] = s[i - 1] - (s[i - 1] / period) + arr[i]
+        return s
+
+    tr_s = smooth(tr_arr)
+    plus_di = 100 * smooth(plus_dm) / np.where(tr_s > 0, tr_s, 1)
+    minus_di = 100 * smooth(minus_dm) / np.where(tr_s > 0, tr_s, 1)
+    dx = 100 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) > 0, plus_di + minus_di, 1)
+
+    adx_arr = np.zeros_like(dx)
+    adx_arr[period - 1] = np.mean(dx[:period])
+    for i in range(period, len(dx)):
+        adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
+
+    return float(adx_arr[-1])
+
+
+def compute_stochastic(highs, lows, closes, period=14, smooth=3):
+    """Returns (%K, %D) for last bar."""
+    if len(closes) < period + smooth:
+        return None, None
+    s_h = pd.Series(highs)
+    s_l = pd.Series(lows)
+    s_c = pd.Series(closes)
+    hh = s_h.rolling(period).max()
+    ll = s_l.rolling(period).min()
+    k_raw = 100 * (s_c - ll) / (hh - ll).replace(0, np.nan)
+    k = k_raw.rolling(smooth).mean()
+    d = k.rolling(smooth).mean()
+    return float(k.iloc[-1]), float(d.iloc[-1])
 
 
 def validate_ohlcv(df) -> tuple[bool, str]:
@@ -88,7 +172,6 @@ def validate_ohlcv(df) -> tuple[bool, str]:
 
 
 def compute_all_indicators(symbol: str):
-    """Returns complete indicator dict or None if data invalid."""
     df = fetch_ohlcv(symbol)
     ok, reason = validate_ohlcv(df)
     if not ok:
@@ -106,8 +189,12 @@ def compute_all_indicators(symbol: str):
     sma50 = compute_sma(closes, 50)
     ema20 = compute_ema(closes, 20)
     ema50 = compute_ema(closes, 50)
+    macd_line, macd_sig, macd_hist = compute_macd(closes)
+    pct_b, bb_bandwidth = compute_bollinger(closes)
+    adx = compute_adx(highs, lows, closes)
+    k, d = compute_stochastic(highs, lows, closes)
 
-    if any(v is None for v in [rsi, atr, sma20, sma50, ema20, ema50]):
+    if any(v is None for v in [rsi, atr, sma20, sma50, ema20, ema50, adx]):
         return None
 
     vol_mean = float(np.mean(volumes[-20:]))
@@ -125,6 +212,14 @@ def compute_all_indicators(symbol: str):
         "sma50": round(float(sma50), 2),
         "ema20": round(float(ema20), 2),
         "ema50": round(float(ema50), 2),
+        "macd_line": round(macd_line, 4) if macd_line is not None else 0.0,
+        "macd_signal": round(macd_sig, 4) if macd_sig is not None else 0.0,
+        "macd_hist": round(macd_hist, 4) if macd_hist is not None else 0.0,
+        "bb_pct_b": round(pct_b, 3) if pct_b is not None else 0.5,
+        "bb_bandwidth": round(bb_bandwidth, 2) if bb_bandwidth is not None else 0.0,
+        "adx": round(float(adx), 2),
+        "stoch_k": round(k, 2) if k is not None else 50.0,
+        "stoch_d": round(d, 2) if d is not None else 50.0,
         "volume_ratio": round(float(vol_ratio), 2),
         "momentum_5d_pct": round(mom5, 2),
         "momentum_10d_pct": round(mom10, 2),
@@ -134,45 +229,79 @@ def compute_all_indicators(symbol: str):
     }
 
 
-def compute_signal_score(ind: dict) -> dict:
-    """0-100 technical score. Phase 3 will expand."""
+def compute_signal_score(ind: dict, regime: dict | None = None,
+                         news: dict | None = None) -> dict:
+    """
+    Composite 0-100 score. Regime-aware.
+    """
     trend = 0
     if ind["ema20"] > ind["ema50"]:
-        trend += 15
+        trend += 12
     if ind["last_close"] > ind["ema20"]:
-        trend += 10
+        trend += 8
     if ind["last_close"] > ind["sma50"]:
         trend += 5
+    if ind["adx"] > 25:
+        trend += 5  # trending market adds confidence
 
     momentum = 0
     if ind["momentum_5d_pct"] > 0:
-        momentum += 12
-    if ind["momentum_10d_pct"] > 0:
         momentum += 8
-    if ind["momentum_5d_pct"] > 2:
+    if ind["momentum_10d_pct"] > 0:
         momentum += 5
+    if ind["macd_hist"] > 0:
+        momentum += 7
 
     rsi = ind["rsi14"]
     if 40 <= rsi <= 70:
-        rsi_score = 25
-    elif 30 <= rsi < 40:
         rsi_score = 15
-    elif 70 < rsi <= 80:
+    elif 30 <= rsi < 40:
         rsi_score = 10
+    elif 70 < rsi <= 78:
+        rsi_score = 8
     else:
         rsi_score = 0
 
+    bb = 0
+    if 0.2 <= ind["bb_pct_b"] <= 0.8:
+        bb += 8
+    if ind["bb_pct_b"] > 0.9:
+        bb -= 5  # overbought
+    if ind["bb_pct_b"] < 0.1:
+        bb += 3  # potential bounce zone for mean-reversion
+    bb = max(0, bb)
+
     if ind["volume_ratio"] > 1.2:
-        vol = 20
-    elif ind["volume_ratio"] > 0.8:
         vol = 12
+    elif ind["volume_ratio"] > 0.8:
+        vol = 8
     else:
-        vol = 5
+        vol = 3
+
+    # News contribution (-10 to +10)
+    news_component = 0
+    if news and news.get("available"):
+        news_component = int(news["score"] * 10)
+
+    raw = trend + momentum + rsi_score + bb + vol + news_component
+    raw = max(0, min(100, raw))
+
+    # Regime adjustment
+    if regime:
+        r = regime.get("regime", "UNKNOWN")
+        if r == "BEAR":
+            raw = int(raw * 0.5)  # heavily discount in bear market
+        elif r == "HIGH_VOLATILITY":
+            raw = int(raw * 0.75)
+        elif r == "SIDEWAYS":
+            raw = int(raw * 0.9)
 
     return {
-        "score": trend + momentum + rsi_score + vol,
+        "score": raw,
         "trend": trend,
         "momentum": momentum,
         "rsi": rsi_score,
+        "bb": bb,
         "volume": vol,
-  }
+        "news": news_component,
+    }
