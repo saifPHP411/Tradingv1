@@ -211,3 +211,65 @@ def record_trade_outcome(pnl_pct: float):
             print(f"🛑 broker: {losses} consecutive losses — cooldown until {until}")
     else:
         set_consecutive_losses(0)
+
+def move_broker_stop(symbol: str, new_stop_price: float, qty: float,
+                     side_held: str) -> dict | None:
+    """
+    Safely move protective stop to a new (higher for long) price.
+    Strategy: submit new stop FIRST, then cancel old — no unprotected window.
+    Returns new stop result or None on failure.
+    """
+    client = _client()
+
+    # Step 1: submit new stop first (defense in depth)
+    new_result = _submit_stop(symbol, qty, new_stop_price, side_held)
+    if new_result is None:
+        return None
+
+    new_order_id = new_result["stop_order_id"]
+
+    # Step 2: cancel old stop orders (except the new one)
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN,
+                             symbols=[symbol], limit=50)
+        )
+        for o in orders:
+            if str(o.id) == new_order_id:
+                continue
+            otype = str(o.order_type).lower() if o.order_type else ""
+            if "stop" in otype:
+                try:
+                    client.cancel_order_by_id(o.id)
+                except Exception as e:
+                    print(f"⚠️ move_stop: cancel old failed: {e}")
+    except Exception as e:
+        print(f"⚠️ move_stop: cleanup failed: {e}")
+
+    return new_result
+
+
+def get_broker_stop_for_symbol(symbol: str) -> dict | None:
+    """Returns the current broker-side stop order for a symbol, if any."""
+    try:
+        client = _client()
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN,
+                             symbols=[symbol], limit=20)
+        )
+        for o in orders:
+            otype = str(o.order_type).lower() if o.order_type else ""
+            if "stop" in otype:
+                return {
+                    "order_id": str(o.id),
+                    "stop_price": float(o.stop_price) if o.stop_price else None,
+                    "qty": float(o.qty) if o.qty else 0,
+                    "side": str(o.side).lower() if o.side else None,
+                }
+    except Exception as e:
+        print(f"⚠️ get_broker_stop: {e}")
+    return None
