@@ -37,6 +37,8 @@ DEFAULTS = {
 "min_loss_to_close_pct": "1.5",
 "llm_exit_min_confidence": "0.70",
     "min_stop_move_pct": "0.3",
+    "regime_enabled": "1",
+"news_enabled": "1",
 }
 
 def _ensure_defaults():
@@ -76,6 +78,8 @@ def get_all_settings() -> dict:
 "min_loss_to_close_pct": float(get_setting("min_loss_to_close_pct")),
 "llm_exit_min_confidence": float(get_setting("llm_exit_min_confidence")),
         "min_stop_move_pct": float(get_setting("min_stop_move_pct")),
+        "regime_enabled": int(get_setting("regime_enabled")),
+"news_enabled": int(get_setting("news_enabled")),
     }
 
 def update_settings(payload: dict):
