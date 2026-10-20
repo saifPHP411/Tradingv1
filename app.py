@@ -4,13 +4,16 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import threading, time
 from datetime import datetime
-from monitor import monitor
-from decision_log import recent_exit_decisions
+
 from safety import get_account_snapshot
 from settings import get_all_settings, update_settings, is_dry_run, get_symbols
-from decision_log import recent_decisions, equity_history, log_equity
+from decision_log import (
+    recent_decisions, equity_history, log_equity,
+    recent_exit_decisions,
+)
 from main import run_cycle
 from learner import learn_from_closed_trades
+from monitor import monitor
 
 templates = Jinja2Templates(directory="templates")
 
@@ -27,8 +30,11 @@ class AgentController:
         return self._thread is not None and self._thread.is_alive()
 
     def status(self) -> dict:
-        return {"running": self.is_running(), "current_symbol": self._current,
-                "started_at": self._started_at.isoformat() if self._started_at else None}
+        return {
+            "running": self.is_running(),
+            "current_symbol": self._current,
+            "started_at": self._started_at.isoformat() if self._started_at else None,
+        }
 
     def start(self) -> bool:
         with self._lock:
@@ -84,9 +90,8 @@ async def lifespan(app: FastAPI):
     monitor.start()
     yield
     controller.stop()
-   monitor.stop()
+    monitor.stop()
     print("⏹️ إيقاف")
-    
 
 
 app = FastAPI(lifespan=lifespan)
@@ -111,13 +116,19 @@ def api_positions():
     try:
         from alpaca.trading.client import TradingClient
         client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
-        return [{"symbol": p.symbol, "qty": float(p.qty), "side": p.side.value,
-                 "avg_entry_price": float(p.avg_entry_price),
-                 "current_price": float(p.current_price),
-                 "market_value": float(p.market_value),
-                 "unrealized_pl": float(p.unrealized_pl),
-                 "unrealized_plpc": float(p.unrealized_plpc) * 100}
-                for p in client.get_all_positions()]
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "side": p.side.value,
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "market_value": float(p.market_value),
+                "unrealized_pl": float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc) * 100,
+            }
+            for p in client.get_all_positions()
+        ]
     except Exception as e:
         return {"error": str(e)}
 
@@ -162,7 +173,9 @@ def api_start():
 def api_stop():
     controller.stop()
     return {"running": controller.is_running()}
-    @app.get("/api/monitor/status")
+
+
+@app.get("/api/monitor/status")
 def api_monitor_status():
     return monitor.status()
 
