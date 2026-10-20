@@ -14,17 +14,23 @@ def _conn():
 
 def init_db():
     with _conn() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, symbol TEXT,
-            analyst_signal TEXT, analyst_confidence REAL, analyst_reason TEXT,
-            risk_approved INTEGER, risk_veto INTEGER, risk_reason TEXT,
-            final_decision TEXT, consensus_reached INTEGER,
-            order_details TEXT, broker_result TEXT, market_data TEXT)""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS equity_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
-            equity REAL, open_positions INTEGER)""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY, value TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS position_state (
+    symbol TEXT PRIMARY KEY,
+    entry_price REAL,
+    qty REAL,
+    side TEXT,
+    highest_price REAL,
+    lowest_price REAL,
+    current_stop REAL,
+    current_target REAL,
+    opened_at TEXT,
+    last_exit_decision TEXT,
+    last_exit_reason TEXT,
+    last_exit_at TEXT)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS exit_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT, symbol TEXT, decision TEXT, reason TEXT,
+    pnl_pct REAL, price REAL, entry_price REAL)""")
         conn.commit()
 
 def log_decision(state: dict, broker_result: dict | None):
@@ -74,3 +80,50 @@ def set_setting(key: str, value: str):
         conn.commit()
 
 init_db()
+def upsert_position_state(symbol: str, entry_price: float, qty: float, side: str):
+    with _conn() as conn:
+        conn.execute("""INSERT INTO position_state
+            (symbol, entry_price, qty, side, highest_price, lowest_price, opened_at)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET qty=excluded.qty""",
+            (symbol, entry_price, qty, side, entry_price, entry_price,
+             datetime.utcnow().isoformat()))
+        conn.commit()
+
+def get_position_state(symbol: str):
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM position_state WHERE symbol=?", (symbol,)).fetchone()
+        return dict(row) if row else None
+
+def all_position_states() -> list:
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM position_state").fetchall()]
+
+def update_position_state(symbol: str, **fields):
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [symbol]
+    with _conn() as conn:
+        conn.execute(f"UPDATE position_state SET {sets} WHERE symbol=?", vals)
+        conn.commit()
+
+def delete_position_state(symbol: str):
+    with _conn() as conn:
+        conn.execute("DELETE FROM position_state WHERE symbol=?", (symbol,))
+        conn.commit()
+
+def log_exit_decision(symbol: str, decision: str, reason: str,
+                      pnl_pct: float, price: float, entry_price: float):
+    with _conn() as conn:
+        conn.execute("""INSERT INTO exit_decisions
+            (timestamp, symbol, decision, reason, pnl_pct, price, entry_price)
+            VALUES (?,?,?,?,?,?,?)""",
+            (datetime.utcnow().isoformat(), symbol, decision, reason,
+             pnl_pct, price, entry_price))
+        conn.commit()
+
+def recent_exit_decisions(limit: int = 50) -> list:
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM exit_decisions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
