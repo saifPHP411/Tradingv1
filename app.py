@@ -38,8 +38,8 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
-
+    return templates.TemplateResponse(request=request, name="dashboard.html")
+    
 @app.get("/api/status")
 def api_status():
     snap = get_account_snapshot()
