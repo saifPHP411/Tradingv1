@@ -6,7 +6,6 @@ from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 from settings import is_dry_run
 from safety import check_safety_gates
 
-
 def execute_order(order: dict) -> dict:
     if is_dry_run():
         return {"status": "dry_run", "message": f"كان سيتم تنفيذ: {order}"}
@@ -19,6 +18,18 @@ def execute_order(order: dict) -> dict:
         return {"status": "blocked", "reason": reason}
 
     client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+
+    # فحص القوة الشرائية قبل الإرسال
+    try:
+        acct = client.get_account()
+        buying_power = float(acct.buying_power)
+        est_cost = order.get("estimated_cost", order["qty"] * order.get("entry_price", 0))
+        if order["side"] == "buy" and est_cost > buying_power:
+            return {"status": "blocked",
+                    "reason": f"قوة شرائية غير كافية (تحتاج ~${est_cost:.0f}, متاح ${buying_power:.0f})"}
+    except Exception as e:
+        print(f"⚠️ تعذر التحقق من القوة الشرائية: {e}")
+
     side = OrderSide.BUY if order["side"] == "buy" else OrderSide.SELL
 
     try:
