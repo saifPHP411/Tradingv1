@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
@@ -18,9 +18,10 @@ SYMBOLS = ["AAPL", "MSFT", "NVDA"]
 MAX_RISK_PER_TRADE = 0.02
 MIN_CONFIDENCE = 0.65
 
+# الحدود أُزيلت
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-MAX_DAILY_LOSS_PCT = 0.05
-MAX_OPEN_POSITIONS = 3
-MAX_TRADES_PER_DAY = 5
+MAX_DAILY_LOSS_PCT = 1.0
+MAX_OPEN_POSITIONS = 999
+MAX_TRADES_PER_DAY = 999
 ONLY_MARKET_HOURS = True
 ACCOUNT_EQUITY_DEFAULT = 10000
