@@ -15,6 +15,7 @@ from decision_log import (
     upsert_position_state, get_position_state, all_position_states,
     update_position_state, delete_position_state,
     log_exit_decision, recent_lessons,
+    set_position_initial_stop, update_stop_order_id, set_trailing_active,
 )
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
@@ -42,15 +43,14 @@ def _market_open(allow_extended: bool) -> bool:
 
 
 def _sync_positions() -> list:
-    """Fetch positions, ensure SL/TP exist in state, verify broker protection."""
+    """Fetch positions, ensure state + broker stop exist."""
     try:
         client = _alpaca()
         positions = client.get_all_positions()
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
         open_orders = client.get_orders(
-            __import__("alpaca.trading.requests", fromlist=["GetOrdersRequest"]).GetOrdersRequest(
-                status=__import__("alpaca.trading.enums", fromlist=["QueryOrderStatus"]).QueryOrderStatus.OPEN,
-                limit=200,
-            )
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)
         )
     except Exception as e:
         print(f"⚠️ monitor: fetch failed: {e}")
@@ -60,7 +60,7 @@ def _sync_positions() -> list:
     result = []
     live_symbols = set()
 
-    # Map stop orders by symbol
+    # Group stop orders by symbol
     stops_by_symbol = {}
     for o in open_orders:
         try:
@@ -94,22 +94,27 @@ def _sync_positions() -> list:
             upsert_position_state(sym, entry, qty, side)
             update_position_state(sym, current_stop=round(stop, 2),
                                   current_target=round(target, 2))
+            set_position_initial_stop(sym, stop, abs(entry - stop))
             state = get_position_state(sym)
             print(f"📌 monitor: new position {sym} SL={stop:.2f} TP={target:.2f}")
 
-        # CRITICAL: verify broker-side protection
+        # CRITICAL: verify broker stop exists
         broker_stops = stops_by_symbol.get(sym, [])
         if not broker_stops:
-            print(f"🚨 monitor: {sym} has NO stop order at broker — emergency close")
+            print(f"🚨 monitor: {sym} NO broker stop — emergency close")
             try:
                 _alpaca().close_position(sym)
             except Exception as e:
-                print(f"🚨 monitor: emergency close failed {sym}: {e}")
+                print(f"🚨 monitor: close failed {sym}: {e}")
             log_exit_decision(sym, "EMERGENCY_NO_STOP",
-                              "broker had no stop order",
-                              pnl_pct, current, entry)
+                              "no broker stop", pnl_pct, current, entry)
             delete_position_state(sym)
             continue
+
+        # Persist broker stop id
+        live_stop_id = broker_stops[0]["id"]
+        if state.get("stop_order_id") != live_stop_id:
+            update_stop_order_id(sym, live_stop_id)
 
         high = max(state.get("highest_price") or entry, current, entry)
         low = min(state.get("lowest_price") or entry, current, entry)
@@ -121,7 +126,7 @@ def _sync_positions() -> list:
             "current": current, "pnl_pct": pnl_pct,
             "high": high, "low": low,
             "state": get_position_state(sym),
-            "has_broker_stop": True,
+            "broker_stops": broker_stops,
         })
 
     for s in all_position_states():
@@ -133,23 +138,42 @@ def _sync_positions() -> list:
 
 
 def _hard_gate(pos: dict, settings: dict):
-    """Deterministic safety gate."""
+    """Deterministic safety — closes if breached."""
     pnl = pos["pnl_pct"]
     if pnl <= -settings["hard_stop_loss_pct"]:
         return ("CLOSE_NOW", f"hard stop {pnl:.2f}%")
     if pnl >= settings["hard_take_profit_pct"]:
         return ("CLOSE_NOW", f"hard target {pnl:.2f}%")
 
-    if pnl >= settings["trailing_activation_pct"]:
-        trail = pos["high"] * (1 - settings["trailing_stop_pct"] / 100)
-        if pos["current"] <= trail:
-            return ("CLOSE_NOW",
-                    f"trailing {pos['current']:.2f}<= {trail:.2f} (high {pos['high']:.2f})")
-
     dyn_stop = pos["state"].get("current_stop")
     if dyn_stop and pos["current"] <= dyn_stop:
-        return ("CLOSE_NOW", f"dynamic stop {pos['current']:.2f}<= {dyn_stop:.2f}")
+        return ("CLOSE_NOW", f"price {pos['current']:.2f} <= stop {dyn_stop:.2f}")
     return None
+
+
+def _trailing_update(pos: dict, settings: dict):
+    """
+    Phase 2: computes new trailing stop that MOVES broker stop.
+    Returns new stop price if should move, else None.
+    """
+    if pos["side"] != "long":
+        return None  # only for longs in current setup
+    if pos["pnl_pct"] < settings["trailing_activation_pct"]:
+        return None
+
+    trail_price = pos["high"] * (1 - settings["trailing_stop_pct"] / 100)
+    old_stop = pos["state"].get("current_stop") or 0
+
+    # Must move UP by at least min_stop_move_pct%
+    min_move = pos["current"] * (settings["min_stop_move_pct"] / 100)
+    if trail_price <= old_stop + min_move:
+        return None
+
+    # Must be below current price (safety)
+    if trail_price >= pos["current"]:
+        return None
+
+    return trail_price
 
 
 def _exit_agent(pos: dict, settings: dict) -> dict:
@@ -167,7 +191,7 @@ def _exit_agent(pos: dict, settings: dict) -> dict:
     min_loss = settings.get("min_loss_to_close_pct", 1.5)
     min_gain = settings.get("min_gain_to_trim_pct", 2.0)
 
-    prompt = f"""أنت مدير خروج. قرارك: HOLD | CLOSE_NOW | TIGHTEN_STOP.
+    prompt = f"""مدير خروج. قرارك: HOLD | CLOSE_NOW | TIGHTEN_STOP.
 
 المركز:
 - {pos['symbol']} | entry {pos['entry']:.2f} | now {pos['current']:.2f}
@@ -180,13 +204,13 @@ def _exit_agent(pos: dict, settings: dict) -> dict:
 Memory:
 {memory}
 
-قواعد صارمة (لا تتجاوزها):
-1. إذا hold < {min_hold} min AND loss < {min_loss}% → HOLD (ضوضاء).
-2. إذا loss >= {min_loss}% AND السعر أدنى من lowest + (highest-lowest)*0.5 → CLOSE_NOW.
-3. إذا gain >= {min_gain}% AND السعر تراجع > 40% من أعلى ربح → TIGHTEN_STOP.
-4. غير ذلك → HOLD.
+قواعد صارمة:
+1. إذا hold < {min_hold} min AND loss < {min_loss}% → HOLD (ضوضاء)
+2. إذا loss >= {min_loss}% AND اتجاه هابط → CLOSE_NOW
+3. إذا gain >= {min_gain}% AND تراجع > 40% من أعلى ربح → TIGHTEN_STOP
+4. غير ذلك → HOLD
 
-أجب JSON فقط:
+JSON فقط:
 {{"action":"HOLD"|"CLOSE_NOW"|"TIGHTEN_STOP","new_stop":null|number,"confidence":0-1,"reason":"سطر"}}"""
 
     for _ in range(2):
@@ -212,7 +236,6 @@ Memory:
 def _execute_close(pos: dict, reason: str):
     try:
         client = _alpaca()
-        # Cancel all open orders on symbol first
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -228,17 +251,38 @@ def _execute_close(pos: dict, reason: str):
         log_exit_decision(pos["symbol"], "CLOSE_NOW", reason,
                           pos["pnl_pct"], pos["current"], pos["entry"])
 
-        # Update consecutive loss counter
         try:
             from broker import record_trade_outcome
             record_trade_outcome(pos["pnl_pct"])
         except Exception as e:
-            print(f"⚠️ monitor: could not record trade outcome: {e}")
+            print(f"⚠️ monitor: outcome record failed: {e}")
 
         print(f"🚪 monitor: closed {pos['symbol']} — {reason}")
         return True
     except Exception as e:
         print(f"⚠️ monitor: close failed {pos['symbol']}: {e}")
+        return False
+
+
+def _move_stop_if_better(pos: dict, new_price: float):
+    """Moves broker stop safely. Returns True on success."""
+    try:
+        from broker import move_broker_stop
+        side_held = "long" if pos["side"] == "long" else "short"
+        result = move_broker_stop(pos["symbol"], new_price, pos["qty"], side_held)
+        if result:
+            update_position_state(
+                pos["symbol"],
+                current_stop=round(new_price, 2),
+                stop_order_id=result["stop_order_id"],
+            )
+            print(f"🔒 monitor: moved stop {pos['symbol']} → {new_price:.2f}")
+            return True
+        else:
+            print(f"⚠️ monitor: stop move failed {pos['symbol']}")
+            return False
+    except Exception as e:
+        print(f"⚠️ monitor: stop move error {pos['symbol']}: {e}")
         return False
 
 
@@ -296,11 +340,12 @@ class PositionMonitor:
         market_ok = _market_open(settings.get("allow_extended_hours", False))
 
         for pos in positions:
+            # 1) Hard gate (deterministic — always runs)
             gate = _hard_gate(pos, settings)
             if gate:
                 action, reason = gate
                 if not market_ok:
-                    print(f"⏸️ monitor: {pos['symbol']} gate hit but market closed")
+                    print(f"⏸️ monitor: {pos['symbol']} gate but market closed")
                     continue
                 _execute_close(pos, f"[GATE] {reason}")
                 continue
@@ -308,6 +353,14 @@ class PositionMonitor:
             if not market_ok:
                 continue
 
+            # 2) Trailing stop update (Phase 2 — moves broker stop)
+            new_trail = _trailing_update(pos, settings)
+            if new_trail is not None:
+                _move_stop_if_better(pos, new_trail)
+                # refresh state after move
+                pos["state"] = get_position_state(pos["symbol"]) or pos["state"]
+
+            # 3) LLM exit decision (throttled)
             last = self._last_llm.get(pos["symbol"], 0)
             if time.time() - last < settings.get("exit_llm_interval_seconds", 300):
                 continue
@@ -330,8 +383,7 @@ class PositionMonitor:
                     new_stop = float(decision["new_stop"])
                     old_stop = pos["state"].get("current_stop") or 0
                     if pos["side"] == "long" and old_stop < new_stop < pos["current"]:
-                        update_position_state(pos["symbol"], current_stop=new_stop)
-                        print(f"🔒 monitor: raised stop {pos['symbol']} -> {new_stop:.2f}")
+                        _move_stop_if_better(pos, new_stop)
                 except Exception:
                     pass
 
