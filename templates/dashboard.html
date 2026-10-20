@@ -39,17 +39,27 @@
   </div>
 </header>
 
-<button id="toggleBtn" onclick="toggleRun()" class="w-full py-4 rounded-2xl mb-4 font-bold text-lg transition-all active:scale-95" style="background: linear-gradient(135deg, #3b82f6, #8b5cf6); box-shadow: 0 10px 40px -10px rgba(139,92,246,0.5);">
+<button id="toggleBtn" onclick="toggleRun()" class="w-full py-4 rounded-2xl mb-3 font-bold text-lg transition-all active:scale-95" style="background: linear-gradient(135deg, #3b82f6, #8b5cf6); box-shadow: 0 10px 40px -10px rgba(139,92,246,0.5);">
   ▶ تشغيل الوكيل
 </button>
+
+<div class="glass px-4 py-2 mb-4 flex items-center justify-between text-xs">
+  <div class="flex items-center gap-2">
+    <span id="monitorDot" class="pulse-dot" style="background:#64748b"></span>
+    <span id="monitorText">المراقب: —</span>
+  </div>
+  <button onclick="toggleMonitor()" id="monitorBtn" class="px-3 py-1 rounded-lg font-semibold" style="background:rgba(100,116,139,0.3);color:#cbd5e1">تشغيل</button>
+</div>
 
 <div class="flex gap-2 mb-4 overflow-x-auto pb-1">
   <button class="tab-btn active" onclick="switchTab('overview', this)">📊 نظرة</button>
   <button class="tab-btn" onclick="switchTab('positions', this)">💼 صفقاتي</button>
   <button class="tab-btn" onclick="switchTab('decisions', this)">📋 قرارات</button>
+  <button class="tab-btn" onclick="switchTab('exits', this)">🚪 خروج</button>
   <button class="tab-btn" onclick="switchTab('settings', this)">⚙️ إعدادات</button>
 </div>
 
+<!-- ================= نظرة ================= -->
 <div id="tab-overview" class="tab-pane active space-y-4">
   <div class="grid grid-cols-2 gap-3">
     <div class="glass p-4"><p class="text-[10px] text-slate-400 mb-1">رأس المال</p><p class="text-xl font-extrabold" id="equity">—</p></div>
@@ -67,14 +77,22 @@
   </div>
 </div>
 
+<!-- ================= صفقاتي ================= -->
 <div id="tab-positions" class="tab-pane space-y-3">
   <div id="positionsList"><div class="glass p-6 text-center text-slate-500 text-sm">لا صفقات مفتوحة</div></div>
 </div>
 
+<!-- ================= قرارات ================= -->
 <div id="tab-decisions" class="tab-pane space-y-2">
   <div id="decisionsList"><p class="text-slate-500 text-sm text-center">لا قرارات بعد</p></div>
 </div>
 
+<!-- ================= خروج ================= -->
+<div id="tab-exits" class="tab-pane space-y-2">
+  <div id="exitsList"><p class="text-slate-500 text-sm text-center">لا قرارات خروج بعد</p></div>
+</div>
+
+<!-- ================= إعدادات ================= -->
 <div id="tab-settings" class="tab-pane space-y-4">
   <div class="glass p-4 space-y-4">
     <h3 class="font-bold text-sm">⚙️ الإعدادات المباشرة</h3>
@@ -98,6 +116,41 @@
       <label class="text-xs text-slate-400 block mb-1">رأس المال المخصص للتداول ($) — 0 = رصيد الحساب</label>
       <input type="number" id="tradingCapital" min="0" step="100" value="0" placeholder="0">
     </div>
+
+    <div class="border-t border-slate-700/50 pt-3 mt-3">
+      <p class="text-xs font-bold text-slate-300 mb-2">🛡️ إعدادات المراقبة والخروج</p>
+      <div class="space-y-2">
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">فاصل الفحص الحتمي (ثانية)</label>
+          <input type="number" id="exitCheckSeconds" min="15" max="300" value="60">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">فاصل وكيل الخروج (ثانية)</label>
+          <input type="number" id="exitLlmInterval" min="60" max="1800" value="300">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">حد الخسارة القصوى %</label>
+          <input type="number" id="hardStop" min="1" max="30" step="0.5" value="8">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">حد الربح القصوى %</label>
+          <input type="number" id="hardTarget" min="2" max="100" step="0.5" value="15">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">تفعيل التريلينغ بعد ربح %</label>
+          <input type="number" id="trailActivate" min="0" max="50" step="0.5" value="5">
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">مسافة التريلينغ %</label>
+          <input type="number" id="trailDistance" min="0.5" max="20" step="0.5" value="3">
+        </div>
+        <label class="flex items-center gap-2 mt-3 text-xs text-slate-400">
+          <input type="checkbox" id="allowExtended" class="w-4 h-4">
+          السماح بالإغلاق في الجلسات الممتدة
+        </label>
+      </div>
+    </div>
+
     <div class="flex items-center justify-between pt-2 border-t border-slate-700/50">
       <div>
         <p class="text-sm font-semibold">وضع التنفيذ</p>
@@ -120,6 +173,7 @@ function switchTab(name, btn) {
   btn.classList.add('active');
 }
 
+/* ================= تشغيل/إيقاف الوكيل ================= */
 function updateRunUI(running, currentSymbol) {
   const btn = document.getElementById('toggleBtn');
   const text = document.getElementById('statusText');
@@ -154,6 +208,45 @@ async function toggleRun() {
   btn.disabled = false;
 }
 
+/* ================= المراقب ================= */
+function updateMonitorUI(running) {
+  const dot = document.getElementById('monitorDot');
+  const txt = document.getElementById('monitorText');
+  const btn = document.getElementById('monitorBtn');
+  if (running) {
+    dot.style.background = '#34d399';
+    txt.textContent = 'المراقب: نشط 24/7';
+    txt.style.color = '#34d399';
+    btn.textContent = 'إيقاف';
+    btn.style.background = 'rgba(239,68,68,0.2)';
+    btn.style.color = '#fca5a5';
+  } else {
+    dot.style.background = '#64748b';
+    txt.textContent = 'المراقب: متوقف';
+    txt.style.color = '';
+    btn.textContent = 'تشغيل';
+    btn.style.background = 'rgba(100,116,139,0.3)';
+    btn.style.color = '#cbd5e1';
+  }
+}
+
+async function toggleMonitor() {
+  try {
+    const r = await fetch('/api/monitor/toggle', {method:'POST'});
+    const d = await r.json();
+    updateMonitorUI(d.running);
+  } catch(e) { console.error(e); }
+}
+
+async function loadMonitor() {
+  try {
+    const r = await fetch('/api/monitor/status');
+    const d = await r.json();
+    updateMonitorUI(d.running);
+  } catch(e) {}
+}
+
+/* ================= الحالة العامة ================= */
 async function loadStatus() {
   try {
     const r = await fetch('/api/status');
@@ -175,6 +268,7 @@ async function loadStatus() {
   } catch(e) { console.error(e); }
 }
 
+/* ================= المراكز ================= */
 async function loadPositions() {
   try {
     const r = await fetch('/api/positions');
@@ -206,6 +300,7 @@ async function loadPositions() {
   } catch(e) { console.error(e); }
 }
 
+/* ================= منحنى رأس المال ================= */
 async function loadEquity() {
   try {
     const r = await fetch('/api/equity?limit=200');
@@ -227,6 +322,7 @@ async function loadEquity() {
   } catch(e) { console.error(e); }
 }
 
+/* ================= القرارات ================= */
 async function loadDecisions() {
   try {
     const r = await fetch('/api/decisions?limit=30');
@@ -251,6 +347,34 @@ async function loadDecisions() {
   } catch(e) { console.error(e); }
 }
 
+/* ================= قرارات الخروج ================= */
+async function loadExits() {
+  try {
+    const r = await fetch('/api/exits?limit=30');
+    const data = await r.json();
+    const list = document.getElementById('exitsList');
+    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-sm text-center">لا قرارات خروج بعد</p>'; return; }
+    list.innerHTML = data.map(e => {
+      const dec = e.decision || '—';
+      const color = dec === 'CLOSE_NOW' ? '#ef4444' : dec === 'CLOSE_FAILED' ? '#fbbf24' : '#94a3b8';
+      const time = new Date(e.timestamp).toLocaleString('ar-EG',{hour:'2-digit',minute:'2-digit',month:'short',day:'numeric'});
+      const pnl = e.pnl_pct >= 0 ? '+' + e.pnl_pct.toFixed(2) : e.pnl_pct.toFixed(2);
+      return `<div class="glass p-3 text-xs">
+        <div class="flex items-center justify-between mb-1">
+          <div class="flex items-center gap-2"><span class="text-slate-500">${time}</span><span class="font-bold">${e.symbol}</span></div>
+          <span style="color:${color}" class="font-bold">${dec}</span>
+        </div>
+        <div class="flex items-center justify-between text-slate-400 mb-1">
+          <span>P&L: ${pnl}%</span>
+          <span>دخول ${fmt(e.entry_price)} → ${fmt(e.price)}</span>
+        </div>
+        <p class="text-slate-300 mt-1">${e.reason || ''}</p>
+      </div>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+/* ================= الإعدادات ================= */
 async function loadSettings() {
   try {
     const r = await fetch('/api/settings');
@@ -261,6 +385,13 @@ async function loadSettings() {
     document.getElementById('symbols').value = s.symbols.join(',');
     document.getElementById('cycleInterval').value = s.cycle_interval_minutes;
     document.getElementById('tradingCapital').value = s.trading_capital;
+    document.getElementById('exitCheckSeconds').value = s.exit_check_seconds;
+    document.getElementById('exitLlmInterval').value = s.exit_llm_interval_seconds;
+    document.getElementById('hardStop').value = s.hard_stop_loss_pct;
+    document.getElementById('hardTarget').value = s.hard_take_profit_pct;
+    document.getElementById('trailActivate').value = s.trailing_activation_pct;
+    document.getElementById('trailDistance').value = s.trailing_stop_pct;
+    document.getElementById('allowExtended').checked = s.allow_extended_hours;
   } catch(e) { console.error(e); }
 }
 
@@ -271,6 +402,13 @@ async function saveSettings() {
     symbols: document.getElementById('symbols').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),
     cycle_interval_minutes: parseInt(document.getElementById('cycleInterval').value),
     trading_capital: parseFloat(document.getElementById('tradingCapital').value) || 0,
+    exit_check_seconds: parseInt(document.getElementById('exitCheckSeconds').value),
+    exit_llm_interval_seconds: parseInt(document.getElementById('exitLlmInterval').value),
+    hard_stop_loss_pct: parseFloat(document.getElementById('hardStop').value),
+    hard_take_profit_pct: parseFloat(document.getElementById('hardTarget').value),
+    trailing_activation_pct: parseFloat(document.getElementById('trailActivate').value),
+    trailing_stop_pct: parseFloat(document.getElementById('trailDistance').value),
+    allow_extended_hours: document.getElementById('allowExtended').checked,
   };
   try {
     await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
@@ -286,9 +424,20 @@ async function toggleDryRun() {
   loadStatus();
 }
 
-function loadAll() { loadStatus(); loadPositions(); loadEquity(); loadDecisions(); }
-loadAll(); loadSettings();
+/* ================= التحديث الدوري ================= */
+function loadAll() {
+  loadStatus();
+  loadPositions();
+  loadEquity();
+  loadDecisions();
+  loadExits();
+}
+
+loadAll();
+loadSettings();
+loadMonitor();
 setInterval(loadAll, 5000);
+setInterval(loadMonitor, 10000);
 </script>
 </body>
 </html>
