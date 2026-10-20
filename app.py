@@ -4,7 +4,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import threading, time
 from datetime import datetime
-
+from monitor import monitor
+from decision_log import recent_exit_decisions
 from safety import get_account_snapshot
 from settings import get_all_settings, update_settings, is_dry_run, get_symbols
 from decision_log import recent_decisions, equity_history, log_equity
@@ -80,9 +81,12 @@ controller = AgentController()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("✅ بدأ التطبيق")
+    monitor.start()
     yield
     controller.stop()
+   monitor.stop()
     print("⏹️ إيقاف")
+    
 
 
 app = FastAPI(lifespan=lifespan)
@@ -158,3 +162,20 @@ def api_start():
 def api_stop():
     controller.stop()
     return {"running": controller.is_running()}
+    @app.get("/api/monitor/status")
+def api_monitor_status():
+    return monitor.status()
+
+
+@app.post("/api/monitor/toggle")
+def api_monitor_toggle():
+    if monitor.is_running():
+        monitor.stop()
+        return {"running": False}
+    monitor.start()
+    return {"running": True}
+
+
+@app.get("/api/exits")
+def api_exits(limit: int = 30):
+    return recent_exit_decisions(limit)
