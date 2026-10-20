@@ -188,22 +188,22 @@ def simulate(
     df: pd.DataFrame,
     spy_df: pd.DataFrame | None,
     start_equity: float = 10000.0,
-    trailing_activation_pct: float = 2.0,
-    trailing_distance_pct: float = 1.5,
+    trailing_activation_pct: float = 5.0,   # ← معدّل: كان 2.0
+    trailing_distance_pct: float = 3.0,     # ← معدّل: كان 1.5
     max_hold_bars: int = 60,
 ) -> dict:
     """
     Candle-by-candle simulation with realistic fills, fees, slippage.
-    
+
     Entry: at NEXT bar's open + slippage (realistic)
     Exit: intrabar check (SL first if both hit — conservative)
-    Trailing: activates at +X%, moves stop by Y% from highest close
+    Trailing: activates at +X% profit, moves stop Y% below highest close
     """
     equity = start_equity
     equity_curve = []
     trades = []
     position: Position | None = None
-    pending_entry = None  # {stop_dist, qty, target_dist, signal_bar_idx}
+    pending_entry = None
 
     n_bars = len(df)
     for i in range(60, n_bars):
@@ -217,7 +217,7 @@ def simulate(
         # ---- 1) Execute pending entry at this bar's open ----
         if pending_entry is not None:
             slip = pending_entry["entry_ref"] * (ENTRY_SLIPPAGE_BPS / 10000.0)
-            fill_price = open_p + slip  # entry always long, so slip up
+            fill_price = open_p + slip
 
             stop_price = fill_price - pending_entry["stop_dist"]
             target_price = fill_price + pending_entry["target_dist"]
@@ -264,7 +264,6 @@ def simulate(
                 exit_price = position.stop
                 exit_reason = "STOP"
                 if open_p < position.stop:
-                    # gapped down past stop
                     exit_price = open_p
                     exit_reason = "STOP_GAP"
 
@@ -279,9 +278,8 @@ def simulate(
                 exit_reason = "MAX_HOLD"
 
             if exit_price is not None:
-                # Apply exit slippage
                 slip_out = exit_price * (EXIT_SLIPPAGE_BPS / 10000.0)
-                final_exit = exit_price - slip_out  # sold below
+                final_exit = exit_price - slip_out
                 fees_out = position.qty * FEES_PER_SHARE
 
                 gross_pnl = (final_exit - position.entry_price) * position.qty
@@ -344,7 +342,7 @@ def simulate(
                             "qty": qty,
                             "stop_dist": stop_dist,
                             "target_dist": target_dist,
-                            "entry_ref": close,  # use close for sizing; fill = next open
+                            "entry_ref": close,
                             "signal_bar_idx": i,
                             "regime": regime["regime"],
                             "score": score,
@@ -379,4 +377,4 @@ def simulate(
         "end_equity": round(equity, 2),
         "trades": trades,
         "equity_curve": equity_curve,
-  }
+    }
