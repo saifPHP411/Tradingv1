@@ -3,273 +3,286 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Consensus Trader — لوحة التحكم</title>
+<title>Consensus Trader</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  * { font-family: 'Inter', sans-serif; }
-  body {
-    background: radial-gradient(circle at 20% 0%, #1e293b 0%, #0f172a 40%, #020617 100%);
-    min-height: 100vh;
-    color: #e2e8f0;
-  }
-  .glass {
-    background: rgba(30, 41, 59, 0.55);
-    backdrop-filter: blur(20px);
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    border-radius: 1.25rem;
-    transition: all 0.3s ease;
-  }
-  .glass:hover { border-color: rgba(148, 163, 184, 0.25); }
-  .gradient-text {
-    background: linear-gradient(135deg, #60a5fa, #a78bfa, #f472b6);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-  }
-  .pulse-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: #34d399;
-    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7);
-    animation: pulse 2s infinite;
-  }
-  @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(52,211,153,0.7); }
-    70% { box-shadow: 0 0 0 10px rgba(52,211,153,0); }
-    100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
-  }
-  .decision-row { transition: all 0.2s ease; }
-  .decision-row:hover { background: rgba(51, 65, 85, 0.5); }
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
-  ::-webkit-scrollbar-track { background: transparent; }
+  * { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+  body { background: radial-gradient(circle at 20% 0%, #1e293b 0%, #0f172a 40%, #020617 100%); min-height: 100vh; color: #e2e8f0; }
+  .glass { background: rgba(30,41,59,0.55); backdrop-filter: blur(20px); border: 1px solid rgba(148,163,184,0.12); border-radius: 1.25rem; }
+  .gradient-text { background: linear-gradient(135deg,#60a5fa,#a78bfa,#f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(52,211,153,0.7);} 70%{box-shadow:0 0 0 10px rgba(52,211,153,0);} 100%{box-shadow:0 0 0 0 rgba(52,211,153,0);} }
+  .tab-btn { padding: 10px 14px; border-radius: 12px; font-size: 13px; font-weight: 600; color: #94a3b8; white-space: nowrap; }
+  .tab-btn.active { background: rgba(96,165,250,0.15); color: #60a5fa; }
+  .tab-pane { display: none; } .tab-pane.active { display: block; }
+  input { background: rgba(15,23,42,0.6); border: 1px solid rgba(148,163,184,0.2); border-radius: 10px; padding: 10px 12px; color: #e2e8f0; width: 100%; font-size: 14px; }
+  input:focus { outline: none; border-color: #60a5fa; }
+  .slider { -webkit-appearance: none; height: 4px; background: rgba(148,163,184,0.2); border-radius: 2px; }
+  .slider::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #60a5fa; cursor: pointer; }
 </style>
 </head>
-<body class="p-4 md:p-8">
+<body class="p-4">
 
-<!-- Header -->
-<header class="max-w-7xl mx-auto mb-6 flex flex-wrap items-center justify-between gap-4">
-  <div class="flex items-center gap-3">
-    <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 flex items-center justify-center text-2xl shadow-lg shadow-purple-500/30">🤖</div>
+<header class="flex items-center justify-between mb-4">
+  <div class="flex items-center gap-2">
+    <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 flex items-center justify-center text-xl">🤖</div>
     <div>
-      <h1 class="text-2xl font-extrabold gradient-text">Consensus Trader</h1>
-      <p class="text-xs text-slate-400">3 وكلاء ذكاء اصطناعي — إجماع قبل كل صفقة</p>
+      <h1 class="text-lg font-extrabold gradient-text leading-tight">Consensus</h1>
+      <p class="text-[10px] text-slate-400">3 وكلاء · إجماع</p>
     </div>
   </div>
-  <div class="flex items-center gap-3">
-    <div class="glass px-4 py-2 flex items-center gap-2 text-sm">
-      <span class="pulse-dot"></span>
-      <span class="text-slate-300">متصل</span>
-    </div>
-    <button id="dryToggle" onclick="toggleDryRun()" class="glass px-4 py-2 text-sm font-semibold hover:scale-105 transition">
-      <span id="dryLabel">…</span>
-    </button>
-    <button onclick="runNow()" class="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 px-4 py-2 rounded-xl text-sm font-semibold shadow-lg shadow-purple-500/30 transition hover:scale-105">
-      ▶ تشغيل دورة الآن
-    </button>
+  <div class="glass px-3 py-1.5 text-xs flex items-center gap-2">
+    <span id="pulseDot" class="pulse-dot" style="background:#64748b"></span>
+    <span id="statusText">متوقف</span>
   </div>
 </header>
 
-<main class="max-w-7xl mx-auto space-y-6">
+<button id="toggleBtn" onclick="toggleRun()" class="w-full py-4 rounded-2xl mb-4 font-bold text-lg transition-all active:scale-95" style="background: linear-gradient(135deg, #3b82f6, #8b5cf6); box-shadow: 0 10px 40px -10px rgba(139,92,246,0.5);">
+  ▶ تشغيل الوكيل
+</button>
 
-  <!-- KPI cards -->
-  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-    <div class="glass p-5">
-      <p class="text-xs text-slate-400 mb-1">رأس المال</p>
-      <p class="text-2xl font-extrabold text-white" id="equity">—</p>
-      <p class="text-xs text-slate-500 mt-1" id="equityPrev">—</p>
-    </div>
-    <div class="glass p-5">
-      <p class="text-xs text-slate-400 mb-1">P&L اليوم</p>
-      <p class="text-2xl font-extrabold" id="pnl">—</p>
-      <p class="text-xs text-slate-500 mt-1" id="pnlPct">—</p>
-    </div>
-    <div class="glass p-5">
-      <p class="text-xs text-slate-400 mb-1">مراكز مفتوحة</p>
-      <p class="text-2xl font-extrabold text-white" id="positions">—</p>
-      <p class="text-xs text-slate-500 mt-1">الحد الأقصى 3</p>
-    </div>
-    <div class="glass p-5">
-      <p class="text-xs text-slate-400 mb-1">صفقات اليوم</p>
-      <p class="text-2xl font-extrabold text-white" id="trades">—</p>
-      <p class="text-xs text-slate-500 mt-1">الحد الأقصى 5</p>
-    </div>
+<div class="flex gap-2 mb-4 overflow-x-auto pb-1">
+  <button class="tab-btn active" onclick="switchTab('overview', this)">📊 نظرة</button>
+  <button class="tab-btn" onclick="switchTab('positions', this)">💼 صفقاتي</button>
+  <button class="tab-btn" onclick="switchTab('decisions', this)">📋 قرارات</button>
+  <button class="tab-btn" onclick="switchTab('settings', this)">⚙️ إعدادات</button>
+</div>
+
+<div id="tab-overview" class="tab-pane active space-y-4">
+  <div class="grid grid-cols-2 gap-3">
+    <div class="glass p-4"><p class="text-[10px] text-slate-400 mb-1">رأس المال</p><p class="text-xl font-extrabold" id="equity">—</p></div>
+    <div class="glass p-4"><p class="text-[10px] text-slate-400 mb-1">P&L اليوم</p><p class="text-xl font-extrabold" id="pnl">—</p><p class="text-[10px] text-slate-500" id="pnlPct">—</p></div>
+    <div class="glass p-4"><p class="text-[10px] text-slate-400 mb-1">مراكز مفتوحة</p><p class="text-xl font-extrabold" id="positions">—</p></div>
+    <div class="glass p-4"><p class="text-[10px] text-slate-400 mb-1">صفقات اليوم</p><p class="text-xl font-extrabold" id="trades">—</p></div>
   </div>
-
-  <!-- Chart + Last consensus -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-    <div class="glass p-5 lg:col-span-2">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="text-sm font-bold text-slate-300">📈 منحنى رأس المال</h2>
-        <span class="text-xs text-slate-500" id="chartInfo">—</span>
-      </div>
-      <div class="h-56"><canvas id="equityChart"></canvas></div>
-    </div>
-    <div class="glass p-5">
-      <h2 class="text-sm font-bold text-slate-300 mb-3">🤝 آخر إجماع</h2>
-      <div id="lastConsensus" class="space-y-2 text-sm">
-        <p class="text-slate-500 text-xs">لا يوجد قرار بعد...</p>
-      </div>
-    </div>
+  <div class="glass p-4">
+    <h3 class="text-xs font-bold text-slate-300 mb-2">📈 منحنى رأس المال</h3>
+    <div class="h-48"><canvas id="equityChart"></canvas></div>
   </div>
-
-  <!-- Decisions + positions -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-    <div class="glass p-5 lg:col-span-2">
-      <h2 class="text-sm font-bold text-slate-300 mb-3">📋 سجل القرارات</h2>
-      <div class="max-h-96 overflow-y-auto space-y-2" id="decisionsList">
-        <p class="text-slate-500 text-xs">لا قرارات بعد...</p>
-      </div>
-    </div>
-    <div class="glass p-5">
-      <h2 class="text-sm font-bold text-slate-300 mb-3">🧠 دروس متعلَّمة</h2>
-      <div class="max-h-96 overflow-y-auto space-y-2" id="memoryList">
-        <p class="text-slate-500 text-xs">لا دروس مخزنة بعد. ستظهر بعد أول صفقات مغلقة.</p>
-      </div>
-    </div>
+  <div id="currentWork" class="glass p-4 hidden">
+    <p class="text-xs text-slate-400 mb-1">يعمل الآن على</p>
+    <p class="text-base font-bold text-blue-400" id="currentSymbol">—</p>
   </div>
-</main>
+</div>
 
-<footer class="max-w-7xl mx-auto mt-8 text-center text-xs text-slate-600">
-  Consensus Trader · نظام تجريبي بالكامل · لا تستخدم أموالًا حقيقية
-</footer>
+<div id="tab-positions" class="tab-pane space-y-3">
+  <div id="positionsList"><div class="glass p-6 text-center text-slate-500 text-sm">لا صفقات مفتوحة</div></div>
+</div>
+
+<div id="tab-decisions" class="tab-pane space-y-2">
+  <div id="decisionsList"><p class="text-slate-500 text-sm text-center">لا قرارات بعد</p></div>
+</div>
+
+<div id="tab-settings" class="tab-pane space-y-4">
+  <div class="glass p-4 space-y-4">
+    <h3 class="font-bold text-sm">⚙️ الإعدادات المباشرة</h3>
+    <div>
+      <label class="text-xs text-slate-400 block mb-1">نسبة الثقة المطلوبة: <span id="confVal" class="text-blue-400 font-bold">0.65</span></label>
+      <input type="range" id="minConfidence" class="slider w-full" min="0.3" max="0.95" step="0.05" value="0.65" oninput="document.getElementById('confVal').textContent=this.value">
+    </div>
+    <div>
+      <label class="text-xs text-slate-400 block mb-1">مخاطرة لكل صفقة (نسبة من 1)</label>
+      <input type="number" id="maxRisk" min="0.005" max="0.2" step="0.005" value="0.02">
+    </div>
+    <div>
+      <label class="text-xs text-slate-400 block mb-1">الرموز (مفصولة بفاصلة)</label>
+      <input type="text" id="symbols" value="AAPL,MSFT,NVDA">
+    </div>
+    <div>
+      <label class="text-xs text-slate-400 block mb-1">فاصل الدورة (دقائق)</label>
+      <input type="number" id="cycleInterval" min="1" max="120" value="5">
+    </div>
+    <div class="flex items-center justify-between pt-2 border-t border-slate-700/50">
+      <div>
+        <p class="text-sm font-semibold">وضع التنفيذ</p>
+        <p class="text-[10px] text-slate-400">تبديل بين تجريبي وفعلي (ورقي)</p>
+      </div>
+      <button id="dryRunToggle" onclick="toggleDryRun()" class="px-3 py-1.5 rounded-lg text-xs font-bold">—</button>
+    </div>
+    <button onclick="saveSettings()" class="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-purple-600 font-bold text-sm active:scale-95 transition">💾 حفظ الإعدادات</button>
+  </div>
+</div>
 
 <script>
 let chart = null;
-const fmt = n => "$" + Number(n || 0).toLocaleString("en-US", {maximumFractionDigits: 2});
+const fmt = n => "$" + Number(n||0).toLocaleString("en-US", {maximumFractionDigits:2});
+
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  btn.classList.add('active');
+}
+
+function updateRunUI(running, currentSymbol) {
+  const btn = document.getElementById('toggleBtn');
+  const text = document.getElementById('statusText');
+  const dot = document.getElementById('pulseDot');
+  const work = document.getElementById('currentWork');
+  if (running) {
+    btn.innerHTML = '⏸ إيقاف الوكيل';
+    btn.style.background = 'linear-gradient(135deg, #ef4444, #f97316)';
+    btn.style.boxShadow = '0 10px 40px -10px rgba(239,68,68,0.5)';
+    text.textContent = 'يعمل'; text.style.color = '#34d399';
+    dot.style.background = '#34d399';
+    work.classList.remove('hidden');
+    if (currentSymbol) document.getElementById('currentSymbol').textContent = currentSymbol;
+  } else {
+    btn.innerHTML = '▶ تشغيل الوكيل';
+    btn.style.background = 'linear-gradient(135deg, #3b82f6, #8b5cf6)';
+    btn.style.boxShadow = '0 10px 40px -10px rgba(139,92,246,0.5)';
+    text.textContent = 'متوقف'; text.style.color = '';
+    dot.style.background = '#64748b';
+    work.classList.add('hidden');
+  }
+}
+
+async function toggleRun() {
+  const btn = document.getElementById('toggleBtn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/run/toggle', {method:'POST'});
+    const d = await r.json();
+    updateRunUI(d.running);
+  } catch(e) { console.error(e); }
+  btn.disabled = false;
+}
 
 async function loadStatus() {
   try {
-    const r = await fetch("/api/status");
+    const r = await fetch('/api/status');
     const d = await r.json();
-    document.getElementById("equity").textContent = fmt(d.equity);
-    document.getElementById("equityPrev").textContent = "أمس: " + fmt(d.last_equity);
+    document.getElementById('equity').textContent = fmt(d.equity);
     const pnl = d.equity - d.last_equity;
-    const pnlPct = d.last_equity ? (pnl / d.last_equity * 100) : 0;
-    const pnlEl = document.getElementById("pnl");
-    pnlEl.textContent = (pnl >= 0 ? "+" : "") + fmt(pnl);
-    pnlEl.className = "text-2xl font-extrabold " + (pnl >= 0 ? "text-emerald-400" : "text-red-400");
-    document.getElementById("pnlPct").textContent = (pnl >= 0 ? "+" : "") + pnlPct.toFixed(2) + "%";
-    document.getElementById("positions").textContent = d.open_positions ?? 0;
-    document.getElementById("trades").textContent = d.trades_today ?? 0;
-    document.getElementById("dryLabel").textContent = d.dry_run ? "🟡 وضع تجريبي" : "🟢 تنفيذ فعلي (ورقي)";
-    document.getElementById("dryToggle").classList.toggle("text-amber-300", d.dry_run);
-    document.getElementById("dryToggle").classList.toggle("text-emerald-300", !d.dry_run);
-  } catch (e) { console.error(e); }
+    const pnlPct = d.last_equity ? (pnl/d.last_equity*100) : 0;
+    const pnlEl = document.getElementById('pnl');
+    pnlEl.textContent = (pnl>=0?'+':'') + fmt(pnl);
+    pnlEl.style.color = pnl>=0 ? '#34d399' : '#ef4444';
+    document.getElementById('pnlPct').textContent = (pnl>=0?'+':'') + pnlPct.toFixed(2) + '%';
+    document.getElementById('positions').textContent = d.open_positions ?? 0;
+    document.getElementById('trades').textContent = d.trades_today ?? 0;
+    updateRunUI(d.running, d.current_symbol);
+    const dry = document.getElementById('dryRunToggle');
+    dry.textContent = d.dry_run ? '🟡 تجريبي' : '🟢 فعلي';
+    dry.style.background = d.dry_run ? 'rgba(245,158,11,0.2)' : 'rgba(16,185,129,0.2)';
+    dry.style.color = d.dry_run ? '#fbbf24' : '#34d399';
+  } catch(e) { console.error(e); }
+}
+
+async function loadPositions() {
+  try {
+    const r = await fetch('/api/positions');
+    const data = await r.json();
+    const list = document.getElementById('positionsList');
+    if (!Array.isArray(data) || !data.length) {
+      list.innerHTML = '<div class="glass p-6 text-center text-slate-500 text-sm">لا صفقات مفتوحة</div>';
+      return;
+    }
+    list.innerHTML = data.map(p => {
+      const up = p.unrealized_pl >= 0;
+      const color = up ? '#34d399' : '#ef4444';
+      return `<div class="glass p-4">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">
+            <span class="font-extrabold text-base">${p.symbol}</span>
+            <span class="text-[10px] px-2 py-0.5 rounded-md" style="background:rgba(96,165,250,0.15);color:#60a5fa">${p.side}</span>
+          </div>
+          <span class="font-bold" style="color:${color}">${up?'+':''}${fmt(p.unrealized_pl)}</span>
+        </div>
+        <div class="grid grid-cols-3 gap-2 text-xs">
+          <div><p class="text-[10px] text-slate-400">الكمية</p><p class="font-semibold">${p.qty}</p></div>
+          <div><p class="text-[10px] text-slate-400">الدخول</p><p class="font-semibold">${fmt(p.avg_entry_price)}</p></div>
+          <div><p class="text-[10px] text-slate-400">الحالي</p><p class="font-semibold">${fmt(p.current_price)}</p></div>
+        </div>
+        <div class="mt-2 text-xs" style="color:${color}">${up?'▲':'▼'} ${p.unrealized_plpc.toFixed(2)}% · القيمة ${fmt(p.market_value)}</div>
+      </div>`;
+    }).join('');
+  } catch(e) { console.error(e); }
 }
 
 async function loadEquity() {
   try {
-    const r = await fetch("/api/equity?limit=200");
+    const r = await fetch('/api/equity?limit=200');
     const data = await r.json();
-    const labels = data.map(x => new Date(x.timestamp).toLocaleTimeString("ar-EG", {hour: "2-digit", minute: "2-digit"}));
+    const labels = data.map(x => new Date(x.timestamp).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}));
     const values = data.map(x => x.equity);
-    document.getElementById("chartInfo").textContent = data.length ? `${data.length} نقطة` : "لا بيانات";
-    if (chart) {
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = values;
-      chart.update("none");
-      return;
-    }
-    const ctx = document.getElementById("equityChart").getContext("2d");
-    const grad = ctx.createLinearGradient(0, 0, 0, 220);
-    grad.addColorStop(0, "rgba(96, 165, 250, 0.35)");
-    grad.addColorStop(1, "rgba(96, 165, 250, 0)");
+    if (chart) { chart.data.labels = labels; chart.data.datasets[0].data = values; chart.update('none'); return; }
+    const ctx = document.getElementById('equityChart').getContext('2d');
+    const grad = ctx.createLinearGradient(0,0,0,200);
+    grad.addColorStop(0,'rgba(96,165,250,0.4)'); grad.addColorStop(1,'rgba(96,165,250,0)');
     chart = new Chart(ctx, {
-      type: "line",
-      data: { labels, datasets: [{ label: "Equity", data: values, borderColor: "#60a5fa", backgroundColor: grad, fill: true, tension: 0.35, pointRadius: 0, borderWidth: 2 }] },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => fmt(c.parsed.y) } } },
-        scales: {
-          x: { grid: { color: "rgba(148,163,184,0.08)" }, ticks: { color: "#64748b", maxTicksLimit: 8 } },
-          y: { grid: { color: "rgba(148,163,184,0.08)" }, ticks: { color: "#64748b", callback: v => "$" + v } }
-        }
-      }
+      type:'line',
+      data:{ labels, datasets:[{ data: values, borderColor:'#60a5fa', backgroundColor:grad, fill:true, tension:0.35, pointRadius:0, borderWidth:2 }] },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: c => fmt(c.parsed.y) } } },
+        scales:{ x:{ grid:{color:'rgba(148,163,184,0.06)'}, ticks:{color:'#64748b',maxTicksLimit:5,font:{size:9}} },
+                 y:{ grid:{color:'rgba(148,163,184,0.06)'}, ticks:{color:'#64748b',callback:v=>'$'+v,font:{size:9}} } } }
     });
-  } catch (e) { console.error(e); }
+  } catch(e) { console.error(e); }
 }
 
 async function loadDecisions() {
   try {
-    const r = await fetch("/api/decisions?limit=30");
+    const r = await fetch('/api/decisions?limit=30');
     const data = await r.json();
-    const list = document.getElementById("decisionsList");
-    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-xs">لا قرارات بعد...</p>'; return; }
+    const list = document.getElementById('decisionsList');
+    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-sm text-center">لا قرارات بعد</p>'; return; }
     list.innerHTML = data.map(d => {
-      const dec = d.final_decision || "—";
-      const color = dec.includes("BUY") ? "text-emerald-400" : dec.includes("SELL") ? "text-red-400" : dec.includes("VETO") ? "text-amber-400" : "text-slate-400";
-      const time = new Date(d.timestamp).toLocaleString("ar-EG", {hour: "2-digit", minute: "2-digit", month: "short", day: "numeric"});
-      return `<div class="decision-row flex items-center justify-between p-3 rounded-lg bg-slate-800/30 text-xs">
-        <div class="flex items-center gap-3">
-          <span class="text-slate-500">${time}</span>
-          <span class="font-bold text-slate-200">${d.symbol}</span>
-          <span class="${color} font-bold">${dec}</span>
+      const dec = d.final_decision || '—';
+      const color = dec.includes('BUY') ? '#34d399' : dec.includes('SELL') ? '#ef4444' : dec.includes('VETO') ? '#fbbf24' : '#94a3b8';
+      const time = new Date(d.timestamp).toLocaleString('ar-EG',{hour:'2-digit',minute:'2-digit',month:'short',day:'numeric'});
+      return `<div class="glass p-3 text-xs">
+        <div class="flex items-center justify-between mb-1">
+          <div class="flex items-center gap-2"><span class="text-slate-500">${time}</span><span class="font-bold">${d.symbol}</span></div>
+          <span style="color:${color}" class="font-bold">${dec}</span>
         </div>
-        <div class="flex items-center gap-3 text-slate-400">
+        <div class="flex items-center justify-between text-slate-400">
           <span>ثقة ${(d.analyst_confidence*100).toFixed(0)}%</span>
-          ${d.consensus_reached ? '<span class="text-emerald-400">✓ إجماع</span>' : '<span class="text-amber-400">✗ لا إجماع</span>'}
+          ${d.consensus_reached ? '<span style="color:#34d399">✓ إجماع</span>' : '<span style="color:#fbbf24">✗ لا إجماع</span>'}
         </div>
       </div>`;
-    }).join("");
-
-    // آخر إجماع
-    const last = data[0];
-    const lc = document.getElementById("lastConsensus");
-    if (last) {
-      const riskColor = last.risk_veto ? "text-red-400" : last.risk_approved ? "text-emerald-400" : "text-slate-400";
-      lc.innerHTML = `
-        <div class="p-3 rounded-lg bg-slate-800/40">
-          <p class="text-xs text-slate-500 mb-1">${last.symbol} · ${new Date(last.timestamp).toLocaleTimeString("ar-EG")}</p>
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-slate-300">محلل</span>
-            <span class="font-bold ${last.analyst_signal==='BUY'?'text-emerald-400':last.analyst_signal==='SELL'?'text-red-400':'text-slate-400'}">${last.analyst_signal} (${(last.analyst_confidence*100).toFixed(0)}%)</span>
-          </div>
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-slate-300">مخاطر</span>
-            <span class="font-bold ${riskColor}">${last.risk_veto ? 'فيتو' : last.risk_approved ? 'موافقة' : 'رفض'}</span>
-          </div>
-          <div class="flex items-center justify-between">
-            <span class="text-slate-300">محفظة</span>
-            <span class="font-bold ${last.final_decision?.includes('EXECUTE')?'text-emerald-400':'text-slate-400'}">${last.final_decision}</span>
-          </div>
-        </div>
-      `;
-    }
-  } catch (e) { console.error(e); }
+    }).join('');
+  } catch(e) { console.error(e); }
 }
 
-async function loadMemory() {
+async function loadSettings() {
   try {
-    const r = await fetch("/api/memory?limit=20");
-    const data = await r.json();
-    const list = document.getElementById("memoryList");
-    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-xs">لا دروس مخزنة بعد.</p>'; return; }
-    list.innerHTML = data.map(m => `<div class="p-3 rounded-lg bg-purple-500/10 border border-purple-500/20 text-xs text-slate-300">${m.content || ''}</div>`).join("");
-  } catch (e) { console.error(e); }
+    const r = await fetch('/api/settings');
+    const s = await r.json();
+    document.getElementById('minConfidence').value = s.min_confidence;
+    document.getElementById('confVal').textContent = s.min_confidence;
+    document.getElementById('maxRisk').value = s.max_risk_per_trade;
+    document.getElementById('symbols').value = s.symbols.join(',');
+    document.getElementById('cycleInterval').value = s.cycle_interval_minutes;
+  } catch(e) { console.error(e); }
+}
+
+async function saveSettings() {
+  const payload = {
+    min_confidence: parseFloat(document.getElementById('minConfidence').value),
+    max_risk_per_trade: parseFloat(document.getElementById('maxRisk').value),
+    symbols: document.getElementById('symbols').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean),
+    cycle_interval_minutes: parseInt(document.getElementById('cycleInterval').value)
+  };
+  try {
+    await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    alert('✅ تم الحفظ');
+    loadSettings();
+  } catch(e) { alert('فشل: ' + e); }
 }
 
 async function toggleDryRun() {
-  const cur = document.getElementById("dryLabel").textContent.includes("تجريبي");
-  if (cur && !confirm("تحذير: التحويل إلى التنفيذ الفعلي سيبدأ إرسال أوامر حقيقية على الحساب الورقي. متأكد؟")) return;
-  await fetch("/api/settings/dry_run", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({dry_run: !cur})
-  });
+  const s = await (await fetch('/api/settings')).json();
+  if (s.dry_run && !confirm('⚠️ تحويل إلى التنفيذ الفعلي (ورقي). متأكد؟')) return;
+  await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dry_run: !s.dry_run}) });
   loadStatus();
 }
 
-async function runNow() {
-  await fetch("/api/run-cycle", {method: "POST"});
-  document.getElementById("dryLabel").textContent = "⏳ يعمل...";
-  setTimeout(() => loadAll(), 4000);
-}
-
-function loadAll() { loadStatus(); loadEquity(); loadDecisions(); loadMemory(); }
-
-loadAll();
-setInterval(loadAll, 4000);
+function loadAll() { loadStatus(); loadPositions(); loadEquity(); loadDecisions(); }
+loadAll(); loadSettings();
+setInterval(loadAll, 5000);
 </script>
 </body>
 </html>
