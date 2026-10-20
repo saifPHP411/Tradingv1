@@ -1,14 +1,29 @@
+import os
+import sqlite3
+from pathlib import Path
+
+from langchain_ollama import ChatOllama
 from langgraph.store.sqlite import SqliteStore
 from langmem import create_manage_memory_tool, create_search_memory_tool
-from langchain_ollama import ChatOllama
-from config import OLLAMA_MODEL, OLLAMA_BASE_URL
+from config import OLLAMA_MODEL, OLLAMA_BASE_URL, OLLAMA_API_KEY
 import json
 
-llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0)
+# مسار قاعدة الذاكرة داخل Volume
+_mem_path = os.getenv("MEMORY_DB_PATH", "trading_memory.db")
+Path(_mem_path).parent.mkdir(parents=True, exist_ok=True)
 
-# متجر ذاكرة دائم في ملف SQLite (يبقى بعد إغلاق البرنامج)
-import os
-store = SqliteStore.from_conn_string(os.getenv("MEMORY_DB_PATH", "trading_memory.db"))
+_llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+llm = ChatOllama(
+    model=OLLAMA_MODEL,
+    base_url=OLLAMA_BASE_URL,
+    temperature=0,
+    headers=_llm_headers,
+)
+
+# اتصال sqlite3 مباشر وليس from_conn_string
+_store_conn = sqlite3.connect(_mem_path, check_same_thread=False)
+store = SqliteStore(_store_conn)
+store.setup()
 
 def build_memory_tools():
     """أدوات تخزين واسترجاع الذاكرة (LangMem)."""
