@@ -46,23 +46,20 @@ def analyst_agent(state: TradingState) -> dict:
 def risk_manager_agent(state: TradingState) -> dict:
     analyst = state["analyst_report"]
     data = state["market_data"]
+    symbol = state["symbol"]
     settings = get_all_settings()
     min_conf = settings["min_confidence"]
     max_risk = settings["max_risk_per_trade"]
     signal = analyst.get("signal", "HOLD")
 
     if analyst.get("confidence", 0) < min_conf:
-        return {
-            "risk_report": {"approved": False, "veto": True,
-                            "reason": f"ثقة ({analyst.get('confidence', 0):.2f}) < حد ({min_conf:.2f})"},
-            "logs": [f"مدير المخاطر: فيتو — ثقة أقل من {min_conf:.2f}"]
-        }
+        return {"risk_report": {"approved": False, "veto": True,
+            "reason": f"ثقة ({analyst.get('confidence', 0):.2f}) < حد ({min_conf:.2f})"},
+            "logs": [f"مدير المخاطر: فيتو — ثقة أقل من {min_conf:.2f}"]}
 
     if signal == "HOLD":
-        return {
-            "risk_report": {"approved": False, "veto": False, "reason": "إشارة HOLD"},
-            "logs": ["مدير المخاطر: HOLD — لا صفقة"]
-        }
+        return {"risk_report": {"approved": False, "veto": False, "reason": "إشارة HOLD"},
+                "logs": ["مدير المخاطر: HOLD — لا صفقة"]}
 
     rsi = data.get("rsi14", 50)
     sma20 = data.get("sma20", 0)
@@ -70,68 +67,85 @@ def risk_manager_agent(state: TradingState) -> dict:
     last = data.get("last_close", 0)
 
     if signal == "BUY" and (rsi > 75 or (sma20 < sma50 and last < sma50)):
-        return {
-            "risk_report": {"approved": False, "veto": True, "reason": "مخاطر شراء مرتفعة (RSI/اتجاه)"},
-            "logs": ["مدير المخاطر: فيتو (RSI/اتجاه)"]
-        }
-    if signal == "SELL" and rsi < 25:
-        return {
-            "risk_report": {"approved": False, "veto": True, "reason": "مخاطر بيع مرتفعة (RSI)"},
-            "logs": ["مدير المخاطر: فيتو (RSI)"]
-        }
+        return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر شراء مرتفعة (RSI/اتجاه)"},
+                "logs": ["مدير المخاطر: فيتو (RSI/اتجاه)"]}
 
-    # رأس المال الفعلي والقوة الشرائية
+    # === جلب رأس المال الحقيقي ===
     from safety import get_account_snapshot
     snap = get_account_snapshot()
-    equity = snap.get("equity", 10000) or 10000
-    buying_power = snap.get("buying_power", equity) or equity
+    real_equity = snap.get("equity", 10000) or 10000
+    real_buying_power = snap.get("buying_power", real_equity) or real_equity
 
-    # SL/TP حسب اتجاه الصفقة
+    # === تطبيق رأس المال المخصص للتداول ===
+    trading_capital = settings.get("trading_capital", 0) or 0
+    if trading_capital > 0:
+        equity = min(real_equity, trading_capital)
+        buying_power = min(real_buying_power, trading_capital)
+        capital_note = f" (رأس مال مخصص ${trading_capital:.0f})"
+    else:
+        equity = real_equity
+        buying_power = real_buying_power
+        capital_note = ""
+
+    # === جلب المركز الحالي ===
+    current_qty = 0.0
+    try:
+        from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
+        if ALPACA_API_KEY and ALPACA_SECRET_KEY:
+            from alpaca.trading.client import TradingClient
+            client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
+            for p in client.get_all_positions():
+                if p.symbol == symbol:
+                    current_qty = float(p.qty)
+                    break
+    except Exception as e:
+        print(f"⚠️ تعذر جلب المراكز: {e}")
+
+    # === SELL ===
+    if signal == "SELL":
+        if current_qty <= 0:
+            return {"risk_report": {"approved": False, "veto": False,
+                "reason": f"لا مركز في {symbol} لإغلاقه"},
+                "logs": [f"مدير المخاطر: تجاهل SELL — لا مركز لإغلاقه"]}
+        order_qty = int(current_qty)
+        return {"risk_report": {"approved": True, "veto": False,
+            "position_size": order_qty,
+            "stop_loss": round(last * 1.02, 2),
+            "take_profit": round(last * 0.96, 2),
+            "entry_price": round(last, 2), "side": "sell",
+            "estimated_cost": round(order_qty * last, 2)},
+            "logs": [f"مدير المخاطر: موافقة إغلاق {symbol} ({order_qty} سهم){capital_note}"]}
+
+    # === BUY ===
     if signal == "BUY":
         stop_loss = round(last * 0.98, 2)
         take_profit = round(last * 1.04, 2)
-    else:  # SELL
-        stop_loss = round(last * 1.02, 2)
-        take_profit = round(last * 0.96, 2)
+        risk_amount = equity * max_risk
+        stop_distance = abs(last - stop_loss)
+        pos_size = max(1, int(risk_amount / stop_distance)) if stop_distance > 0 else 0
 
-    # حجم المركز بناءً على المخاطرة
-    risk_amount = equity * max_risk
-    stop_distance = abs(last - stop_loss)
-    pos_size = max(1, int(risk_amount / stop_distance)) if stop_distance > 0 else 0
+        # سقف المركز: 10% من رأس المال المخصص
+        max_pos_value = equity * 0.10
+        if pos_size * last > max_pos_value:
+            pos_size = max(1, int(max_pos_value / last))
 
-    # سقف: لا نفتح مركزاً أكبر من 10% من رأس المال
-    max_pos_value = equity * 0.10
-    if pos_size * last > max_pos_value:
-        pos_size = max(1, int(max_pos_value / last))
+        estimated_cost = pos_size * last
+        if estimated_cost > buying_power:
+            return {"risk_report": {"approved": False, "veto": True,
+                "reason": f"قوة شرائية غير كافية (تحتاج ~${estimated_cost:.0f}, متاح ${buying_power:.0f}){capital_note}"},
+                "logs": [f"مدير المخاطر: فيتو — ${buying_power:.0f} < ${estimated_cost:.0f}{capital_note}"]}
+        if pos_size < 1:
+            return {"risk_report": {"approved": False, "veto": True, "reason": "حجم صفر"},
+                    "logs": ["مدير المخاطر: فيتو (حجم صفر)"]}
+        return {"risk_report": {"approved": True, "veto": False,
+            "position_size": pos_size,
+            "stop_loss": stop_loss, "take_profit": take_profit,
+            "entry_price": round(last, 2), "side": "buy",
+            "estimated_cost": round(estimated_cost, 2)},
+            "logs": [f"مدير المخاطر: موافقة شراء (حجم={pos_size}, ~${estimated_cost:.0f}){capital_note}"]}
 
-    # فحص القوة الشرائية (للشراء فقط)
-    estimated_cost = pos_size * last
-    if signal == "BUY" and estimated_cost > buying_power:
-        return {
-            "risk_report": {"approved": False, "veto": True,
-                            "reason": f"قوة شرائية غير كافية (تحتاج ~${estimated_cost:.0f}, متاح ${buying_power:.0f})"},
-            "logs": [f"مدير المخاطر: فيتو — قوة شرائية ${buying_power:.0f} < ${estimated_cost:.0f}"]
-        }
-
-    if pos_size < 1:
-        return {
-            "risk_report": {"approved": False, "veto": True, "reason": "حجم المركز صفر"},
-            "logs": ["مدير المخاطر: فيتو (حجم صفر)"]
-        }
-
-    report = {
-        "approved": True, "veto": False,
-        "position_size": pos_size,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "entry_price": round(last, 2),
-        "side": "buy" if signal == "BUY" else "sell",
-        "estimated_cost": round(estimated_cost, 2),
-    }
-    return {
-        "risk_report": report,
-        "logs": [f"مدير المخاطر: موافقة (حجم={pos_size}, قيمة~${estimated_cost:.0f})"]
-    }
+    return {"risk_report": {"approved": False, "veto": True, "reason": "إشارة غير معروفة"},
+            "logs": ["مدير المخاطر: فيتو (إشارة غير معروفة)"]}
 
 
 def portfolio_manager_agent(state: TradingState) -> dict:
