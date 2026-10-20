@@ -14,3 +14,5 @@ uvicorn[standard]
 jinja2
 aiofiles
 python-multipart
+pyarrow
+python-dateutil
