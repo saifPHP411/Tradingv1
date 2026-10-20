@@ -44,6 +44,17 @@ def init_db():
     key TEXT PRIMARY KEY,
     value TEXT,
     updated_at TEXT)""")
+# Migrations — safe to re-run
+for col, ctype in [
+    ("stop_order_id", "TEXT"),
+    ("initial_stop", "REAL"),
+    ("initial_risk_per_share", "REAL"),
+    ("trailing_active", "INTEGER DEFAULT 0"),
+]:
+    try:
+        conn.execute(f"ALTER TABLE position_state ADD COLUMN {col} {ctype}")
+    except Exception:
+        pass  # already exists
         conn.commit()
 
 
@@ -237,3 +248,35 @@ def set_cooldown_until(iso_ts: str):
 
 def clear_cooldown():
     set_trading_state("cooldown_until", "")
+def set_position_initial_stop(symbol: str, initial_stop: float, risk_per_share: float):
+    """Sets initial_stop only once — for R calculations."""
+    state = get_position_state(symbol)
+    if not state:
+        return
+    if state.get("initial_stop"):
+        return  # already set
+    update_position_state(symbol,
+                          initial_stop=round(initial_stop, 4),
+                          initial_risk_per_share=round(risk_per_share, 4))
+
+
+def update_stop_order_id(symbol: str, stop_order_id: str):
+    update_position_state(symbol, stop_order_id=str(stop_order_id))
+
+
+def set_trailing_active(symbol: str, active: bool):
+    update_position_state(symbol, trailing_active=1 if active else 0)
+
+
+def get_r_multiple(symbol: str, current_price: float) -> float | None:
+    """Returns current profit/loss in R multiples."""
+    s = get_position_state(symbol)
+    if not s or not s.get("initial_stop") or not s.get("initial_risk_per_share"):
+        return None
+    entry = s["entry_price"]
+    rps = s["initial_risk_per_share"]
+    if rps <= 0:
+        return None
+    if s["side"] == "long":
+        return (current_price - entry) / rps
+    return (entry - current_price) / rps
