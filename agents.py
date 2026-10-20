@@ -6,6 +6,7 @@ from config import (
 from settings import get_all_settings
 from state import TradingState
 from signals import compute_all_indicators, compute_signal_score
+from risk_engine import check_portfolio_exposure
 from safety import get_account_snapshot
 import json, re
 
