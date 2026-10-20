@@ -36,6 +36,7 @@ DEFAULTS = {
 "min_hold_minutes": "30",
 "min_loss_to_close_pct": "1.5",
 "llm_exit_min_confidence": "0.70",
+    "min_stop_move_pct": "0.3",
 }
 
 def _ensure_defaults():
@@ -74,6 +75,7 @@ def get_all_settings() -> dict:
 "min_hold_minutes": int(get_setting("min_hold_minutes")),
 "min_loss_to_close_pct": float(get_setting("min_loss_to_close_pct")),
 "llm_exit_min_confidence": float(get_setting("llm_exit_min_confidence")),
+        "min_stop_move_pct": float(get_setting("min_stop_move_pct")),
     }
 
 def update_settings(payload: dict):
