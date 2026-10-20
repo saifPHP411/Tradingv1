@@ -7,7 +7,8 @@ import json
 llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0)
 
 # متجر ذاكرة دائم في ملف SQLite (يبقى بعد إغلاق البرنامج)
-store = SqliteStore.from_conn_string("trading_memory.db")
+import os
+store = SqliteStore.from_conn_string(os.getenv("MEMORY_DB_PATH", "trading_memory.db"))
 
 def build_memory_tools():
     """أدوات تخزين واسترجاع الذاكرة (LangMem)."""
