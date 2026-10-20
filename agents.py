@@ -6,8 +6,8 @@ from config import (
 from settings import get_all_settings
 from state import TradingState
 from signals import compute_all_indicators, compute_signal_score
-from risk_engine import check_portfolio_exposure
 from safety import get_account_snapshot
+from risk_engine import check_portfolio_exposure
 import json, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
@@ -27,7 +27,11 @@ def analyst_agent(state: TradingState) -> dict:
 
     if not data or "atr14" not in data:
         return {
-            "analyst_report": {"signal": "HOLD", "confidence": 0.0, "reason": "no valid indicators"},
+            "analyst_report": {
+                "signal": "HOLD", "confidence": 0.0,
+                "reason": "no valid indicators",
+                "signal_score": 0,
+            },
             "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة"],
         }
 
@@ -68,7 +72,9 @@ def analyst_agent(state: TradingState) -> dict:
 
     report["signal_score"] = sig["score"]
     report["agent"] = "analyst"
-    log = f"المحلل[{symbol}]: {report.get('signal')} conf={report.get('confidence', 0):.2f} score={sig['score']} — {report.get('reason', '')[:100]}"
+    log = (f"المحلل[{symbol}]: {report.get('signal')} "
+           f"conf={report.get('confidence', 0):.2f} "
+           f"score={sig['score']} — {report.get('reason', '')[:100]}")
     return {"analyst_report": report, "logs": [log]}
 
 
@@ -85,29 +91,31 @@ def risk_manager_agent(state: TradingState) -> dict:
 
     # Rule 1: confidence
     if confidence < MIN_CONFIDENCE:
-        return _veto(f"confidence {confidence:.2f} < {MIN_CONFIDENCE}")
+        return _veto(symbol, f"confidence {confidence:.2f} < {MIN_CONFIDENCE}")
 
     # Rule 2: signal score
     if signal_score < MIN_SIGNAL_SCORE:
-        return _veto(f"signal_score {signal_score} < {MIN_SIGNAL_SCORE}")
+        return _veto(symbol, f"signal_score {signal_score} < {MIN_SIGNAL_SCORE}")
 
     # Rule 3: HOLD
     if signal == "HOLD":
-        return {"risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
-                "logs": [f"مدير المخاطر[{symbol}]: HOLD"]}
+        return {
+            "risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
+            "logs": [f"مدير المخاطر[{symbol}]: HOLD"],
+        }
 
     # Rule 4: basic sanity on indicators
     atr = data.get("atr14", 0)
     last = data.get("last_close", 0)
     if atr <= 0 or last <= 0:
-        return _veto("ATR or price invalid")
+        return _veto(symbol, "ATR or price invalid")
 
     # Rule 5: RSI extremes
     rsi = data.get("rsi14", 50)
     if signal == "BUY" and rsi > 78:
-        return _veto(f"RSI {rsi:.1f} overbought")
+        return _veto(symbol, f"RSI {rsi:.1f} overbought")
     if signal == "SELL" and rsi < 22:
-        return _veto(f"RSI {rsi:.1f} oversold")
+        return _veto(symbol, f"RSI {rsi:.1f} oversold")
 
     # ===== POSITION SIZING =====
     snap = get_account_snapshot()
@@ -121,14 +129,14 @@ def risk_manager_agent(state: TradingState) -> dict:
         buying_power = min(buying_power, trading_capital)
 
     if equity <= 0:
-        return _veto("equity <= 0")
+        return _veto(symbol, "equity <= 0")
 
     risk_amount = equity * settings["max_risk_per_trade"]
 
     # ATR-based stop
     stop_distance = atr * settings["stop_atr_multiplier"]
     if stop_distance <= 0 or stop_distance > last * 0.15:
-        return _veto(f"stop distance unreasonable ({stop_distance:.2f})")
+        return _veto(symbol, f"stop distance unreasonable ({stop_distance:.2f})")
 
     # R-multiple target
     take_profit_distance = stop_distance * settings["take_profit_rr"]
@@ -136,14 +144,14 @@ def risk_manager_agent(state: TradingState) -> dict:
     if signal == "BUY":
         stop_price = last - stop_distance
         take_profit = last + take_profit_distance
-    else:  # SELL -> only if we hold a position; caller will filter
+    else:  # SELL — only if we hold a position, caller will filter
         stop_price = last + stop_distance
         take_profit = last - take_profit_distance
 
     # Core sizing formula
     pos_size = risk_amount / stop_distance
     if pos_size <= 0:
-        return _veto("position size <= 0")
+        return _veto(symbol, "position size <= 0")
 
     # Cap 1: position notional <= max_position_pct of equity
     max_notional = equity * settings["max_position_pct"]
@@ -153,11 +161,20 @@ def risk_manager_agent(state: TradingState) -> dict:
     # Cap 2: buying power
     estimated_cost = pos_size * last
     if estimated_cost > buying_power:
-        return _veto(f"buying_power insufficient ({estimated_cost:.2f} > {buying_power:.2f})")
+        return _veto(
+            symbol,
+            f"buying_power insufficient ({estimated_cost:.2f} > {buying_power:.2f})"
+        )
 
     # Minimum meaningful position
     if estimated_cost < 1.0:
-        return _veto("position too small (<$1)")
+        return _veto(symbol, "position too small (<$1)")
+
+    # ===== Portfolio Exposure Check (Phase 2) =====
+    if signal == "BUY":
+        exp_ok, exp_reason = check_portfolio_exposure(symbol, estimated_cost)
+        if not exp_ok:
+            return _veto(symbol, f"exposure: {exp_reason}")
 
     # Round to 4 decimals (fractional)
     pos_size = round(pos_size, 4)
@@ -165,7 +182,10 @@ def risk_manager_agent(state: TradingState) -> dict:
     # Sanity: expected risk must not exceed limit
     actual_risk = pos_size * stop_distance
     if actual_risk > risk_amount * 1.05:
-        return _veto(f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}")
+        return _veto(
+            symbol,
+            f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}"
+        )
 
     report = {
         "approved": True, "veto": False,
@@ -185,18 +205,25 @@ def risk_manager_agent(state: TradingState) -> dict:
     return {"risk_report": report, "logs": [log]}
 
 
-def _veto(reason: str) -> dict:
-    return {"risk_report": {"approved": False, "veto": True, "reason": reason},
-            "logs": [f"مدير المخاطر: فيتو — {reason}"]}
+def _veto(symbol: str, reason: str) -> dict:
+    return {
+        "risk_report": {"approved": False, "veto": True, "reason": reason},
+        "logs": [f"مدير المخاطر[{symbol}]: فيتو — {reason}"],
+    }
 
 
 # =============== PORTFOLIO MANAGER ===============
 def portfolio_manager_agent(state: TradingState) -> dict:
     risk = state["risk_report"]
+    symbol = state.get("symbol", "?")
+
     if risk.get("veto") or not risk.get("approved"):
         decision = "VETO" if risk.get("veto") else "HOLD"
-        return {"final_decision": decision, "consensus_reached": False,
-                "logs": [f"مدير المحفظة: {decision}"]}
+        return {
+            "final_decision": decision,
+            "consensus_reached": False,
+            "logs": [f"مدير المحفظة[{symbol}]: {decision}"],
+        }
 
     signal = state["analyst_report"].get("signal", "HOLD")
     decision = {"BUY": "EXECUTE_BUY", "SELL": "EXECUTE_SELL"}.get(signal, "HOLD")
@@ -204,7 +231,7 @@ def portfolio_manager_agent(state: TradingState) -> dict:
     order = None
     if decision.startswith("EXECUTE"):
         order = {
-            "symbol": state["symbol"],
+            "symbol": symbol,
             "side": "buy" if decision == "EXECUTE_BUY" else "sell",
             "qty": risk["position_size"],
             "stop_loss": risk["stop_loss"],
@@ -214,11 +241,15 @@ def portfolio_manager_agent(state: TradingState) -> dict:
             "atr": risk["atr"],
         }
 
-    return {"final_decision": decision, "order_details": order,
-            "consensus_reached": decision != "HOLD",
-            "logs": [f"مدير المحفظة: {decision}"]}
+    return {
+        "final_decision": decision,
+        "order_details": order,
+        "consensus_reached": decision != "HOLD",
+        "logs": [f"مدير المحفظة[{symbol}]: {decision}"],
+    }
 
 
+# =============== HELPERS ===============
 def _parse_llm_json(text) -> dict:
     try:
         if not isinstance(text, str):
