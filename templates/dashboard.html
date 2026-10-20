@@ -1,1 +1,275 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consensus Trader — لوحة التحكم</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { font-family: 'Inter', sans-serif; }
+  body {
+    background: radial-gradient(circle at 20% 0%, #1e293b 0%, #0f172a 40%, #020617 100%);
+    min-height: 100vh;
+    color: #e2e8f0;
+  }
+  .glass {
+    background: rgba(30, 41, 59, 0.55);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 1.25rem;
+    transition: all 0.3s ease;
+  }
+  .glass:hover { border-color: rgba(148, 163, 184, 0.25); }
+  .gradient-text {
+    background: linear-gradient(135deg, #60a5fa, #a78bfa, #f472b6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .pulse-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #34d399;
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(52,211,153,0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(52,211,153,0); }
+    100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+  }
+  .decision-row { transition: all 0.2s ease; }
+  .decision-row:hover { background: rgba(51, 65, 85, 0.5); }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body class="p-4 md:p-8">
 
+<!-- Header -->
+<header class="max-w-7xl mx-auto mb-6 flex flex-wrap items-center justify-between gap-4">
+  <div class="flex items-center gap-3">
+    <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 flex items-center justify-center text-2xl shadow-lg shadow-purple-500/30">🤖</div>
+    <div>
+      <h1 class="text-2xl font-extrabold gradient-text">Consensus Trader</h1>
+      <p class="text-xs text-slate-400">3 وكلاء ذكاء اصطناعي — إجماع قبل كل صفقة</p>
+    </div>
+  </div>
+  <div class="flex items-center gap-3">
+    <div class="glass px-4 py-2 flex items-center gap-2 text-sm">
+      <span class="pulse-dot"></span>
+      <span class="text-slate-300">متصل</span>
+    </div>
+    <button id="dryToggle" onclick="toggleDryRun()" class="glass px-4 py-2 text-sm font-semibold hover:scale-105 transition">
+      <span id="dryLabel">…</span>
+    </button>
+    <button onclick="runNow()" class="bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 px-4 py-2 rounded-xl text-sm font-semibold shadow-lg shadow-purple-500/30 transition hover:scale-105">
+      ▶ تشغيل دورة الآن
+    </button>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto space-y-6">
+
+  <!-- KPI cards -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="glass p-5">
+      <p class="text-xs text-slate-400 mb-1">رأس المال</p>
+      <p class="text-2xl font-extrabold text-white" id="equity">—</p>
+      <p class="text-xs text-slate-500 mt-1" id="equityPrev">—</p>
+    </div>
+    <div class="glass p-5">
+      <p class="text-xs text-slate-400 mb-1">P&L اليوم</p>
+      <p class="text-2xl font-extrabold" id="pnl">—</p>
+      <p class="text-xs text-slate-500 mt-1" id="pnlPct">—</p>
+    </div>
+    <div class="glass p-5">
+      <p class="text-xs text-slate-400 mb-1">مراكز مفتوحة</p>
+      <p class="text-2xl font-extrabold text-white" id="positions">—</p>
+      <p class="text-xs text-slate-500 mt-1">الحد الأقصى 3</p>
+    </div>
+    <div class="glass p-5">
+      <p class="text-xs text-slate-400 mb-1">صفقات اليوم</p>
+      <p class="text-2xl font-extrabold text-white" id="trades">—</p>
+      <p class="text-xs text-slate-500 mt-1">الحد الأقصى 5</p>
+    </div>
+  </div>
+
+  <!-- Chart + Last consensus -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="glass p-5 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-bold text-slate-300">📈 منحنى رأس المال</h2>
+        <span class="text-xs text-slate-500" id="chartInfo">—</span>
+      </div>
+      <div class="h-56"><canvas id="equityChart"></canvas></div>
+    </div>
+    <div class="glass p-5">
+      <h2 class="text-sm font-bold text-slate-300 mb-3">🤝 آخر إجماع</h2>
+      <div id="lastConsensus" class="space-y-2 text-sm">
+        <p class="text-slate-500 text-xs">لا يوجد قرار بعد...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Decisions + positions -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="glass p-5 lg:col-span-2">
+      <h2 class="text-sm font-bold text-slate-300 mb-3">📋 سجل القرارات</h2>
+      <div class="max-h-96 overflow-y-auto space-y-2" id="decisionsList">
+        <p class="text-slate-500 text-xs">لا قرارات بعد...</p>
+      </div>
+    </div>
+    <div class="glass p-5">
+      <h2 class="text-sm font-bold text-slate-300 mb-3">🧠 دروس متعلَّمة</h2>
+      <div class="max-h-96 overflow-y-auto space-y-2" id="memoryList">
+        <p class="text-slate-500 text-xs">لا دروس مخزنة بعد. ستظهر بعد أول صفقات مغلقة.</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="max-w-7xl mx-auto mt-8 text-center text-xs text-slate-600">
+  Consensus Trader · نظام تجريبي بالكامل · لا تستخدم أموالًا حقيقية
+</footer>
+
+<script>
+let chart = null;
+const fmt = n => "$" + Number(n || 0).toLocaleString("en-US", {maximumFractionDigits: 2});
+
+async function loadStatus() {
+  try {
+    const r = await fetch("/api/status");
+    const d = await r.json();
+    document.getElementById("equity").textContent = fmt(d.equity);
+    document.getElementById("equityPrev").textContent = "أمس: " + fmt(d.last_equity);
+    const pnl = d.equity - d.last_equity;
+    const pnlPct = d.last_equity ? (pnl / d.last_equity * 100) : 0;
+    const pnlEl = document.getElementById("pnl");
+    pnlEl.textContent = (pnl >= 0 ? "+" : "") + fmt(pnl);
+    pnlEl.className = "text-2xl font-extrabold " + (pnl >= 0 ? "text-emerald-400" : "text-red-400");
+    document.getElementById("pnlPct").textContent = (pnl >= 0 ? "+" : "") + pnlPct.toFixed(2) + "%";
+    document.getElementById("positions").textContent = d.open_positions ?? 0;
+    document.getElementById("trades").textContent = d.trades_today ?? 0;
+    document.getElementById("dryLabel").textContent = d.dry_run ? "🟡 وضع تجريبي" : "🟢 تنفيذ فعلي (ورقي)";
+    document.getElementById("dryToggle").classList.toggle("text-amber-300", d.dry_run);
+    document.getElementById("dryToggle").classList.toggle("text-emerald-300", !d.dry_run);
+  } catch (e) { console.error(e); }
+}
+
+async function loadEquity() {
+  try {
+    const r = await fetch("/api/equity?limit=200");
+    const data = await r.json();
+    const labels = data.map(x => new Date(x.timestamp).toLocaleTimeString("ar-EG", {hour: "2-digit", minute: "2-digit"}));
+    const values = data.map(x => x.equity);
+    document.getElementById("chartInfo").textContent = data.length ? `${data.length} نقطة` : "لا بيانات";
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.update("none");
+      return;
+    }
+    const ctx = document.getElementById("equityChart").getContext("2d");
+    const grad = ctx.createLinearGradient(0, 0, 0, 220);
+    grad.addColorStop(0, "rgba(96, 165, 250, 0.35)");
+    grad.addColorStop(1, "rgba(96, 165, 250, 0)");
+    chart = new Chart(ctx, {
+      type: "line",
+      data: { labels, datasets: [{ label: "Equity", data: values, borderColor: "#60a5fa", backgroundColor: grad, fill: true, tension: 0.35, pointRadius: 0, borderWidth: 2 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => fmt(c.parsed.y) } } },
+        scales: {
+          x: { grid: { color: "rgba(148,163,184,0.08)" }, ticks: { color: "#64748b", maxTicksLimit: 8 } },
+          y: { grid: { color: "rgba(148,163,184,0.08)" }, ticks: { color: "#64748b", callback: v => "$" + v } }
+        }
+      }
+    });
+  } catch (e) { console.error(e); }
+}
+
+async function loadDecisions() {
+  try {
+    const r = await fetch("/api/decisions?limit=30");
+    const data = await r.json();
+    const list = document.getElementById("decisionsList");
+    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-xs">لا قرارات بعد...</p>'; return; }
+    list.innerHTML = data.map(d => {
+      const dec = d.final_decision || "—";
+      const color = dec.includes("BUY") ? "text-emerald-400" : dec.includes("SELL") ? "text-red-400" : dec.includes("VETO") ? "text-amber-400" : "text-slate-400";
+      const time = new Date(d.timestamp).toLocaleString("ar-EG", {hour: "2-digit", minute: "2-digit", month: "short", day: "numeric"});
+      return `<div class="decision-row flex items-center justify-between p-3 rounded-lg bg-slate-800/30 text-xs">
+        <div class="flex items-center gap-3">
+          <span class="text-slate-500">${time}</span>
+          <span class="font-bold text-slate-200">${d.symbol}</span>
+          <span class="${color} font-bold">${dec}</span>
+        </div>
+        <div class="flex items-center gap-3 text-slate-400">
+          <span>ثقة ${(d.analyst_confidence*100).toFixed(0)}%</span>
+          ${d.consensus_reached ? '<span class="text-emerald-400">✓ إجماع</span>' : '<span class="text-amber-400">✗ لا إجماع</span>'}
+        </div>
+      </div>`;
+    }).join("");
+
+    // آخر إجماع
+    const last = data[0];
+    const lc = document.getElementById("lastConsensus");
+    if (last) {
+      const riskColor = last.risk_veto ? "text-red-400" : last.risk_approved ? "text-emerald-400" : "text-slate-400";
+      lc.innerHTML = `
+        <div class="p-3 rounded-lg bg-slate-800/40">
+          <p class="text-xs text-slate-500 mb-1">${last.symbol} · ${new Date(last.timestamp).toLocaleTimeString("ar-EG")}</p>
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-slate-300">محلل</span>
+            <span class="font-bold ${last.analyst_signal==='BUY'?'text-emerald-400':last.analyst_signal==='SELL'?'text-red-400':'text-slate-400'}">${last.analyst_signal} (${(last.analyst_confidence*100).toFixed(0)}%)</span>
+          </div>
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-slate-300">مخاطر</span>
+            <span class="font-bold ${riskColor}">${last.risk_veto ? 'فيتو' : last.risk_approved ? 'موافقة' : 'رفض'}</span>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-slate-300">محفظة</span>
+            <span class="font-bold ${last.final_decision?.includes('EXECUTE')?'text-emerald-400':'text-slate-400'}">${last.final_decision}</span>
+          </div>
+        </div>
+      `;
+    }
+  } catch (e) { console.error(e); }
+}
+
+async function loadMemory() {
+  try {
+    const r = await fetch("/api/memory?limit=20");
+    const data = await r.json();
+    const list = document.getElementById("memoryList");
+    if (!data.length) { list.innerHTML = '<p class="text-slate-500 text-xs">لا دروس مخزنة بعد.</p>'; return; }
+    list.innerHTML = data.map(m => `<div class="p-3 rounded-lg bg-purple-500/10 border border-purple-500/20 text-xs text-slate-300">${m.content || ''}</div>`).join("");
+  } catch (e) { console.error(e); }
+}
+
+async function toggleDryRun() {
+  const cur = document.getElementById("dryLabel").textContent.includes("تجريبي");
+  if (cur && !confirm("تحذير: التحويل إلى التنفيذ الفعلي سيبدأ إرسال أوامر حقيقية على الحساب الورقي. متأكد؟")) return;
+  await fetch("/api/settings/dry_run", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({dry_run: !cur})
+  });
+  loadStatus();
+}
+
+async function runNow() {
+  await fetch("/api/run-cycle", {method: "POST"});
+  document.getElementById("dryLabel").textContent = "⏳ يعمل...";
+  setTimeout(() => loadAll(), 4000);
+}
+
+function loadAll() { loadStatus(); loadEquity(); loadDecisions(); loadMemory(); }
+
+loadAll();
+setInterval(loadAll, 4000);
+</script>
+</body>
+</html>
