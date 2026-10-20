@@ -5,7 +5,7 @@ from state import TradingState
 import json, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
-llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1, headers=_llm_headers)
+llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1, headers=_llm_headers, format="json")
 
 def analyst_agent(state: TradingState) -> dict:
     data = state["market_data"]
@@ -19,8 +19,12 @@ def analyst_agent(state: TradingState) -> dict:
 
     أجب بـ JSON فقط: {{"signal":"BUY/SELL/HOLD","confidence":0-1,"reason":"..."}}
     """
-    response = llm.invoke(prompt)
+    report = {"signal": "HOLD", "confidence": 0.0, "reason": "فشل"}
+for attempt in range(2):
+    response = llm.invoke(prompt + ("\n\nأعد الإجابة بصيغة JSON صالحة فقط بدون أي نص إضافي." if attempt else ""))
     report = _parse_json(response.content)
+    if report.get("confidence", 0) > 0 and report.get("signal") in ("BUY", "SELL", "HOLD"):
+        break
     report["agent"] = "analyst"
     log = f"المحلل: {report.get('signal')} ثقة={report.get('confidence', 0):.2f} — {report.get('reason', '')}"
     return {"analyst_report": report, "logs": [log]}
