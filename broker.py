@@ -6,6 +6,7 @@ from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 from settings import is_dry_run
 from safety import check_safety_gates
 
+
 def execute_order(order: dict) -> dict:
     if is_dry_run():
         return {"status": "dry_run", "message": f"كان سيتم تنفيذ: {order}"}
@@ -19,36 +20,53 @@ def execute_order(order: dict) -> dict:
 
     client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER)
 
-    # فحص القوة الشرائية قبل الإرسال
+    # فحص القوة الشرائية
     try:
         acct = client.get_account()
         buying_power = float(acct.buying_power)
         est_cost = order.get("estimated_cost", order["qty"] * order.get("entry_price", 0))
         if order["side"] == "buy" and est_cost > buying_power:
             return {"status": "blocked",
-                    "reason": f"قوة شرائية غير كافية (تحتاج ~${est_cost:.0f}, متاح ${buying_power:.0f})"}
+                    "reason": f"قوة شرائية غير كافية (تحتاج ~${est_cost:.2f}, متاح ${buying_power:.2f})"}
     except Exception as e:
         print(f"⚠️ تعذر التحقق من القوة الشرائية: {e}")
 
     side = OrderSide.BUY if order["side"] == "buy" else OrderSide.SELL
+    qty = float(order["qty"])
+
+    # تحديد نوع الأمر: كسري = simple، صحيح = bracket
+    is_fractional = abs(qty - round(qty)) > 1e-9
 
     try:
-        req = MarketOrderRequest(
-            symbol=order["symbol"],
-            qty=float(order["qty"]),  # ← كسري
-            side=side,
-            time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(stop_price=order["stop_loss"]),
-            take_profit=TakeProfitRequest(limit_price=order["take_profit"]),
-        )
+        if is_fractional:
+            # الأسهم الكسرية: أمر simple بدون SL/TP
+            req = MarketOrderRequest(
+                symbol=order["symbol"],
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.SIMPLE,
+            )
+        else:
+            # الأسهم الصحيحة: أمر bracket مع SL/TP
+            req = MarketOrderRequest(
+                symbol=order["symbol"],
+                qty=int(round(qty)),
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=order["stop_loss"]),
+                take_profit=TakeProfitRequest(limit_price=order["take_profit"]),
+            )
+
         placed = client.submit_order(req)
         return {
             "status": "submitted",
             "order_id": str(placed.id),
             "symbol": order["symbol"],
             "side": order["side"],
-            "qty": order["qty"],
+            "qty": qty,
+            "order_type": "simple (fractional)" if is_fractional else "bracket",
         }
     except Exception as e:
         return {"status": "error", "reason": str(e)}
