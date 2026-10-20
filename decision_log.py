@@ -29,21 +29,17 @@ def init_db():
             key TEXT PRIMARY KEY, value TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS position_state (
             symbol TEXT PRIMARY KEY,
-            entry_price REAL,
-            qty REAL,
-            side TEXT,
-            highest_price REAL,
-            lowest_price REAL,
-            current_stop REAL,
-            current_target REAL,
-            opened_at TEXT,
-            last_exit_decision TEXT,
-            last_exit_reason TEXT,
-            last_exit_at TEXT)""")
+            entry_price REAL, qty REAL, side TEXT,
+            highest_price REAL, lowest_price REAL,
+            current_stop REAL, current_target REAL, opened_at TEXT,
+            last_exit_decision TEXT, last_exit_reason TEXT, last_exit_at TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS exit_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT, symbol TEXT, decision TEXT, reason TEXT,
             pnl_pct REAL, price REAL, entry_price REAL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS lessons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, content TEXT, metadata TEXT)""")
         conn.commit()
 
 
@@ -100,6 +96,22 @@ def set_setting(key: str, value: str):
             "INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)))
         conn.commit()
+
+
+def log_lesson(content: str, metadata: dict | None = None):
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO lessons (timestamp, content, metadata) VALUES (?,?,?)",
+            (datetime.utcnow().isoformat(), content,
+             json.dumps(metadata or {}, ensure_ascii=False)))
+        conn.commit()
+
+
+def recent_lessons(limit: int = 20) -> list:
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT content, timestamp FROM lessons ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()]
 
 
 def upsert_position_state(symbol: str, entry_price: float, qty: float, side: str):
