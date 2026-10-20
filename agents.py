@@ -5,55 +5,83 @@ from config import (
 )
 from settings import get_all_settings
 from state import TradingState
-from signals import compute_all_indicators, compute_signal_score
+from signals import compute_signal_score
 from safety import get_account_snapshot
 from risk_engine import check_portfolio_exposure
+from regime import get_market_regime
+from news import get_news_sentiment
 import json, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
 llm = ChatOllama(
-    model=OLLAMA_MODEL,
-    base_url=OLLAMA_BASE_URL,
-    temperature=0.1,
-    headers=_llm_headers,
-    format="json",
+    model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL,
+    temperature=0.1, headers=_llm_headers, format="json",
 )
 
 
-# =============== ANALYST ===============
 def analyst_agent(state: TradingState) -> dict:
     symbol = state["symbol"]
     data = state.get("market_data") or {}
 
     if not data or "atr14" not in data:
         return {
-            "analyst_report": {
-                "signal": "HOLD", "confidence": 0.0,
-                "reason": "no valid indicators",
-                "signal_score": 0,
-            },
+            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+                               "reason": "no valid indicators", "signal_score": 0},
             "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة"],
         }
 
-    sig = compute_signal_score(data)
+    # Fetch regime + news
+    settings = get_all_settings()
+    regime = get_market_regime() if settings.get("regime_enabled", 1) else None
+    news = get_news_sentiment(symbol) if settings.get("news_enabled", 1) else None
+
+    sig = compute_signal_score(data, regime, news)
+
     if sig["score"] < MIN_SIGNAL_SCORE:
         return {
-            "analyst_report": {
-                "signal": "HOLD", "confidence": 0.0,
-                "reason": f"signal_score={sig['score']} < {MIN_SIGNAL_SCORE}",
-                "signal_score": sig["score"],
-            },
+            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+                               "reason": f"score={sig['score']} < {MIN_SIGNAL_SCORE}",
+                               "signal_score": sig["score"]},
             "logs": [f"المحلل[{symbol}]: HOLD — score {sig['score']} < {MIN_SIGNAL_SCORE}"],
         }
 
+    # Bear market safety: no BUY in BEAR
+    regime_name = regime["regime"] if regime else "UNKNOWN"
+    if regime_name == "BEAR":
+        return {
+            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+                               "reason": "BEAR market — no new longs",
+                               "signal_score": sig["score"]},
+            "logs": [f"المحلل[{symbol}]: HOLD — سوق هابط (BEAR)"],
+        }
+
     memory = state.get("memory_context", "")
+    news_line = "غير متوفر"
+    if news and news.get("available"):
+        news_line = f"sentiment={news['score']:+.2f}, count={news['news_count']}"
+
     prompt = f"""أنت محلل مالي. حلل {symbol}:
-- السعر: {data['last_close']}
+
+--- Technical ---
+- Price: {data['last_close']}
 - EMA20: {data['ema20']} | EMA50: {data['ema50']}
-- RSI14: {data['rsi14']} | ATR14: {data['atr14']}
-- Volume ratio: {data['volume_ratio']}
+- RSI14: {data['rsi14']} | ADX: {data['adx']}
+- MACD hist: {data['macd_hist']}
+- BB %B: {data['bb_pct_b']} (bandwidth {data['bb_bandwidth']}%)
+- Stochastic K/D: {data['stoch_k']}/{data['stoch_d']}
+- Vol ratio: {data['volume_ratio']}
 - Momentum 5d: {data['momentum_5d_pct']}% | 10d: {data['momentum_10d_pct']}%
-- Signal score: {sig['score']}/100
+
+--- Market Regime ---
+- Regime: {regime_name}
+- SPY price: {regime['spy_price'] if regime else 0} (SMA50: {regime['spy_sma50'] if regime else 0})
+- Regime ATR%: {regime['atr_pct'] if regime else 0}
+
+--- News ---
+- {news_line}
+
+--- Signal Score ---
+{sig['score']}/100 (trend={sig['trend']}, momentum={sig['momentum']}, rsi={sig['rsi']}, bb={sig['bb']}, volume={sig['volume']}, news={sig['news']})
 
 {memory}
 
@@ -62,23 +90,23 @@ def analyst_agent(state: TradingState) -> dict:
     report = {"signal": "HOLD", "confidence": 0.0, "reason": "LLM invalid"}
     for attempt in range(2):
         try:
-            suffix = "\n\nJSON فقط بدون أي نص إضافي." if attempt else ""
+            suffix = "\n\nJSON فقط." if attempt else ""
             resp = llm.invoke(prompt + suffix)
             report = _parse_llm_json(resp.content)
             if report.get("signal") in ("BUY", "SELL", "HOLD") and report.get("confidence", 0) > 0:
                 break
         except Exception as e:
-            report = {"signal": "HOLD", "confidence": 0.0, "reason": f"LLM error: {e}"}
+            report = {"signal": "HOLD", "confidence": 0.0, "reason": f"LLM err: {e}"}
 
     report["signal_score"] = sig["score"]
+    report["regime"] = regime_name
     report["agent"] = "analyst"
     log = (f"المحلل[{symbol}]: {report.get('signal')} "
            f"conf={report.get('confidence', 0):.2f} "
-           f"score={sig['score']} — {report.get('reason', '')[:100]}")
+           f"score={sig['score']} regime={regime_name}")
     return {"analyst_report": report, "logs": [log]}
 
 
-# =============== RISK MANAGER ===============
 def risk_manager_agent(state: TradingState) -> dict:
     analyst = state["analyst_report"]
     data = state["market_data"]
@@ -88,41 +116,31 @@ def risk_manager_agent(state: TradingState) -> dict:
     signal = analyst.get("signal", "HOLD")
     confidence = float(analyst.get("confidence", 0))
     signal_score = analyst.get("signal_score", 0)
+    regime_name = analyst.get("regime", "UNKNOWN")
 
-    # Rule 1: confidence
     if confidence < MIN_CONFIDENCE:
         return _veto(symbol, f"confidence {confidence:.2f} < {MIN_CONFIDENCE}")
-
-    # Rule 2: signal score
     if signal_score < MIN_SIGNAL_SCORE:
-        return _veto(symbol, f"signal_score {signal_score} < {MIN_SIGNAL_SCORE}")
-
-    # Rule 3: HOLD
+        return _veto(symbol, f"score {signal_score} < {MIN_SIGNAL_SCORE}")
     if signal == "HOLD":
-        return {
-            "risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
-            "logs": [f"مدير المخاطر[{symbol}]: HOLD"],
-        }
+        return {"risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
+                "logs": [f"مدير المخاطر[{symbol}]: HOLD"]}
 
-    # Rule 4: basic sanity on indicators
     atr = data.get("atr14", 0)
     last = data.get("last_close", 0)
     if atr <= 0 or last <= 0:
         return _veto(symbol, "ATR or price invalid")
 
-    # Rule 5: RSI extremes
     rsi = data.get("rsi14", 50)
     if signal == "BUY" and rsi > 78:
         return _veto(symbol, f"RSI {rsi:.1f} overbought")
     if signal == "SELL" and rsi < 22:
         return _veto(symbol, f"RSI {rsi:.1f} oversold")
 
-    # ===== POSITION SIZING =====
     snap = get_account_snapshot()
     equity = snap.get("equity", 0) or 0
     buying_power = snap.get("buying_power", 0) or 0
 
-    # Respect user-defined trading capital cap
     trading_capital = settings.get("trading_capital", 0) or 0
     if trading_capital > 0:
         equity = min(equity, trading_capital)
@@ -131,61 +149,56 @@ def risk_manager_agent(state: TradingState) -> dict:
     if equity <= 0:
         return _veto(symbol, "equity <= 0")
 
-    risk_amount = equity * settings["max_risk_per_trade"]
+    # Regime-based risk multiplier
+    risk_multiplier = 1.0
+    if regime_name == "HIGH_VOLATILITY":
+        risk_multiplier = 0.5
+    elif regime_name == "SIDEWAYS":
+        risk_multiplier = 0.8
+    elif regime_name == "BEAR":
+        return _veto(symbol, "BEAR market — no longs")
+    elif regime_name == "UNKNOWN":
+        risk_multiplier = 0.5
 
-    # ATR-based stop
+    risk_amount = equity * settings["max_risk_per_trade"] * risk_multiplier
+
     stop_distance = atr * settings["stop_atr_multiplier"]
     if stop_distance <= 0 or stop_distance > last * 0.15:
         return _veto(symbol, f"stop distance unreasonable ({stop_distance:.2f})")
 
-    # R-multiple target
     take_profit_distance = stop_distance * settings["take_profit_rr"]
 
     if signal == "BUY":
         stop_price = last - stop_distance
         take_profit = last + take_profit_distance
-    else:  # SELL — only if we hold a position, caller will filter
+    else:
         stop_price = last + stop_distance
         take_profit = last - take_profit_distance
 
-    # Core sizing formula
     pos_size = risk_amount / stop_distance
     if pos_size <= 0:
         return _veto(symbol, "position size <= 0")
 
-    # Cap 1: position notional <= max_position_pct of equity
     max_notional = equity * settings["max_position_pct"]
     if pos_size * last > max_notional:
         pos_size = max_notional / last
 
-    # Cap 2: buying power
     estimated_cost = pos_size * last
     if estimated_cost > buying_power:
-        return _veto(
-            symbol,
-            f"buying_power insufficient ({estimated_cost:.2f} > {buying_power:.2f})"
-        )
+        return _veto(symbol, f"buying_power ({estimated_cost:.2f} > {buying_power:.2f})")
 
-    # Minimum meaningful position
     if estimated_cost < 1.0:
         return _veto(symbol, "position too small (<$1)")
 
-    # ===== Portfolio Exposure Check (Phase 2) =====
     if signal == "BUY":
         exp_ok, exp_reason = check_portfolio_exposure(symbol, estimated_cost)
         if not exp_ok:
             return _veto(symbol, f"exposure: {exp_reason}")
 
-    # Round to 4 decimals (fractional)
     pos_size = round(pos_size, 4)
-
-    # Sanity: expected risk must not exceed limit
     actual_risk = pos_size * stop_distance
     if actual_risk > risk_amount * 1.05:
-        return _veto(
-            symbol,
-            f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}"
-        )
+        return _veto(symbol, f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}")
 
     report = {
         "approved": True, "veto": False,
@@ -198,32 +211,27 @@ def risk_manager_agent(state: TradingState) -> dict:
         "side": "buy" if signal == "BUY" else "sell",
         "estimated_cost": round(estimated_cost, 2),
         "risk_amount": round(actual_risk, 2),
+        "regime": regime_name,
+        "risk_multiplier": risk_multiplier,
     }
     log = (f"مدير المخاطر[{symbol}]: موافقة | qty={pos_size} "
            f"cost=${estimated_cost:.2f} risk=${actual_risk:.2f} "
-           f"stop={stop_price:.2f} tp={take_profit:.2f}")
+           f"regime={regime_name} mult={risk_multiplier:.1f}x")
     return {"risk_report": report, "logs": [log]}
 
 
 def _veto(symbol: str, reason: str) -> dict:
-    return {
-        "risk_report": {"approved": False, "veto": True, "reason": reason},
-        "logs": [f"مدير المخاطر[{symbol}]: فيتو — {reason}"],
-    }
+    return {"risk_report": {"approved": False, "veto": True, "reason": reason},
+            "logs": [f"مدير المخاطر[{symbol}]: فيتو — {reason}"]}
 
 
-# =============== PORTFOLIO MANAGER ===============
 def portfolio_manager_agent(state: TradingState) -> dict:
     risk = state["risk_report"]
     symbol = state.get("symbol", "?")
-
     if risk.get("veto") or not risk.get("approved"):
         decision = "VETO" if risk.get("veto") else "HOLD"
-        return {
-            "final_decision": decision,
-            "consensus_reached": False,
-            "logs": [f"مدير المحفظة[{symbol}]: {decision}"],
-        }
+        return {"final_decision": decision, "consensus_reached": False,
+                "logs": [f"مدير المحفظة[{symbol}]: {decision}"]}
 
     signal = state["analyst_report"].get("signal", "HOLD")
     decision = {"BUY": "EXECUTE_BUY", "SELL": "EXECUTE_SELL"}.get(signal, "HOLD")
@@ -240,16 +248,11 @@ def portfolio_manager_agent(state: TradingState) -> dict:
             "estimated_cost": risk["estimated_cost"],
             "atr": risk["atr"],
         }
-
-    return {
-        "final_decision": decision,
-        "order_details": order,
-        "consensus_reached": decision != "HOLD",
-        "logs": [f"مدير المحفظة[{symbol}]: {decision}"],
-    }
+    return {"final_decision": decision, "order_details": order,
+            "consensus_reached": decision != "HOLD",
+            "logs": [f"مدير المحفظة[{symbol}]: {decision}"]}
 
 
-# =============== HELPERS ===============
 def _parse_llm_json(text) -> dict:
     try:
         if not isinstance(text, str):
@@ -260,11 +263,10 @@ def _parse_llm_json(text) -> dict:
         if sig not in ("BUY", "SELL", "HOLD"):
             sig = "HOLD"
         try:
-            conf = float(data.get("confidence", 0))
-            conf = max(0.0, min(1.0, conf))
+            conf = max(0.0, min(1.0, float(data.get("confidence", 0))))
         except Exception:
             conf = 0.0
-        reason = str(data.get("reason", ""))[:200]
-        return {"signal": sig, "confidence": conf, "reason": reason}
+        return {"signal": sig, "confidence": conf,
+                "reason": str(data.get("reason", ""))[:200]}
     except Exception:
         return {"signal": "HOLD", "confidence": 0.0, "reason": "invalid JSON"}
