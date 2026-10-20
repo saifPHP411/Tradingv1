@@ -12,6 +12,7 @@ def is_market_open() -> bool:
 def get_account_snapshot() -> dict:
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         return {"equity": ACCOUNT_EQUITY_DEFAULT, "last_equity": ACCOUNT_EQUITY_DEFAULT,
+                "buying_power": ACCOUNT_EQUITY_DEFAULT,
                 "open_positions": 0, "trades_today": 0}
     try:
         from alpaca.trading.client import TradingClient
@@ -23,11 +24,17 @@ def get_account_snapshot() -> dict:
         today_start = datetime.now(ZoneInfo("UTC")).replace(hour=0, minute=0, second=0, microsecond=0)
         today_orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100, after=today_start))
         filled_today = [o for o in today_orders if o.filled_at is not None]
-        return {"equity": float(acct.equity), "last_equity": float(acct.last_equity),
-                "open_positions": len(positions), "trades_today": len(filled_today)}
+        return {
+            "equity": float(acct.equity),
+            "last_equity": float(acct.last_equity),
+            "buying_power": float(acct.buying_power),
+            "open_positions": len(positions),
+            "trades_today": len(filled_today),
+        }
     except Exception as e:
         print(f"⚠️ تعذر جلب بيانات الحساب: {e}")
         return {"equity": ACCOUNT_EQUITY_DEFAULT, "last_equity": ACCOUNT_EQUITY_DEFAULT,
+                "buying_power": ACCOUNT_EQUITY_DEFAULT,
                 "open_positions": 0, "trades_today": 0}
 
 def check_safety_gates() -> tuple[bool, str]:
