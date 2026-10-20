@@ -24,6 +24,18 @@ DEFAULTS = {
 "trailing_activation_pct": "5.0",
 "trailing_stop_pct": "3.0",
 "allow_extended_hours": "false",
+    "stop_atr_multiplier": "1.5",
+"take_profit_rr": "2.0",
+"trailing_activation_r": "1.0",
+"trailing_distance_r": "0.75",
+"max_position_pct": "0.15",
+"max_portfolio_exposure_pct": "0.45",
+"max_consecutive_losses": "3",
+"cooldown_minutes": "120",
+"min_signal_score": "60",
+"min_hold_minutes": "30",
+"min_loss_to_close_pct": "1.5",
+"llm_exit_min_confidence": "0.70",
 }
 
 def _ensure_defaults():
@@ -50,6 +62,18 @@ def get_all_settings() -> dict:
 "trailing_activation_pct": float(get_setting("trailing_activation_pct")),
 "trailing_stop_pct": float(get_setting("trailing_stop_pct")),
 "allow_extended_hours": get_setting("allow_extended_hours") == "true",
+        "stop_atr_multiplier": float(get_setting("stop_atr_multiplier")),
+"take_profit_rr": float(get_setting("take_profit_rr")),
+"trailing_activation_r": float(get_setting("trailing_activation_r")),
+"trailing_distance_r": float(get_setting("trailing_distance_r")),
+"max_position_pct": float(get_setting("max_position_pct")),
+"max_portfolio_exposure_pct": float(get_setting("max_portfolio_exposure_pct")),
+"max_consecutive_losses": int(get_setting("max_consecutive_losses")),
+"cooldown_minutes": int(get_setting("cooldown_minutes")),
+"min_signal_score": int(get_setting("min_signal_score")),
+"min_hold_minutes": int(get_setting("min_hold_minutes")),
+"min_loss_to_close_pct": float(get_setting("min_loss_to_close_pct")),
+"llm_exit_min_confidence": float(get_setting("llm_exit_min_confidence")),
     }
 
 def update_settings(payload: dict):
