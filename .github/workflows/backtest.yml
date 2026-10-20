@@ -1,0 +1,56 @@
+name: Run Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Symbol (e.g., AAPL)'
+        required: true
+        default: 'AAPL'
+      start_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        default: '2024-01-01'
+      end_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: true
+        default: '2025-01-01'
+      initial_equity:
+        description: 'Initial equity'
+        required: true
+        default: '10000'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas numpy pyarrow python-dateutil langchain-ollama python-dotenv
+
+      - name: Run backtest
+        env:
+          OLLAMA_MODEL: gpt-oss:20b
+          OLLAMA_BASE_URL: https://ollama.com
+        run: |
+          python run_backtest.py \
+            --symbol ${{ github.event.inputs.symbol }} \
+            --start ${{ github.event.inputs.start_date }} \
+            --end ${{ github.event.inputs.end_date }} \
+            --initial ${{ github.event.inputs.initial_equity }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-reports
+          path: backtest_reports/
+          retention-days: 30
