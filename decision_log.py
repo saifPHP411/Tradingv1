@@ -40,6 +40,10 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT, content TEXT, metadata TEXT)""")
+       conn.execute("""CREATE TABLE IF NOT EXISTS trading_state (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT)""")
         conn.commit()
 
 
@@ -170,3 +174,66 @@ def recent_exit_decisions(limit: int = 50) -> list:
 
 
 init_db()
+
+def get_trading_state(key: str, default=None):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM trading_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def set_trading_state(key: str, value: str):
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO trading_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE
+               SET value=excluded.value, updated_at=excluded.updated_at""",
+            (key, str(value), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def get_day_start_equity() -> float | None:
+    """Returns day_start_equity if it's for today, else None."""
+    raw = get_trading_state("day_start_equity")
+    raw_date = get_trading_state("day_start_date")
+    if not raw or not raw_date:
+        return None
+    today = datetime.utcnow().date().isoformat()
+    if raw_date != today:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def set_day_start_equity(equity: float):
+    today = datetime.utcnow().date().isoformat()
+    set_trading_state("day_start_equity", str(equity))
+    set_trading_state("day_start_date", today)
+
+
+def get_consecutive_losses() -> int:
+    try:
+        return int(get_trading_state("consecutive_losses", "0"))
+    except Exception:
+        return 0
+
+
+def set_consecutive_losses(n: int):
+    set_trading_state("consecutive_losses", str(int(n)))
+
+
+def get_cooldown_until() -> str | None:
+    return get_trading_state("cooldown_until")
+
+
+def set_cooldown_until(iso_ts: str):
+    set_trading_state("cooldown_until", iso_ts)
+
+
+def clear_cooldown():
+    set_trading_state("cooldown_until", "")
