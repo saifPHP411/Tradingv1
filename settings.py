@@ -26,8 +26,8 @@ DEFAULTS = {
 "allow_extended_hours": "false",
     "stop_atr_multiplier": "1.5",
 "take_profit_rr": "2.0",
-"trailing_activation_r": "1.0",
-"trailing_distance_r": "0.75",
+"trailing_activation_r": "1.5",   # يبدأ بعد +1.5R
+"trailing_distance_r": "1.0",     # 1R مسافة
 "max_position_pct": "0.15",
 "max_portfolio_exposure_pct": "0.45",
 "max_consecutive_losses": "3",
