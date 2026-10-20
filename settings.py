@@ -17,6 +17,13 @@ DEFAULTS = {
     "symbols": json.dumps(DEFAULT_SYMBOLS),
     "cycle_interval_minutes": "5",
     "trading_capital": "0",   # ← جديد: 0 = استخدم رصيد الحساب الحقيقي
+    "exit_check_seconds": "60",
+"exit_llm_interval_seconds": "300",
+"hard_stop_loss_pct": "8.0",
+"hard_take_profit_pct": "15.0",
+"trailing_activation_pct": "5.0",
+"trailing_stop_pct": "3.0",
+"allow_extended_hours": "false",
 }
 
 def _ensure_defaults():
@@ -36,6 +43,13 @@ def get_all_settings() -> dict:
         "symbols": json.loads(get_setting("symbols")),
         "cycle_interval_minutes": int(get_setting("cycle_interval_minutes")),
         "trading_capital": float(get_setting("trading_capital")),   # ← جديد
+        "exit_check_seconds": int(get_setting("exit_check_seconds")),
+"exit_llm_interval_seconds": int(get_setting("exit_llm_interval_seconds")),
+"hard_stop_loss_pct": float(get_setting("hard_stop_loss_pct")),
+"hard_take_profit_pct": float(get_setting("hard_take_profit_pct")),
+"trailing_activation_pct": float(get_setting("trailing_activation_pct")),
+"trailing_stop_pct": float(get_setting("trailing_stop_pct")),
+"allow_extended_hours": get_setting("allow_extended_hours") == "true",
     }
 
 def update_settings(payload: dict):
