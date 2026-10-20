@@ -29,7 +29,7 @@ if not ALPACA_PAPER:
     print("🚨🚨🚨 WARNING: LIVE TRADING IS ENABLED — REAL MONEY AT RISK 🚨🚨🚨")
 
 # ============ Risk Defaults (conservative) ============
-MAX_RISK_PER_TRADE = 0.0075
+MAX_RISK_PER_TRADE = 0.005   # 0.5% — أقل عرضة للـGap
 MAX_POSITION_PCT = 0.15
 MAX_PORTFOLIO_EXPOSURE_PCT = 0.45
 MAX_OPEN_POSITIONS = 3
