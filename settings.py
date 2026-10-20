@@ -16,6 +16,7 @@ DEFAULTS = {
     "max_daily_loss_pct": str(DEFAULT_MAX_LOSS),
     "symbols": json.dumps(DEFAULT_SYMBOLS),
     "cycle_interval_minutes": "5",
+    "trading_capital": "0",   # ← جديد: 0 = استخدم رصيد الحساب الحقيقي
 }
 
 def _ensure_defaults():
@@ -34,6 +35,7 @@ def get_all_settings() -> dict:
         "max_daily_loss_pct": float(get_setting("max_daily_loss_pct")),
         "symbols": json.loads(get_setting("symbols")),
         "cycle_interval_minutes": int(get_setting("cycle_interval_minutes")),
+        "trading_capital": float(get_setting("trading_capital")),   # ← جديد
     }
 
 def update_settings(payload: dict):
