@@ -35,7 +35,7 @@ def execute_order(order: dict) -> dict:
     try:
         req = MarketOrderRequest(
             symbol=order["symbol"],
-            qty=order["qty"],
+            qty=float(order["qty"]),  # ← كسري
             side=side,
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
