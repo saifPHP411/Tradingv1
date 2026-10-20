@@ -3,7 +3,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-DB = Path("decisions.db")
+import os
+DB = Path(os.getenv("DB_PATH", "decisions.db"))
 
 def init_db():
     with sqlite3.connect(DB) as conn:
