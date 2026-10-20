@@ -17,7 +17,6 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()
 ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 LIVE_TRADING_CONFIRMATION = os.getenv("LIVE_TRADING_CONFIRMATION", "")
 
-# Alpaca: paper by default. Live requires BOTH flags.
 _allow_live = (
     ENABLE_LIVE_TRADING
     and LIVE_TRADING_CONFIRMATION == "I_UNDERSTAND_LIVE_RISK"
@@ -29,7 +28,8 @@ if not ALPACA_PAPER:
     print("🚨🚨🚨 WARNING: LIVE TRADING IS ENABLED — REAL MONEY AT RISK 🚨🚨🚨")
 
 # ============ Risk Defaults (conservative) ============
-MAX_RISK_PER_TRADE = 0.005   # 0.5% — أقل عرضة للـGap
+# ⚠️ تعديل الخيار ب: رفعنا ATR multiplier لتوسيع Stop، وخفّضنا المخاطرة للتعويض
+MAX_RISK_PER_TRADE = 0.005          # ← كان 0.0075
 MAX_POSITION_PCT = 0.15
 MAX_PORTFOLIO_EXPOSURE_PCT = 0.45
 MAX_OPEN_POSITIONS = 3
@@ -39,21 +39,22 @@ MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_MINUTES = 120
 
 # ============ Stop / Target ============
-STOP_ATR_MULTIPLIER = 1.5
-TAKE_PROFIT_RR = 3.0
+# ⚠️ تعديل الخيار ب: Stop أوسع = صفقات أقل لكن اتجاهات حقيقية
+STOP_ATR_MULTIPLIER = 2.5           # ← كان 1.5
+TAKE_PROFIT_RR = 2.0
 TRAILING_ACTIVATION_R = 1.0
 TRAILING_DISTANCE_R = 0.75
 
 # ============ Signal Thresholds ============
 MIN_CONFIDENCE = 0.70
-MIN_SIGNAL_SCORE = 60
+MIN_SIGNAL_SCORE = 70               # ← كان 60
 
 # ============ Fees / Slippage ============
 FEES_PER_SHARE = 0.0
 ENTRY_SLIPPAGE_BPS = 5
 EXIT_SLIPPAGE_BPS = 5
 
-# ============ LLM Exit Sensitivity (fix for noise closes) ============
+# ============ LLM Exit Sensitivity ============
 MIN_HOLD_MINUTES = 30
 MIN_LOSS_TO_CLOSE_PCT = 1.5
 MIN_GAIN_TO_TRIM_PCT = 2.0
@@ -63,7 +64,7 @@ LLM_EXIT_MIN_CONFIDENCE = 0.70
 SYMBOLS = ["AAPL", "NVDA", "AMD", "ASML", "CRM", "PANW", "TSLA", "JNJ", "LLY", "AMZN"]
 CYCLE_INTERVAL_MINUTES = 15
 
-# ============ Legacy fallback percentages (used if ATR unavailable) ============
+# ============ Legacy fallback percentages ============
 HARD_STOP_LOSS_PCT = 3.0
 HARD_TAKE_PROFIT_PCT = 6.0
 TRAILING_ACTIVATION_PCT = 2.0
@@ -79,7 +80,7 @@ DB_PATH = os.getenv("DB_PATH", "decisions.db")
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "trading_memory.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "graph_checkpoints.db")
 
-# ============ Legacy aliases (kept for compatibility) ============
+# ============ Legacy aliases ============
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 ACCOUNT_EQUITY_DEFAULT = 10000
 ONLY_MARKET_HOURS = True
