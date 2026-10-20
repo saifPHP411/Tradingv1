@@ -1,10 +1,11 @@
 import sqlite3
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
-import os
 DB = Path(os.getenv("DB_PATH", "decisions.db"))
+DB.parent.mkdir(parents=True, exist_ok=True)
 
 def init_db():
     with sqlite3.connect(DB) as conn:
