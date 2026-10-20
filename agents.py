@@ -70,24 +70,23 @@ def risk_manager_agent(state: TradingState) -> dict:
         return {"risk_report": {"approved": False, "veto": True, "reason": "مخاطر شراء مرتفعة (RSI/اتجاه)"},
                 "logs": ["مدير المخاطر: فيتو (RSI/اتجاه)"]}
 
-    # === جلب رأس المال الحقيقي ===
     from safety import get_account_snapshot
     snap = get_account_snapshot()
     real_equity = snap.get("equity", 10000) or 10000
     real_buying_power = snap.get("buying_power", real_equity) or real_equity
 
-    # === تطبيق رأس المال المخصص للتداول ===
+    # تطبيق رأس المال المخصص
     trading_capital = settings.get("trading_capital", 0) or 0
     if trading_capital > 0:
         equity = min(real_equity, trading_capital)
         buying_power = min(real_buying_power, trading_capital)
-        capital_note = f" (رأس مال مخصص ${trading_capital:.0f})"
+        capital_note = f" (رأس مال ${trading_capital:.0f})"
     else:
         equity = real_equity
         buying_power = real_buying_power
         capital_note = ""
 
-    # === جلب المركز الحالي ===
+    # جلب المركز الحالي
     current_qty = 0.0
     try:
         from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
@@ -107,7 +106,7 @@ def risk_manager_agent(state: TradingState) -> dict:
             return {"risk_report": {"approved": False, "veto": False,
                 "reason": f"لا مركز في {symbol} لإغلاقه"},
                 "logs": [f"مدير المخاطر: تجاهل SELL — لا مركز لإغلاقه"]}
-        order_qty = int(current_qty)
+        order_qty = round(current_qty, 4)  # كسري
         return {"risk_report": {"approved": True, "veto": False,
             "position_size": order_qty,
             "stop_loss": round(last * 1.02, 2),
@@ -122,27 +121,40 @@ def risk_manager_agent(state: TradingState) -> dict:
         take_profit = round(last * 1.04, 2)
         risk_amount = equity * max_risk
         stop_distance = abs(last - stop_loss)
-        pos_size = max(1, int(risk_amount / stop_distance)) if stop_distance > 0 else 0
 
-        # سقف المركز: 10% من رأس المال المخصص
-        max_pos_value = equity * 0.10
-        if pos_size * last > max_pos_value:
-            pos_size = max(1, int(max_pos_value / last))
+        # الحجم بناءً على المخاطرة
+        pos_size_by_risk = risk_amount / stop_distance if stop_distance > 0 else 0
 
+        # سقف: 25% من رأس المال لكل صفقة
+        max_pos_value = equity * 0.25
+        pos_size_by_cap = max_pos_value / last if last > 0 else 0
+
+        # الحجم النهائي = الأصغر بينهما، بدقة 4 منازل عشرية (كسرية)
+        pos_size = min(pos_size_by_risk, pos_size_by_cap)
+        pos_size = round(pos_size, 4)
+
+        # ضمان حد أدنى 0.001 سهم وقيمة صفقة $1 على الأقل
         estimated_cost = pos_size * last
+        if estimated_cost < 1.0:
+            # نحاول رفع الحجم إلى الحد الأدنى $1
+            pos_size = round(1.0 / last, 4) if last > 0 else 0
+            estimated_cost = pos_size * last
+
         if estimated_cost > buying_power:
             return {"risk_report": {"approved": False, "veto": True,
-                "reason": f"قوة شرائية غير كافية (تحتاج ~${estimated_cost:.0f}, متاح ${buying_power:.0f}){capital_note}"},
-                "logs": [f"مدير المخاطر: فيتو — ${buying_power:.0f} < ${estimated_cost:.0f}{capital_note}"]}
-        if pos_size < 1:
+                "reason": f"قوة شرائية غير كافية (تحتاج ~${estimated_cost:.2f}, متاح ${buying_power:.2f}){capital_note}"},
+                "logs": [f"مدير المخاطر: فيتو — ${buying_power:.2f} < ${estimated_cost:.2f}{capital_note}"]}
+
+        if pos_size <= 0:
             return {"risk_report": {"approved": False, "veto": True, "reason": "حجم صفر"},
                     "logs": ["مدير المخاطر: فيتو (حجم صفر)"]}
+
         return {"risk_report": {"approved": True, "veto": False,
             "position_size": pos_size,
             "stop_loss": stop_loss, "take_profit": take_profit,
             "entry_price": round(last, 2), "side": "buy",
             "estimated_cost": round(estimated_cost, 2)},
-            "logs": [f"مدير المخاطر: موافقة شراء (حجم={pos_size}, ~${estimated_cost:.0f}){capital_note}"]}
+            "logs": [f"مدير المخاطر: موافقة شراء ({pos_size} سهم, ~${estimated_cost:.2f}){capital_note}"]}
 
     return {"risk_report": {"approved": False, "veto": True, "reason": "إشارة غير معروفة"},
             "logs": ["مدير المخاطر: فيتو (إشارة غير معروفة)"]}
