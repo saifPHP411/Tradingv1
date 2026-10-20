@@ -1,0 +1,16 @@
+langgraph
+langgraph-checkpoint-sqlite
+langchain-ollama
+langmem
+yfinance
+finnhub-python
+pandas
+numpy
+alpaca-py
+python-dotenv
+apscheduler
+fastapi
+uvicorn[standard]
+jinja2
+aiofiles
+python-multipart
