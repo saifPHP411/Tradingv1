@@ -12,24 +12,31 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-# ============ Trading Mode — LIVE LOCKED BY DEFAULT ============
+# ============ Trading Mode — SINGLE SOURCE ============
+# BACKTEST: no broker calls (used by backtester/engine)
+# PAPER:    Alpaca Paper Trading
+# LIVE:     requires TRADING_MODE=live + ENABLE_LIVE_TRADING=true + confirmation
 TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()
 ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 LIVE_TRADING_CONFIRMATION = os.getenv("LIVE_TRADING_CONFIRMATION", "")
 
-_allow_live = (
-    ENABLE_LIVE_TRADING
-    and LIVE_TRADING_CONFIRMATION == "I_UNDERSTAND_LIVE_RISK"
-    and TRADING_MODE == "live"
-)
-ALPACA_PAPER = not _allow_live
+def get_trading_mode() -> str:
+    """The ONLY function the project should use to know trading mode."""
+    if TRADING_MODE == "backtest":
+        return "BACKTEST"
+    live_ok = (
+        ENABLE_LIVE_TRADING
+        and LIVE_TRADING_CONFIRMATION == "I_UNDERSTAND_LIVE_RISK"
+        and TRADING_MODE == "live"
+    )
+    return "LIVE" if live_ok else "PAPER"
 
-if not ALPACA_PAPER:
-    print("🚨🚨🚨 WARNING: LIVE TRADING IS ENABLED — REAL MONEY AT RISK 🚨🚨🚨")
+ALPACA_PAPER = get_trading_mode() != "LIVE"
+if get_trading_mode() == "LIVE":
+    print("🚨 WARNING: LIVE TRADING IS ENABLED — REAL MONEY AT RISK 🚨")
 
-# ============ Risk Defaults (conservative) ============
-# ⚠️ تعديل الخيار ب: رفعنا ATR multiplier لتوسيع Stop، وخفّضنا المخاطرة للتعويض
-MAX_RISK_PER_TRADE = 0.005          # ← كان 0.0075
+# ============ Risk Defaults (CONSERVATIVE) ============
+MAX_RISK_PER_TRADE = 0.005
 MAX_POSITION_PCT = 0.15
 MAX_PORTFOLIO_EXPOSURE_PCT = 0.45
 MAX_OPEN_POSITIONS = 3
@@ -38,18 +45,18 @@ MAX_DAILY_LOSS_PCT = 0.02
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_MINUTES = 120
 
-# ============ Stop / Target ============
-# ⚠️ تعديل الخيار ب: Stop أوسع = صفقات أقل لكن اتجاهات حقيقية
-STOP_ATR_MULTIPLIER = 2.5           # ← كان 1.5
+# ============ ATR / R-based Risk Model (THE ONLY MODEL) ============
+STOP_ATR_MULTIPLIER = 2.5
 TAKE_PROFIT_RR = 2.0
-TRAILING_ACTIVATION_R = 1.0
-TRAILING_DISTANCE_R = 0.75
+TRAILING_ACTIVATION_R = 1.5
+TRAILING_DISTANCE_R = 1.0
+MIN_STOP_MOVE_PCT = 0.3
 
 # ============ Signal Thresholds ============
 MIN_CONFIDENCE = 0.70
-MIN_SIGNAL_SCORE = 70               # ← كان 60
+MIN_SIGNAL_SCORE = 70
 
-# ============ Fees / Slippage ============
+# ============ Fees / Slippage (configurable; backtest uses these) ============
 FEES_PER_SHARE = 0.0
 ENTRY_SLIPPAGE_BPS = 5
 EXIT_SLIPPAGE_BPS = 5
@@ -64,12 +71,6 @@ LLM_EXIT_MIN_CONFIDENCE = 0.70
 SYMBOLS = ["AAPL", "NVDA", "AMD", "ASML", "CRM", "PANW", "TSLA", "JNJ", "LLY", "AMZN"]
 CYCLE_INTERVAL_MINUTES = 15
 
-# ============ Legacy fallback percentages ============
-HARD_STOP_LOSS_PCT = 3.0
-HARD_TAKE_PROFIT_PCT = 6.0
-TRAILING_ACTIVATION_PCT = 2.0
-TRAILING_STOP_PCT = 1.5
-
 # ============ Exits monitor cadence ============
 EXIT_CHECK_SECONDS = 60
 EXIT_LLM_INTERVAL_SECONDS = 300
@@ -80,7 +81,11 @@ DB_PATH = os.getenv("DB_PATH", "decisions.db")
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "trading_memory.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "graph_checkpoints.db")
 
-# ============ Legacy aliases ============
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+# ============ Account fallback (NEVER used for trade decisions) ============
+# Kept only so UI can show "N/A". safety.py must FAIL CLOSED on API errors.
 ACCOUNT_EQUITY_DEFAULT = 10000
+
+# ============ Legacy aliases — DO NOT USE IN NEW CODE ============
+# Kept only so any missed import doesn't crash. Migrated to settings.py.
 ONLY_MARKET_HOURS = True
+DRY_RUN = get_trading_mode() == "PAPER"
