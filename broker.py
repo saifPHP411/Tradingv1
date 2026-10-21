@@ -1,19 +1,20 @@
 import time
+from datetime import datetime, timezone, timedelta
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest, StopOrderRequest, LimitOrderRequest,
-    GetOrdersRequest,
+    MarketOrderRequest, StopOrderRequest, GetOrdersRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
-from settings import is_dry_run
+from settings import is_dry_run, get_all_settings
 from safety import check_safety_gates
 from decision_log import (
     set_consecutive_losses, get_consecutive_losses,
-    set_cooldown_until, set_trading_state,
+    set_cooldown_until,
 )
-from datetime import datetime, timedelta
+from risk_utils import normalize_price_for_symbol
 
 
 def _client():
@@ -21,25 +22,18 @@ def _client():
 
 
 def _submit_entry(order: dict) -> dict:
-    """Step 1: submit entry order only."""
     client = _client()
     side = OrderSide.BUY if order["side"] == "buy" else OrderSide.SELL
     qty = float(order["qty"])
-    is_frac = abs(qty - round(qty)) > 1e-9
-
     req = MarketOrderRequest(
-        symbol=order["symbol"],
-        qty=qty,
-        side=side,
-        time_in_force=TimeInForce.DAY,
-        order_class=OrderClass.SIMPLE,  # always simple for entry
+        symbol=order["symbol"], qty=qty, side=side,
+        time_in_force=TimeInForce.DAY, order_class=OrderClass.SIMPLE,
     )
     placed = client.submit_order(req)
-    return {"order_id": str(placed.id), "symbol": order["symbol"], "is_frac": is_frac}
+    return {"order_id": str(placed.id), "symbol": order["symbol"]}
 
 
 def _wait_fill(order_id: str, max_wait_sec: int = 30) -> dict | None:
-    """Poll until filled or timeout."""
     client = _client()
     deadline = time.time() + max_wait_sec
     while time.time() < deadline:
@@ -55,45 +49,100 @@ def _wait_fill(order_id: str, max_wait_sec: int = 30) -> dict | None:
             if "canceled" in status or "rejected" in status or "expired" in status:
                 return None
         except Exception as e:
-            print(f"⚠️ broker: poll order {order_id} failed: {e}")
+            print(f"⚠️ broker: poll failed: {e}")
         time.sleep(1)
     return None
 
 
+def _check_partial_fill(order_id: str) -> dict | None:
+    try:
+        o = _client().get_order_by_id(order_id)
+        qty = float(o.filled_qty or 0)
+        if qty > 0:
+            return {
+                "filled_qty": qty,
+                "filled_avg_price": float(o.filled_avg_price or 0),
+                "status": str(o.status).lower(),
+            }
+    except Exception as e:
+        print(f"⚠️ broker: partial check failed: {e}")
+    return None
+
+
 def _submit_stop(symbol: str, qty: float, stop_price: float, side_held: str) -> dict | None:
-    """Step 2: submit protective stop order."""
     client = _client()
-    # If we hold long, stop is SELL. If short, stop is BUY.
     stop_side = OrderSide.SELL if side_held == "long" else OrderSide.BUY
     try:
+        price = normalize_price_for_symbol(symbol, float(stop_price))
         req = StopOrderRequest(
-            symbol=symbol,
-            qty=float(qty),
-            side=stop_side,
-            time_in_force=TimeInForce.GTC,
-            stop_price=round(float(stop_price), 2),
+            symbol=symbol, qty=float(qty), side=stop_side,
+            time_in_force=TimeInForce.GTC, stop_price=price,
         )
         placed = client.submit_order(req)
-        return {"stop_order_id": str(placed.id), "stop_price": round(float(stop_price), 2)}
+        return {"stop_order_id": str(placed.id), "stop_price": price}
     except Exception as e:
         print(f"⚠️ broker: stop submission failed for {symbol}: {e}")
         return None
 
 
-def _emergency_close(symbol: str):
-    """Last resort: close position immediately."""
+def _verify_stop_exists(symbol: str, expected_qty: float) -> bool:
     try:
         client = _client()
-        client.close_position(symbol)
-        print(f"🚨 broker: EMERGENCY CLOSE {symbol}")
+        orders = client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, symbols=[symbol], limit=20
+        ))
+        for o in orders:
+            otype = str(o.order_type).lower() if o.order_type else ""
+            if "stop" in otype:
+                q = float(o.qty or 0)
+                if q + 1e-6 >= expected_qty:
+                    return True
     except Exception as e:
-        print(f"🚨 broker: EMERGENCY CLOSE FAILED {symbol}: {e}")
+        print(f"⚠️ broker: verify_stop failed: {e}")
+    return False
+
+
+def _emergency_close_and_verify(symbol: str) -> bool:
+    """
+    Close position and verify it is actually gone.
+    Returns True only if broker confirms flat.
+    """
+    try:
+        client = _client()
+        # Cancel all open orders on symbol
+        try:
+            for o in client.get_orders(GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50)):
+                try:
+                    client.cancel_order_by_id(o.id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        client.close_position(symbol)
+
+        # Verify
+        for _ in range(5):
+            time.sleep(1)
+            try:
+                positions = client.get_all_positions()
+                if not any(p.symbol == symbol for p in positions):
+                    print(f"✅ EMERGENCY CLOSE VERIFIED: {symbol}")
+                    return True
+            except Exception:
+                pass
+
+        print(f"🚨 CRITICAL: EMERGENCY CLOSE VERIFICATION FAILED: {symbol}")
+        return False
+    except Exception as e:
+        print(f"🚨 CRITICAL: EMERGENCY CLOSE EXCEPTION: {symbol}: {e}")
+        return False
 
 
 def _find_existing_position(symbol: str) -> dict | None:
     try:
-        client = _client()
-        for p in client.get_all_positions():
+        for p in _client().get_all_positions():
             if p.symbol == symbol:
                 return {
                     "symbol": p.symbol,
@@ -108,8 +157,8 @@ def _find_existing_position(symbol: str) -> dict | None:
 
 def execute_order(order: dict) -> dict:
     """
-    Full execution flow:
-      Entry -> Wait Fill -> Create Stop -> Verify -> [fail => Close]
+    Entry → fill → stop at the EXACT price approved by risk_manager.
+    Broker does NOT recalculate stop.
     """
     if is_dry_run():
         return {"status": "dry_run", "message": f"would execute: {order}"}
@@ -123,19 +172,16 @@ def execute_order(order: dict) -> dict:
 
     symbol = order["symbol"]
 
-    # Duplicate guard
-    existing = _find_existing_position(symbol)
-    if existing is not None:
+    if _find_existing_position(symbol) is not None:
         return {"status": "blocked", "reason": f"already holding {symbol}"}
 
     try:
-        client = _client()
-        acct = client.get_account()
-        buying_power = float(acct.buying_power)
-        est_cost = order.get("estimated_cost", 0)
-        if order["side"] == "buy" and est_cost > buying_power:
+        acct = _client().get_account()
+        bp = float(acct.buying_power)
+        est = order.get("estimated_cost", 0)
+        if order["side"] == "buy" and est > bp:
             return {"status": "blocked",
-                    "reason": f"insufficient buying power ({est_cost:.2f} > {buying_power:.2f})"}
+                    "reason": f"insufficient buying power ({est:.2f} > {bp:.2f})"}
     except Exception as e:
         return {"status": "error", "reason": f"account check failed: {e}"}
 
@@ -147,8 +193,36 @@ def execute_order(order: dict) -> dict:
 
     # Step 2: wait fill
     fill = _wait_fill(entry["order_id"], max_wait_sec=30)
+
     if fill is None:
-        return {"status": "error", "reason": "entry did not fill within 30s",
+        # Check partial fill before declaring failure
+        partial = _check_partial_fill(entry["order_id"])
+        if partial and partial["filled_qty"] > 0:
+            # Cancel remainder, protect what filled
+            try:
+                _client().cancel_order_by_id(entry["order_id"])
+            except Exception:
+                pass
+            stop = _submit_stop(
+                symbol=symbol,
+                qty=partial["filled_qty"],
+                stop_price=order["stop_loss"],
+                side_held="long" if order["side"] == "buy" else "short",
+            )
+            if stop is None:
+                _emergency_close_and_verify(symbol)
+                return {"status": "error",
+                        "reason": "PARTIAL FILL — STOP FAILED — EMERGENCY CLOSED",
+                        "filled_qty": partial["filled_qty"]}
+            return {"status": "submitted_partial",
+                    "order_id": entry["order_id"],
+                    "stop_order_id": stop["stop_order_id"],
+                    "filled_qty": partial["filled_qty"],
+                    "filled_avg_price": partial["filled_avg_price"],
+                    "stop_price": stop["stop_price"]}
+
+        return {"status": "error",
+                "reason": "entry did not fill within 30s (no partial)",
                 "order_id": entry["order_id"]}
 
     filled_qty = fill["filled_qty"]
@@ -156,120 +230,90 @@ def execute_order(order: dict) -> dict:
     if filled_qty <= 0 or filled_price <= 0:
         return {"status": "error", "reason": "invalid fill data"}
 
-    # Step 3: recalc stop from actual fill (safer than theoretical)
-    atr = order.get("atr")
-    if atr and atr > 0:
-        if order["side"] == "buy":
-            stop_price = filled_price - (atr * 1.5)
-        else:
-            stop_price = filled_price + (atr * 1.5)
-    else:
-        stop_price = order.get("stop_loss", filled_price * 0.97)
+    # Step 3: USE THE APPROVED STOP — no recalculation
+    stop_price = order["stop_loss"]
 
-    # Step 4: stop order
-    stop_result = _submit_stop(
+    # Safety check for side-consistency
+    if order["side"] == "buy" and stop_price >= filled_price:
+        _emergency_close_and_verify(symbol)
+        return {"status": "error",
+                "reason": f"INVALID STOP: stop={stop_price} >= fill={filled_price}",
+                "order_id": entry["order_id"]}
+    if order["side"] == "sell" and stop_price <= filled_price:
+        _emergency_close_and_verify(symbol)
+        return {"status": "error",
+                "reason": f"INVALID STOP: stop={stop_price} <= fill={filled_price}",
+                "order_id": entry["order_id"]}
+
+    # Step 4: place stop
+    stop = _submit_stop(
         symbol=symbol,
         qty=filled_qty,
         stop_price=stop_price,
         side_held="long" if order["side"] == "buy" else "short",
     )
 
-    if stop_result is None:
-        # CRITICAL: no protection -> close immediately
-        _emergency_close(symbol)
-        return {
-            "status": "error",
-            "reason": "STOP CREATION FAILED — position was emergency-closed",
-            "order_id": entry["order_id"],
-            "filled_qty": filled_qty,
-            "filled_avg_price": filled_price,
-        }
+    if stop is None:
+        _emergency_close_and_verify(symbol)
+        return {"status": "error",
+                "reason": "STOP CREATION FAILED — position emergency-closed",
+                "order_id": entry["order_id"],
+                "filled_qty": filled_qty,
+                "filled_avg_price": filled_price}
 
-    # Success
+    # Step 5: verify protection
+    if not _verify_stop_exists(symbol, filled_qty):
+        _emergency_close_and_verify(symbol)
+        return {"status": "error",
+                "reason": "STOP VERIFICATION FAILED — position emergency-closed",
+                "order_id": entry["order_id"]}
+
     return {
         "status": "submitted",
         "order_id": entry["order_id"],
-        "stop_order_id": stop_result["stop_order_id"],
+        "stop_order_id": stop["stop_order_id"],
         "symbol": symbol,
         "side": order["side"],
         "qty": filled_qty,
         "filled_avg_price": filled_price,
-        "stop_price": stop_result["stop_price"],
-        "order_type": "entry+stop (bracket-equivalent)",
+        "stop_price": stop_price,   # EXACT approved stop
+        "order_type": "entry+stop (protected)",
     }
 
 
-def record_trade_outcome(pnl_pct: float):
-    """Update consecutive losses counter based on closed trade."""
-    if pnl_pct < 0:
-        losses = get_consecutive_losses() + 1
-        set_consecutive_losses(losses)
-        from config import MAX_CONSECUTIVE_LOSSES, COOLDOWN_MINUTES
-        if losses >= MAX_CONSECUTIVE_LOSSES:
-            until = (datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)).isoformat()
-            set_cooldown_until(until)
-            print(f"🛑 broker: {losses} consecutive losses — cooldown until {until}")
-    else:
-        set_consecutive_losses(0)
-
-def move_broker_stop(symbol: str, new_stop_price: float, qty: float,
-                     side_held: str) -> dict | None:
-    """
-    Safely move protective stop to a new (higher for long) price.
-    Strategy: submit new stop FIRST, then cancel old — no unprotected window.
-    Returns new stop result or None on failure.
-    """
+def move_broker_stop(symbol: str, new_stop_price: float, qty: float, side_held: str) -> dict | None:
+    """Submit new stop first, then cancel old one. Never leaves position unprotected."""
     client = _client()
-
-    # Step 1: submit new stop first (defense in depth)
-    new_result = _submit_stop(symbol, qty, new_stop_price, side_held)
-    if new_result is None:
+    new_stop = _submit_stop(symbol, qty, new_stop_price, side_held)
+    if new_stop is None:
         return None
-
-    new_order_id = new_result["stop_order_id"]
-
-    # Step 2: cancel old stop orders (except the new one)
+    # Cancel old stops (except the new one)
     try:
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-        orders = client.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.OPEN,
-                             symbols=[symbol], limit=50)
-        )
-        for o in orders:
-            if str(o.id) == new_order_id:
+        for o in client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50)):
+            if str(o.id) == new_stop["stop_order_id"]:
                 continue
             otype = str(o.order_type).lower() if o.order_type else ""
             if "stop" in otype:
                 try:
                     client.cancel_order_by_id(o.id)
-                except Exception as e:
-                    print(f"⚠️ move_stop: cancel old failed: {e}")
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"⚠️ move_stop: cleanup failed: {e}")
+        print(f"⚠️ move_stop cleanup: {e}")
+    return new_stop
 
-    return new_result
 
-
-def get_broker_stop_for_symbol(symbol: str) -> dict | None:
-    """Returns the current broker-side stop order for a symbol, if any."""
-    try:
-        client = _client()
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-        orders = client.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.OPEN,
-                             symbols=[symbol], limit=20)
-        )
-        for o in orders:
-            otype = str(o.order_type).lower() if o.order_type else ""
-            if "stop" in otype:
-                return {
-                    "order_id": str(o.id),
-                    "stop_price": float(o.stop_price) if o.stop_price else None,
-                    "qty": float(o.qty) if o.qty else 0,
-                    "side": str(o.side).lower() if o.side else None,
-                }
-    except Exception as e:
-        print(f"⚠️ get_broker_stop: {e}")
-    return None
+def record_trade_outcome(pnl_pct: float):
+    settings = get_all_settings()
+    if pnl_pct < 0:
+        losses = get_consecutive_losses() + 1
+        set_consecutive_losses(losses)
+        if losses >= settings["max_consecutive_losses"]:
+            until = (datetime.now(timezone.utc) + timedelta(
+                minutes=settings["cooldown_minutes"]
+            )).isoformat()
+            set_cooldown_until(until)
+            print(f"🛑 broker: {losses} consecutive losses — cooldown until {until}")
+    else:
+        set_consecutive_losses(0)
