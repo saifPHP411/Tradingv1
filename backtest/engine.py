@@ -1,31 +1,22 @@
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 from signals import (
     compute_rsi_wilder, compute_atr, compute_sma, compute_ema,
     compute_macd, compute_bollinger, compute_adx, compute_stochastic,
 )
-from config import (
-    STOP_ATR_MULTIPLIER, TAKE_PROFIT_RR,
-    MAX_RISK_PER_TRADE, MAX_POSITION_PCT,
-    MIN_SIGNAL_SCORE, MIN_CONFIDENCE,
-    FEES_PER_SHARE, ENTRY_SLIPPAGE_BPS, EXIT_SLIPPAGE_BPS,
-)
+from settings import get_all_settings
+from risk_utils import normalize_price_for_symbol
 
 
-# ============ Indicator extraction for backtest ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
-    """Compute indicators using ONLY data up to index i (no look-ahead)."""
     if i < 60:
         return None
-
     window = df.iloc[: i + 1]
     closes = window["Close"].values.astype(float)
     highs = window["High"].values.astype(float)
     lows = window["Low"].values.astype(float)
     volumes = window["Volume"].values.astype(float)
-
     if len(closes) < 60:
         return None
 
@@ -65,33 +56,27 @@ def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
 
 
 def compute_regime_at(spy_df: pd.DataFrame, ts) -> dict:
-    """Regime using SPY data up to timestamp ts (no look-ahead)."""
     if spy_df is None:
         return {"regime": "UNKNOWN", "size_multiplier": 0.5}
-
     try:
         window = spy_df.loc[:ts]
     except Exception:
         window = spy_df.iloc[:0]
-
     if len(window) < 200:
         return {"regime": "UNKNOWN", "size_multiplier": 0.5}
 
     closes = window["Close"].values.astype(float)
     highs = window["High"].values.astype(float)
     lows = window["Low"].values.astype(float)
-
     price = float(closes[-1])
     sma50 = compute_sma(closes, 50)
     sma200 = compute_sma(closes, 200)
     atr = compute_atr(highs, lows, closes)
     rsi = compute_rsi_wilder(closes)
-
     if any(v is None for v in [sma50, sma200, atr, rsi]):
         return {"regime": "UNKNOWN", "size_multiplier": 0.5}
 
     atr_pct = (atr / price) * 100 if price > 0 else 0
-
     if atr_pct >= 3.0:
         return {"regime": "HIGH_VOLATILITY", "size_multiplier": 0.4}
     if atr_pct >= 2.2 and rsi < 40:
@@ -104,7 +89,6 @@ def compute_regime_at(spy_df: pd.DataFrame, ts) -> dict:
 
 
 def compute_score(indicators: dict, regime: dict) -> int:
-    """Composite signal score 0-100."""
     trend = 0
     if indicators["ema20"] > indicators["ema50"]:
         trend += 12
@@ -151,7 +135,6 @@ def compute_score(indicators: dict, regime: dict) -> int:
 
     raw = trend + momentum + rsi_score + bb + vol
     raw = max(0, min(100, raw))
-
     r = regime.get("regime", "UNKNOWN")
     if r == "BEAR":
         raw = int(raw * 0.5)
@@ -159,11 +142,9 @@ def compute_score(indicators: dict, regime: dict) -> int:
         raw = int(raw * 0.75)
     elif r == "SIDEWAYS":
         raw = int(raw * 0.9)
-
     return raw
 
 
-# ============ Position dataclass ============
 class Position:
     def __init__(self, symbol, entry_price, qty, stop, target, entry_time, entry_idx):
         self.symbol = symbol
@@ -175,26 +156,27 @@ class Position:
         self.entry_time = entry_time
         self.entry_idx = entry_idx
         self.highest_close = entry_price
-        self.trailing_active = False
         self.bars_held = 0
 
     def risk_per_share(self):
         return abs(self.entry_price - self.initial_stop)
 
 
-# ============ Main simulation ============
 def simulate(
     symbol: str,
     df: pd.DataFrame,
     spy_df: pd.DataFrame | None,
     start_equity: float = 10000.0,
-    trailing_activation_pct: float = 5.0,
-    trailing_distance_pct: float = 3.0,
     max_hold_bars: int = 60,
 ) -> dict:
     """
-    Candle-by-candle simulation with realistic fills, fees, slippage.
+    Bar-driven simulation.
+    - Decisions use data up to bar i only.
+    - Entry fills at next bar's Open + slippage (no lookahead).
+    - Gap through stop honored.
+    - Same-candle SL+TP → conservative: stop first.
     """
+    settings = get_all_settings()
     equity = start_equity
     equity_curve = []
     trades = []
@@ -210,128 +192,127 @@ def simulate(
         low = float(row["Low"])
         close = float(row["Close"])
 
-        # ---- 1) Execute pending entry at this bar's open ----
+        # ---- Execute pending entry at THIS bar's open (from signal on i-1)
         if pending_entry is not None:
-            slip = pending_entry["entry_ref"] * (ENTRY_SLIPPAGE_BPS / 10000.0)
+            slip = pending_entry["entry_ref"] * (settings["entry_slippage_bps"] / 10000.0)
             fill_price = open_p + slip
-
             stop_price = fill_price - pending_entry["stop_dist"]
             target_price = fill_price + pending_entry["target_dist"]
             qty = pending_entry["qty"]
 
-            cost = fill_price * qty
-            fees = qty * FEES_PER_SHARE
+            fees = qty * settings["fees_per_share"]
             equity -= fees
 
-            if cost <= equity + 0.01:
-                position = Position(
-                    symbol=symbol,
-                    entry_price=fill_price,
-                    qty=qty,
-                    stop=stop_price,
-                    target=target_price,
-                    entry_time=ts,
-                    entry_idx=i,
-                )
-                trade_record = {
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "entry_time": ts,
-                    "entry_price": fill_price,
-                    "qty": qty,
-                    "initial_stop": stop_price,
-                    "target": target_price,
-                    "signal_bar_idx": pending_entry["signal_bar_idx"],
-                    "regime": pending_entry.get("regime", ""),
-                    "score": pending_entry.get("score", 0),
-                    "fees_entry": fees,
-                    "slippage_entry": slip * qty,
-                }
+            position = Position(
+                symbol=symbol, entry_price=fill_price, qty=qty,
+                stop=normalize_price_for_symbol(symbol, stop_price),
+                target=normalize_price_for_symbol(symbol, target_price),
+                entry_time=ts, entry_idx=i,
+            )
+            trade_record = {
+                "symbol": symbol, "side": "BUY",
+                "entry_time": ts, "entry_price": fill_price,
+                "qty": qty,
+                "initial_stop": position.initial_stop,
+                "take_profit": position.target,
+                "signal_bar_idx": pending_entry["signal_bar_idx"],
+                "regime": pending_entry.get("regime", ""),
+                "signal_score": pending_entry.get("score", 0),
+                "fees_entry": fees,
+                "slippage_entry": slip * qty,
+                "risk_amount": abs(fill_price - position.initial_stop) * qty,
+            }
             pending_entry = None
 
-        # ---- 2) Manage open position ----
+        # ---- Manage open position
         if position is not None:
             position.bars_held += 1
             exit_reason = None
             exit_price = None
 
-            if low <= position.stop:
-                exit_price = position.stop
-                exit_reason = "STOP"
-                if open_p < position.stop:
-                    exit_price = open_p
-                    exit_reason = "STOP_GAP"
-
-            elif high >= position.target:
-                exit_price = position.target
-                exit_reason = "TARGET"
-
-            elif position.bars_held >= max_hold_bars:
-                exit_price = close
-                exit_reason = "MAX_HOLD"
+            # Gap handling: if OPEN is beyond stop, exit at open (worse than stop)
+            if position.side if hasattr(position, "side") else True:
+                if position.stop is not None:
+                    # LONG
+                    if open_p <= position.stop:
+                        exit_price = open_p
+                        exit_reason = "STOP_GAP"
+                    elif open_p >= position.target:
+                        exit_price = open_p
+                        exit_reason = "TARGET_GAP"
+                    elif low <= position.stop:
+                        # Same-candle conflict: stop first (conservative)
+                        exit_price = position.stop
+                        exit_reason = "STOP"
+                    elif high >= position.target:
+                        exit_price = position.target
+                        exit_reason = "TARGET"
+                    elif position.bars_held >= max_hold_bars:
+                        exit_price = close
+                        exit_reason = "MAX_HOLD"
 
             if exit_price is not None:
-                slip_out = exit_price * (EXIT_SLIPPAGE_BPS / 10000.0)
+                slip_out = exit_price * (settings["exit_slippage_bps"] / 10000.0)
                 final_exit = exit_price - slip_out
-                fees_out = position.qty * FEES_PER_SHARE
-
+                fees_out = position.qty * settings["fees_per_share"]
                 gross_pnl = (final_exit - position.entry_price) * position.qty
                 net_pnl = gross_pnl - fees_out
                 equity += net_pnl
 
-                trade_record["exit_time"] = ts
-                trade_record["exit_price"] = final_exit
-                trade_record["exit_reason"] = exit_reason
-                trade_record["gross_pnl"] = round(gross_pnl, 4)
-                trade_record["fees_exit"] = round(fees_out, 4)
-                trade_record["slippage_exit"] = round(slip_out * position.qty, 4)
-                trade_record["net_pnl"] = round(net_pnl, 4)
-                trade_record["r_multiple"] = round(
-                    (final_exit - position.entry_price) / position.risk_per_share(), 3
-                ) if position.risk_per_share() > 0 else 0
-                trade_record["bars_held"] = position.bars_held
+                trade_record.update({
+                    "exit_time": ts,
+                    "exit_price": final_exit,
+                    "exit_reason": exit_reason,
+                    "gross_pnl": round(gross_pnl, 4),
+                    "fees_exit": round(fees_out, 4),
+                    "slippage_exit": round(slip_out * position.qty, 4),
+                    "net_pnl": round(net_pnl, 4),
+                    "r_multiple": round(
+                        (final_exit - position.entry_price) / position.risk_per_share(), 3
+                    ) if position.risk_per_share() > 0 else 0,
+                    "bars_held": position.bars_held,
+                })
                 trades.append(trade_record)
                 position = None
-
             else:
+                # R-based trailing
                 if close > position.highest_close:
                     position.highest_close = close
+                rps = position.risk_per_share()
+                if rps > 0:
+                    pnl_r = (close - position.entry_price) / rps
+                    if pnl_r >= settings["trailing_activation_r"]:
+                        new_stop = position.highest_close - (rps * settings["trailing_distance_r"])
+                        if new_stop > position.stop and new_stop < close:
+                            position.stop = normalize_price_for_symbol(symbol, new_stop)
 
-                unrealized_pct = (close - position.entry_price) / position.entry_price * 100
-
-                if unrealized_pct >= trailing_activation_pct:
-                    new_stop = position.highest_close * (1 - trailing_distance_pct / 100)
-                    if new_stop > position.stop:
-                        position.stop = new_stop
-
-        # ---- 3) Look for new signals ----
+        # ---- Look for new signal (execute on next bar's open)
         if position is None and pending_entry is None:
             ind = compute_indicators_at(df, i)
             if ind is None:
-                equity_curve.append({"time": ts, "equity": equity})
+                equity_curve.append({"time": ts, "equity": round(equity, 2)})
                 continue
 
             regime = compute_regime_at(spy_df, ts)
             score = compute_score(ind, regime)
 
-            # ⚠️ تعديل الخيار ب: فلتر اتجاه قوي إضافي
             strong_uptrend = (
                 ind["last_close"] > ind["ema20"] and
                 ind["ema20"] > ind["ema50"] and
                 ind["adx"] > 25
             )
 
-            if score >= MIN_SIGNAL_SCORE and regime["regime"] != "BEAR" and strong_uptrend:
+            if score >= settings["min_signal_score"] and regime["regime"] != "BEAR" and strong_uptrend:
                 atr = ind["atr14"]
-                stop_dist = atr * STOP_ATR_MULTIPLIER
-                target_dist = stop_dist * TAKE_PROFIT_RR
+                stop_dist = atr * settings["stop_atr_multiplier"]
+                target_dist = stop_dist * settings["take_profit_rr"]
 
-                if stop_dist > 0 and stop_dist < close * 0.20:  # سقف 20% للـStop الواسع
+                if stop_dist > 0 and stop_dist < close * 0.20:
                     risk_mult = regime.get("size_multiplier", 1.0)
-                    risk_amount = equity * MAX_RISK_PER_TRADE * risk_mult
+                    risk_amount = equity * settings["max_risk_per_trade"] * risk_mult
                     qty = risk_amount / stop_dist
 
-                    max_notional = equity * MAX_POSITION_PCT
+                    max_notional = equity * settings["max_position_pct"]
                     if qty * close > max_notional:
                         qty = max_notional / close
 
@@ -348,25 +329,27 @@ def simulate(
 
         equity_curve.append({"time": ts, "equity": round(equity, 2)})
 
-    # Force-close open position at end
+    # Force close any open position at end
     if position is not None:
         final_close = float(df.iloc[-1]["Close"])
-        slip_out = final_close * (EXIT_SLIPPAGE_BPS / 10000.0)
+        slip_out = final_close * (settings["exit_slippage_bps"] / 10000.0)
         final_exit = final_close - slip_out
-        fees_out = position.qty * FEES_PER_SHARE
+        fees_out = position.qty * settings["fees_per_share"]
         gross_pnl = (final_exit - position.entry_price) * position.qty
         net_pnl = gross_pnl - fees_out
         equity += net_pnl
-        trade_record["exit_time"] = df.index[-1]
-        trade_record["exit_price"] = final_exit
-        trade_record["exit_reason"] = "END_OF_DATA"
-        trade_record["gross_pnl"] = round(gross_pnl, 4)
-        trade_record["fees_exit"] = round(fees_out, 4)
-        trade_record["net_pnl"] = round(net_pnl, 4)
-        trade_record["r_multiple"] = round(
-            (final_exit - position.entry_price) / position.risk_per_share(), 3
-        ) if position.risk_per_share() > 0 else 0
-        trade_record["bars_held"] = position.bars_held
+        trade_record.update({
+            "exit_time": df.index[-1],
+            "exit_price": final_exit,
+            "exit_reason": "END_OF_DATA",
+            "gross_pnl": round(gross_pnl, 4),
+            "fees_exit": round(fees_out, 4),
+            "net_pnl": round(net_pnl, 4),
+            "r_multiple": round(
+                (final_exit - position.entry_price) / position.risk_per_share(), 3
+            ) if position.risk_per_share() > 0 else 0,
+            "bars_held": position.bars_held,
+        })
         trades.append(trade_record)
 
     return {
@@ -375,4 +358,4 @@ def simulate(
         "end_equity": round(equity, 2),
         "trades": trades,
         "equity_curve": equity_curve,
-                }
+    }
