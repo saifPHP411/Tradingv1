@@ -2,8 +2,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-import threading, time
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timezone
 
 from safety import get_account_snapshot
 from settings import get_all_settings, update_settings, is_dry_run, get_symbols
@@ -41,7 +42,7 @@ class AgentController:
             if self.is_running():
                 return False
             self._stop_event.clear()
-            self._started_at = datetime.utcnow()
+            self._started_at = datetime.now(timezone.utc)
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
             return True
@@ -65,17 +66,22 @@ class AgentController:
                     except Exception as e:
                         print(f"⚠️ فشل دورة {sym}: {e}")
                     time.sleep(2)
+
+                # Snapshot equity after each full pass (fail-closed logging)
                 try:
                     snap = get_account_snapshot()
-                    log_equity(snap["equity"], snap["open_positions"])
-                except Exception:
-                    pass
+                    if snap.get("available"):
+                        log_equity(snap["equity"], snap["open_positions"])
+                except Exception as e:
+                    print(f"⚠️ equity log failed: {e}")
+
                 try:
                     learn_from_closed_trades()
-                except Exception:
-                    pass
-                interval = max(1, get_all_settings()["cycle_interval_minutes"]) * 60
-                self._stop_event.wait(timeout=interval)
+                except Exception as e:
+                    print(f"⚠️ learner failed: {e}")
+
+                interval_sec = max(1, get_all_settings()["cycle_interval_minutes"]) * 60
+                self._stop_event.wait(timeout=interval_sec)
         finally:
             self._current = None
             self._started_at = None
@@ -87,7 +93,10 @@ controller = AgentController()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("✅ بدأ التطبيق")
-    monitor.start()
+    try:
+        monitor.start()
+    except Exception as e:
+        print(f"⚠️ monitor start failed: {e}")
     yield
     controller.stop()
     monitor.stop()
@@ -97,17 +106,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# ============ Dashboard ============
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     return templates.TemplateResponse(request=request, name="dashboard.html")
 
 
+# ============ Status (FAIL-CLOSED) ============
 @app.get("/api/status")
 def api_status():
     snap = get_account_snapshot()
-    return {**snap, "dry_run": is_dry_run(), **controller.status()}
+    base = {
+        "dry_run": is_dry_run(),
+        **controller.status(),
+    }
+
+    if snap.get("available"):
+        base.update({
+            "available": True,
+            "equity": snap["equity"],
+            "last_equity": snap["last_equity"],
+            "buying_power": snap["buying_power"],
+            "open_positions": snap["open_positions"],
+            "trades_today": snap["trades_today"],
+        })
+    else:
+        base.update({
+            "available": False,
+            "reason": snap.get("reason", "unknown"),
+            "equity": None,
+            "last_equity": None,
+            "buying_power": None,
+            "open_positions": None,
+            "trades_today": None,
+        })
+
+    return base
 
 
+# ============ Positions ============
 @app.get("/api/positions")
 def api_positions():
     from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
@@ -133,6 +170,7 @@ def api_positions():
         return {"error": str(e)}
 
 
+# ============ Decisions / Equity / Exits ============
 @app.get("/api/decisions")
 def api_decisions(limit: int = 30):
     return recent_decisions(limit)
@@ -143,6 +181,12 @@ def api_equity(limit: int = 200):
     return equity_history(limit)
 
 
+@app.get("/api/exits")
+def api_exits(limit: int = 30):
+    return recent_exit_decisions(limit)
+
+
+# ============ Settings ============
 @app.get("/api/settings")
 def api_get_settings():
     return get_all_settings()
@@ -154,6 +198,7 @@ async def api_update_settings(payload: dict):
     return get_all_settings()
 
 
+# ============ Run control ============
 @app.post("/api/run/toggle")
 def api_toggle_run():
     if controller.is_running():
@@ -175,6 +220,7 @@ def api_stop():
     return {"running": controller.is_running()}
 
 
+# ============ Monitor control ============
 @app.get("/api/monitor/status")
 def api_monitor_status():
     return monitor.status()
@@ -187,8 +233,3 @@ def api_monitor_toggle():
         return {"running": False}
     monitor.start()
     return {"running": True}
-
-
-@app.get("/api/exits")
-def api_exits(limit: int = 30):
-    return recent_exit_decisions(limit)
