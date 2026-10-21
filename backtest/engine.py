@@ -27,40 +27,34 @@ Capital constraints (explicit):
     - can_open() requires available_cash >= notional + fees for BOTH sides.
     - For SHORT, proceeds are credited to cash (so the equity identity holds),
       but the same notional is reserved, so the proceeds are NOT spendable.
-      This is an exposure-based short model with reserved collateral, not
-      margin accounting.
     - Total exposure is additionally capped by max_portfolio_exposure_pct
-      via validate_portfolio_exposure() (which uses abs market value, so it
-      includes shorts).
-    - max_open_positions is enforced BOTH at signal-generation time (inside
-      can_trade) AND at order-execution time (inside the pending-entry loop).
-      The execution-time check is essential because multiple symbols can
-      queue entries in the same bar; without it, all of them would open.
+      via validate_portfolio_exposure().
 
-Other invariants:
-    - Equity curve marked-to-market every bar (last Close per symbol).
-    - A final snapshot is appended after force-closing open positions so
-      equity_curve[-1].equity == end_equity.
-    - Signals computed on bar i, executed on bar i+1 Open (no lookahead).
-    - Gap handled at Open; same-candle conflict resolved STOP-first.
-    - R-based trailing uses Close (matches monitor semantics).
-    - Consecutive losses trigger a *timed* cooldown from
-      settings['cooldown_minutes']. When the cooldown expires, both
-      cooldown_until and consecutive_losses are reset so trading can resume.
-      An active cooldown is never extended by subsequent losses.
-    - Signal scoring is imported from signals.py (no duplication).
-    - Historical news is unavailable in the backtest. We pass an explicit
-      news={'available': False} dict to compute_signal_score(), which yields
-      news_component = 0 deterministically. Live may add up to ±10 points
-      from news, so backtest scores can differ from live by that amount.
-      This is a documented input limitation, not full signal parity.
+Signal & risk timing:
+    - Signals are computed on bar i (using data up to i), queued as pending,
+      and executed on bar i+1 Open (no lookahead).
+    - Risk gates (max_open_positions, max_trades_per_day, daily_loss,
+      cooldown, consecutive_losses) are re-checked at BOTH signal time and
+      execution time. The execution-time recheck is essential: multiple
+      symbols can be pending in the same bar, and state may have changed
+      between bar i and bar i+1 (another pending opened, a loss closed,
+      a cooldown started). Rechecking keeps every entry synchronized with
+      live portfolio state.
+    - trading_start_ts (optional): if provided, no signals are queued before
+      this timestamp, but indicator warmup still uses all earlier bars. This
+      is required for walk-forward OOS windows: the window needs >= 60 bars
+      of history for indicators, but must not report trades from that
+      history as OOS results.
+
+Execution realism:
+    - Gap through stop honoured at Open.
+    - Same-candle STOP+TP resolved STOP-first (conservative; documented).
+    - Slippage is signed: buy -> pay more, sell -> receive less.
+    - Fees charged once on entry and once on exit.
 
 Strategy vs execution:
     - Strategy is LONG-only by design (enable_short defaults to 0).
     - Execution engine is LONG and SHORT capable.
-    - SHORT signals (when enable_short=1) use compute_short_score() from
-      signals.py, a symmetric mirror of compute_signal_score(). It is not
-      a new strategy.
 """
 from __future__ import annotations
 
@@ -80,8 +74,6 @@ from risk_utils import (
 
 
 # ---------------------------------------------------------------- News
-# The backtester has no historical news feed. This constant documents the
-# limitation explicitly so nobody later assumes backtest scores include news.
 BACKTEST_NEWS_AVAILABLE = False
 _NEWS_UNAVAILABLE = {"available": False, "score": 0.0, "news_count": 0}
 
@@ -244,13 +236,10 @@ class PortfolioState:
 
     @property
     def available_cash(self) -> float:
-        """Cash that is not tied up as reserved collateral for shorts."""
         return self.cash - self.reserved_collateral
 
-    # ---- timestamp helper ----
     @staticmethod
     def _parse_ts(x):
-        """Parse any pandas-compatible timestamp into a naive UTC Timestamp."""
         try:
             t = pd.Timestamp(x)
         except Exception:
@@ -259,7 +248,6 @@ class PortfolioState:
             t = t.tz_convert("UTC").tz_localize(None)
         return t
 
-    # ---- day / risk gates ----
     def new_day(self, date_iso: str):
         self.current_date = date_iso
         self.daily_start_equity = self.equity(self._last_prices)
@@ -267,8 +255,6 @@ class PortfolioState:
 
     def can_trade(self, now_iso: str, prices: dict[str, float]) -> tuple[bool, str]:
         s = self.settings
-
-        # ---- Cooldown handling ----
         if self.cooldown_until:
             cu = self._parse_ts(self.cooldown_until)
             now = self._parse_ts(now_iso)
@@ -278,10 +264,6 @@ class PortfolioState:
                 return False, "cooldown"
             self.cooldown_until = None
             self.consecutive_losses = 0
-
-        # Defensive: if the loss threshold was reached but no cooldown was set
-        # (e.g., timestamp conversion failed inside record_trade), start one
-        # from now, or reset if cooldown_minutes <= 0. Never permanently lock.
         if self.consecutive_losses >= s["max_consecutive_losses"]:
             mins = int(s.get("cooldown_minutes", 120))
             if mins <= 0:
@@ -290,11 +272,8 @@ class PortfolioState:
                 now = self._parse_ts(now_iso)
                 if now is None:
                     return False, "cooldown_unparseable"
-                self.cooldown_until = (
-                    now + pd.Timedelta(minutes=mins)
-                ).isoformat()
+                self.cooldown_until = (now + pd.Timedelta(minutes=mins)).isoformat()
                 return False, "cooldown"
-
         if self.trades_today >= s["max_trades_per_day"]:
             return False, "max_trades_per_day"
         if len(self.positions) >= s["max_open_positions"]:
@@ -306,24 +285,8 @@ class PortfolioState:
                 return False, "daily_loss"
         return True, "ok"
 
-    # ---- cash / position ops ----
     def can_open(self, entry_notional: float, entry_fees: float,
                  side: str = "long") -> tuple[bool, str]:
-        """
-        Cash-secured gate with reserved collateral (SHORT-safe).
-
-            available = cash - reserved_collateral
-            require available >= entry_notional + entry_fees
-
-        For SHORT, proceeds are credited to cash on fill (so the equity
-        identity holds), but the same notional is added to
-        reserved_collateral. The proceeds are therefore NOT spendable:
-        available_cash stays at the pre-trade level.
-
-        `side` is accepted for API compatibility. The reserved-collateral
-        rule applies to both LONG and SHORT. Total exposure is additionally
-        capped by max_portfolio_exposure_pct via validate_portfolio_exposure.
-        """
         available = self.available_cash
         required = entry_notional + entry_fees
         if available < required:
@@ -334,8 +297,7 @@ class PortfolioState:
             )
         return True, "ok"
 
-    def open_position(self, pos: PortfolioPosition, entry_fees: float,
-                      entry_slippage_cost: float):
+    def open_position(self, pos, entry_fees, entry_slippage_cost):
         notional = pos.entry_price * pos.qty
         if pos.side == LONG:
             self.cash -= notional + entry_fees
@@ -347,12 +309,10 @@ class PortfolioState:
         pos.entry_slippage_cost = entry_slippage_cost
         self.positions[pos.symbol] = pos
 
-    def close_position(self, sym: str, exit_price: float, exit_fees: float,
-                       exit_slippage_cost: float, exit_reason: str, ts,
-                       prices: dict[str, float]):
+    def close_position(self, sym, exit_price, exit_fees,
+                       exit_slippage_cost, exit_reason, ts, prices):
         pos = self.positions.pop(sym)
         exit_notional = exit_price * pos.qty
-
         if pos.side == LONG:
             gross = (exit_price - pos.entry_price) * pos.qty
             self.cash += exit_notional - exit_fees
@@ -362,15 +322,12 @@ class PortfolioState:
             self.reserved_collateral -= pos.entry_price * pos.qty
             if self.reserved_collateral < 0:
                 self.reserved_collateral = 0.0
-
         self.fees_paid += exit_fees
         total_net = gross - exit_fees - pos.entry_fees
         self.realized_pnl += total_net
-
         rps = pos.risk_per_share()
         risk_amount = rps * pos.qty
         r_multiple = (gross / risk_amount) if risk_amount > 0 else 0.0
-
         trade = {
             "symbol": sym,
             "side": "BUY" if pos.side == LONG else "SELL",
@@ -398,7 +355,6 @@ class PortfolioState:
             "portfolio_reserved_after": round(self.reserved_collateral, 2),
         }
         self.trades.append(trade)
-
         if total_net < 0:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.settings["max_consecutive_losses"]:
@@ -408,9 +364,7 @@ class PortfolioState:
                     self.cooldown_until = None
                 elif self.cooldown_until is None:
                     try:
-                        self.cooldown_until = (
-                            pd.Timestamp(ts) + pd.Timedelta(minutes=mins)
-                        ).isoformat()
+                        self.cooldown_until = (pd.Timestamp(ts) + pd.Timedelta(minutes=mins)).isoformat()
                     except Exception:
                         self.cooldown_until = None
                 print(f"🛑 cooldown: {self.consecutive_losses} consecutive losses "
@@ -418,7 +372,7 @@ class PortfolioState:
         else:
             self.consecutive_losses = 0
 
-    def snapshot(self, ts, prices: dict[str, float]):
+    def snapshot(self, ts, prices):
         eq = self.equity(prices)
         self._last_prices = dict(prices)
         self.equity_curve.append({
@@ -432,8 +386,7 @@ class PortfolioState:
         })
 
 
-# ============ Helpers ============
-def _bar_row(df: pd.DataFrame, ts):
+def _bar_row(df, ts):
     try:
         return df.loc[ts]
     except Exception:
@@ -444,7 +397,21 @@ def _bar_row(df: pd.DataFrame, ts):
 def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                        spy_df: pd.DataFrame | None,
                        start_equity: float = 10000.0,
-                       settings: dict | None = None) -> dict:
+                       settings: dict | None = None,
+                       trading_start_ts=None,
+                       max_hold_bars: int = 60) -> dict:
+    """
+    Bar-driven portfolio backtest.
+
+    Parameters
+    ----------
+    trading_start_ts : pandas-compatible timestamp, optional
+        If set, no signals are queued before this timestamp. Indicator
+        warmup still uses all earlier bars (no lookahead), but no trades
+        are opened during warmup. Used by walk-forward OOS windows.
+    max_hold_bars : int
+        Force-close a position after this many bars. Defaults to 60.
+    """
     if settings is None:
         settings = get_all_settings()
 
@@ -452,10 +419,16 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         print("ℹ️ backtest: historical news unavailable — scoring with "
               "news={'available': False} (deterministic, no lookahead).")
 
+    # Normalize trading_start_ts to a naive UTC Timestamp or None.
+    if trading_start_ts is not None:
+        _tstart = PortfolioState._parse_ts(trading_start_ts)
+    else:
+        _tstart = None
+
     state = PortfolioState(start_equity, settings)
     all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
     cursors = {sym: 0 for sym in symbols_data}
-    pending: dict[str, dict | None] = {sym: None for sym in symbols_data}
+    pending = {sym: None for sym in symbols_data}
     last_prices: dict[str, float] = {}
     last_ts = all_times[-1] if all_times else None
     enable_short = bool(int(settings.get("enable_short", 0) or 0))
@@ -477,16 +450,14 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             if p is None:
                 continue
 
-            # Respect max_open_positions at execution time.
-            # Multiple symbols may be pending in the same bar; the count
-            # must be re-checked before each open, not only at signal time.
-            # If the limit is missing or invalid, fail closed (0 opens).
-            limit = settings.get("max_open_positions")
-            try:
-                limit_int = int(limit)
-            except (TypeError, ValueError):
-                limit_int = 0
-            if limit_int <= 0 or len(state.positions) >= limit_int:
+            # RE-CHECK risk gates at execution time.
+            # Signals are queued on bar T and executed on bar T+1. Between
+            # those bars, multiple symbols may have opened, a loss may have
+            # triggered cooldown, or a daily-loss lock may have started.
+            # Without this recheck, pending entries bypass max_open_positions,
+            # max_trades_per_day, daily_loss, and cooldown.
+            gate_ok, _ = state.can_trade(ts.isoformat(), last_prices)
+            if not gate_ok:
                 pending[sym] = None
                 continue
 
@@ -516,12 +487,12 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             entry_notional = qty * fill_price
             entry_fees = qty * settings["fees_per_share"]
 
-            ok, why = state.can_open(entry_notional, entry_fees, side)
+            ok, _ = state.can_open(entry_notional, entry_fees, side)
             if not ok:
                 pending[sym] = None
                 continue
 
-            exp_ok, exp_why = validate_portfolio_exposure(
+            exp_ok, _ = validate_portfolio_exposure(
                 state.equity(last_prices), state.positions,
                 entry_notional, settings["max_portfolio_exposure_pct"],
             )
@@ -563,7 +534,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                     exit_price, exit_reason = pos.stop, "STOP"
                 elif high >= pos.target:
                     exit_price, exit_reason = pos.target, "TARGET"
-                elif pos.bars_held >= 60:
+                elif pos.bars_held >= max_hold_bars:
                     exit_price, exit_reason = close, "MAX_HOLD"
             else:  # SHORT
                 if open_p >= pos.stop:
@@ -574,7 +545,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                     exit_price, exit_reason = pos.stop, "STOP"
                 elif low <= pos.target:
                     exit_price, exit_reason = pos.target, "TARGET"
-                elif pos.bars_held >= 60:
+                elif pos.bars_held >= max_hold_bars:
                     exit_price, exit_reason = close, "MAX_HOLD"
 
             if exit_price is not None:
@@ -589,7 +560,6 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 )
                 continue
 
-            # R-based trailing (Close-based, matches monitor)
             if pos.side == LONG:
                 if close > pos.highest_price:
                     pos.highest_price = close
@@ -612,81 +582,86 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                             pos.stop = normalize_price_for_symbol(sym, new_stop)
 
         # ---- 3) Generate signals (executed next bar)
-        can, _ = state.can_trade(ts.isoformat(), last_prices)
-        if can:
-            for sym, df in symbols_data.items():
-                if sym in state.positions or pending.get(sym) is not None:
-                    continue
-                try:
-                    idx = df.index.get_loc(ts)
-                except KeyError:
-                    continue
-                if idx < 60:
-                    continue
-                ind = compute_indicators_at(df, idx)
-                if ind is None:
-                    continue
-                regime = compute_regime_at(spy_df, ts)
+        # Skip during warmup: indicators still use all earlier bars, but no
+        # pending entries are queued, so walk-forward OOS windows do not
+        # leak pre-window trades into reported results.
+        in_trading_window = (_tstart is None) or (ts >= _tstart)
+        if in_trading_window:
+            can, _ = state.can_trade(ts.isoformat(), last_prices)
+            if can:
+                for sym, df in symbols_data.items():
+                    if sym in state.positions or pending.get(sym) is not None:
+                        continue
+                    try:
+                        idx = df.index.get_loc(ts)
+                    except KeyError:
+                        continue
+                    if idx < 60:
+                        continue
+                    ind = compute_indicators_at(df, idx)
+                    if ind is None:
+                        continue
+                    regime = compute_regime_at(spy_df, ts)
 
-                long_score = compute_signal_score(
-                    ind, regime, news=_NEWS_UNAVAILABLE)["score"]
-                strong_uptrend = (
-                    ind["last_close"] > ind["ema20"]
-                    and ind["ema20"] > ind["ema50"]
-                    and ind["adx"] > 25
-                )
-                long_ok = (
-                    long_score >= settings["min_signal_score"]
-                    and regime["regime"] != "BEAR"
-                    and strong_uptrend
-                )
-
-                short_ok = False
-                short_score = 0
-                if enable_short:
-                    short_score = compute_short_score(ind, regime)["score"]
-                    strong_downtrend = (
-                        ind["last_close"] < ind["ema20"]
-                        and ind["ema20"] < ind["ema50"]
+                    long_score = compute_signal_score(
+                        ind, regime, news=_NEWS_UNAVAILABLE)["score"]
+                    strong_uptrend = (
+                        ind["last_close"] > ind["ema20"]
+                        and ind["ema20"] > ind["ema50"]
                         and ind["adx"] > 25
                     )
-                    short_ok = (
-                        short_score >= settings["min_signal_score"]
-                        and regime["regime"] != "BULL"
-                        and strong_downtrend
+                    long_ok = (
+                        long_score >= settings["min_signal_score"]
+                        and regime["regime"] != "BEAR"
+                        and strong_uptrend
                     )
 
-                if long_ok and not short_ok:
-                    side, chosen_score = "buy", long_score
-                elif short_ok and not long_ok:
-                    side, chosen_score = "sell", short_score
-                else:
-                    continue
+                    short_ok = False
+                    short_score = 0
+                    if enable_short:
+                        short_score = compute_short_score(ind, regime)["score"]
+                        strong_downtrend = (
+                            ind["last_close"] < ind["ema20"]
+                            and ind["ema20"] < ind["ema50"]
+                            and ind["adx"] > 25
+                        )
+                        short_ok = (
+                            short_score >= settings["min_signal_score"]
+                            and regime["regime"] != "BULL"
+                            and strong_downtrend
+                        )
 
-                atr = ind["atr14"]
-                stop_dist = atr * settings["stop_atr_multiplier"]
-                if stop_dist <= 0 or stop_dist > ind["last_close"] * 0.20:
-                    continue
-                target_dist = stop_dist * settings["take_profit_rr"]
+                    if long_ok and not short_ok:
+                        side, chosen_score = "buy", long_score
+                    elif short_ok and not long_ok:
+                        side, chosen_score = "sell", short_score
+                    else:
+                        continue
 
-                risk_mult = regime.get("size_multiplier", 1.0)
-                qty = compute_position_size(
-                    state.equity(last_prices), ind["last_close"], stop_dist,
-                    settings["max_risk_per_trade"], risk_mult,
-                    settings["max_position_pct"],
-                )
-                if qty <= 0 or qty * ind["last_close"] < 1.0:
-                    continue
+                    atr = ind["atr14"]
+                    stop_dist = atr * settings["stop_atr_multiplier"]
+                    if stop_dist <= 0 or stop_dist > ind["last_close"] * 0.20:
+                        continue
+                    target_dist = stop_dist * settings["take_profit_rr"]
 
-                pending[sym] = {
-                    "side": side,
-                    "qty": qty,
-                    "stop_dist": stop_dist,
-                    "target_dist": target_dist,
-                    "signal_bar_idx": idx,
-                    "regime": regime["regime"],
-                    "score": chosen_score,
-                }
+                    risk_mult = regime.get("size_multiplier", 1.0)
+                    qty = compute_position_size(
+                        state.equity(last_prices), ind["last_close"], stop_dist,
+                        settings["max_risk_per_trade"], risk_mult,
+                        settings["max_position_pct"],
+                    )
+                    if qty <= 0 or qty * ind["last_close"] < 1.0:
+                        continue
+
+                    pending[sym] = {
+                        "side": side,
+                        "qty": qty,
+                        "stop_dist": stop_dist,
+                        "target_dist": target_dist,
+                        "signal_bar_idx": idx,
+                        "regime": regime["regime"],
+                        "score": chosen_score,
+                    }
 
         state.snapshot(ts, last_prices)
 
@@ -708,7 +683,6 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             abs(exit_slip) * pos.qty, "END_OF_DATA", last_ts, last_prices,
         )
 
-    # Final snapshot: after force-close, equity_curve[-1] must match end_equity.
     if all_times:
         final_eq = state.equity(last_prices)
         state._last_prices = dict(last_prices)
@@ -738,9 +712,13 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     }
 
 
-# ============ Legacy single-symbol wrapper ============
 def simulate(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
-             start_equity: float = 10000.0, max_hold_bars: int = 60) -> dict:
-    r = simulate_portfolio({symbol: df}, spy_df, start_equity)
+             start_equity: float = 10000.0, max_hold_bars: int = 60,
+             trading_start_ts=None) -> dict:
+    r = simulate_portfolio(
+        {symbol: df}, spy_df, start_equity,
+        trading_start_ts=trading_start_ts,
+        max_hold_bars=max_hold_bars,
+    )
     r["symbol"] = symbol
     return r
