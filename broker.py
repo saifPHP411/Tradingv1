@@ -104,12 +104,16 @@ def _verify_stop_exists(symbol: str, expected_qty: float) -> bool:
 
 def _emergency_close_and_verify(symbol: str) -> bool:
     """
-    Close position and verify it is actually gone.
+    Close position and verify. Handles market-closed gracefully.
     Returns True only if broker confirms flat.
     """
     try:
         client = _client()
-        # Cancel all open orders on symbol
+
+        from safety import is_market_open
+        market_open = is_market_open()
+
+        # Cancel all open orders on symbol first
         try:
             for o in client.get_orders(GetOrdersRequest(
                     status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50)):
@@ -120,11 +124,16 @@ def _emergency_close_and_verify(symbol: str) -> bool:
         except Exception:
             pass
 
-        client.close_position(symbol)
+        # Attempt close (may fail outside market hours)
+        close_error = None
+        try:
+            client.close_position(symbol)
+        except Exception as e:
+            close_error = str(e)
 
-        # Verify
-        for _ in range(5):
-            time.sleep(1)
+        # Verify — up to ~15s
+        for _ in range(8):
+            time.sleep(2)
             try:
                 positions = client.get_all_positions()
                 if not any(p.symbol == symbol for p in positions):
@@ -133,12 +142,16 @@ def _emergency_close_and_verify(symbol: str) -> bool:
             except Exception:
                 pass
 
-        print(f"🚨 CRITICAL: EMERGENCY CLOSE VERIFICATION FAILED: {symbol}")
+        if close_error:
+            print(f"🚨 CRITICAL: {symbol} close failed: {close_error} "
+                  f"(market_open={market_open})")
+        else:
+            print(f"🚨 CRITICAL: {symbol} still open after close "
+                  f"(market_open={market_open})")
         return False
     except Exception as e:
         print(f"🚨 CRITICAL: EMERGENCY CLOSE EXCEPTION: {symbol}: {e}")
         return False
-
 
 def _find_existing_position(symbol: str) -> dict | None:
     try:
