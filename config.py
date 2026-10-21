@@ -12,6 +12,10 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
+# ============ Data Providers (optional) ============
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+
 # ============ Trading Mode — SINGLE SOURCE ============
 # BACKTEST: no broker calls (used by backtester/engine)
 # PAPER:    Alpaca Paper Trading
@@ -86,6 +90,5 @@ GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "graph_checkpoints.db")
 ACCOUNT_EQUITY_DEFAULT = 10000
 
 # ============ Legacy aliases — DO NOT USE IN NEW CODE ============
-# Kept only so any missed import doesn't crash. Migrated to settings.py.
 ONLY_MARKET_HOURS = True
 DRY_RUN = get_trading_mode() == "PAPER"
