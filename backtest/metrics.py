@@ -2,49 +2,44 @@ import numpy as np
 import pandas as pd
 
 
-def calculate_metrics(equity_curve: list, trades: list, initial_equity: float) -> dict:
-    """Compute comprehensive performance metrics."""
+def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
+                      periods_per_year: int = 252) -> dict:
+    """
+    periods_per_year: 252 for daily bars, 252*390 for 1-minute intraday,
+                      52 for weekly, 12 for monthly.
+    """
     if not equity_curve or len(equity_curve) < 2:
         return {"error": "no data"}
-
     eq = pd.DataFrame(equity_curve)
     eq["time"] = pd.to_datetime(eq["time"])
     eq = eq.set_index("time").sort_index()
     values = eq["equity"].values
 
-    # Returns
     returns = np.diff(values) / values[:-1]
     returns = returns[np.isfinite(returns)]
-
     total_return_pct = (values[-1] / initial_equity - 1) * 100
 
-    # Annualized (assuming daily bars, 252 trading days)
-    n_days = len(values)
-    years = max(n_days / 252, 1 / 252)
+    n_periods = len(values)
+    years = max(n_periods / periods_per_year, 1 / periods_per_year)
     cagr = ((values[-1] / initial_equity) ** (1 / years) - 1) * 100 if initial_equity > 0 else 0
 
-    # Drawdown
     running_max = np.maximum.accumulate(values)
     drawdowns = (values - running_max) / running_max
     max_dd = drawdowns.min() * 100
 
-    # Sharpe
     if len(returns) > 1 and np.std(returns) > 0:
-        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+        sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(periods_per_year)
     else:
         sharpe = 0.0
 
-    # Sortino
     downside = returns[returns < 0]
     if len(downside) > 1 and np.std(downside) > 0:
-        sortino = (np.mean(returns) / np.std(downside)) * np.sqrt(252)
+        sortino = (np.mean(returns) / np.std(downside)) * np.sqrt(periods_per_year)
     else:
         sortino = 0.0
 
-    # Calmar
     calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
 
-    # Trade stats
     if not trades:
         return {
             "total_return_pct": round(total_return_pct, 2),
@@ -59,22 +54,20 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float) -
     pnls = [t["net_pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
-    rs = [t["r_multiple"] for t in trades]
+    rs = [t.get("r_multiple", 0.0) for t in trades]
 
     win_rate = len(wins) / len(pnls) * 100 if pnls else 0
     avg_win = np.mean(wins) if wins else 0
     avg_loss = np.mean(losses) if losses else 0
     largest_win = max(wins) if wins else 0
     largest_loss = min(losses) if losses else 0
-
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
     expectancy = np.mean(pnls) if pnls else 0
     avg_r = np.mean(rs) if rs else 0
+    median_r = float(np.median(rs)) if rs else 0
 
-    # Consecutive
     max_cons_wins = 0
     max_cons_losses = 0
     cur_w = 0
@@ -93,13 +86,6 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float) -
     total_slip = sum(t.get("slippage_entry", 0) + t.get("slippage_exit", 0) for t in trades)
     avg_hold = np.mean([t.get("bars_held", 0) for t in trades]) if trades else 0
 
-    # Monthly returns
-    try:
-        monthly = eq["equity"].resample("ME").last().pct_change() * 100
-        monthly = monthly.dropna()
-    except Exception:
-        monthly = pd.Series(dtype=float)
-
     return {
         "total_return_pct": round(total_return_pct, 2),
         "cagr_pct": round(cagr, 2),
@@ -116,10 +102,11 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float) -
         "profit_factor": round(float(profit_factor), 2) if profit_factor != float("inf") else None,
         "expectancy": round(float(expectancy), 2),
         "avg_r_multiple": round(float(avg_r), 3),
+        "median_r_multiple": round(median_r, 3),
         "max_consecutive_wins": max_cons_wins,
         "max_consecutive_losses": max_cons_losses,
         "avg_hold_bars": round(float(avg_hold), 1),
         "total_fees": round(float(total_fees), 2),
         "total_slippage": round(float(total_slip), 2),
         "final_equity": round(float(values[-1]), 2),
-      }
+        }
