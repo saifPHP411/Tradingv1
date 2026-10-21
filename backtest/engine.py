@@ -1,24 +1,52 @@
 """
 Bar-driven Portfolio Backtester.
 
-Cash accounting model (spot, no leverage / no margin):
+Accounting model: CASH-SECURED SPOT (no margin, no leverage).
+
     LONG  entry : cash -= entry_notional + entry_fees
     SHORT entry : cash += entry_notional - entry_fees   (proceeds - fees)
     LONG  exit  : cash += exit_notional  - exit_fees
     SHORT exit  : cash -= exit_notional  + exit_fees
+
     equity(prices) = cash + sum(signed_market_value)
         long  => +qty * price
         short => -qty * price
 
+    realized_pnl  is accumulated when positions close.
+    unrealized_pnl is derived on demand from open positions and current prices.
+    equity is always cash + signed_market_value — no double counting.
+
+Capital model constraints (explicit):
+    - No margin and no leverage is simulated. Both LONG and SHORT entries
+      require the FULL notional + fees in cash at entry time. For SHORT,
+      proceeds are credited on fill (see formula above), but the gate at
+      entry is conservative — the model never opens a short it cannot
+      cover on a gap-up. This is a documented limitation, not margin
+      accounting.
+
 Other invariants:
     - Equity curve is marked-to-market every bar (last Close per symbol).
+    - A final snapshot is appended after force-closing remaining positions
+      so that equity_curve[-1].equity == end_equity.
     - Signals computed on bar i, executed on bar i+1 Open (no lookahead).
     - Gap handled at Open; same-candle conflict resolved STOP-first.
     - R-based trailing uses Close (matches monitor semantics).
-    - Consecutive losses trigger a *timed* cooldown from settings.
-    - Signal scoring imported from signals.py (no duplication).
-    - Strategy is LONG-only by design. SHORT execution exists, but
-      enable_short must be set explicitly; the default is 0.
+    - Consecutive losses trigger a *timed* cooldown from settings
+      (settings['cooldown_minutes']).
+    - Signal scoring is imported from signals.py — no duplicated scoring.
+    - BACKTEST_NEWS_AVAILABLE is False: no historical news feed is used.
+      We pass an explicit news={"available": False} dict to the score
+      function so the decision is deterministic and auditable. The live
+      strategy can add up to ±10 points from news, so backtest scores
+      may differ from live scores by that amount. This is a documented
+      input limitation, not a claim of full signal parity.
+
+Strategy vs execution:
+    - The strategy is LONG-only by design.
+    - The execution engine is LONG and SHORT capable.
+    - SHORT signals are gated by settings['enable_short'] (default 0)
+      and use compute_short_score() from signals.py — a symmetric
+      mirror of compute_signal_score(). This is not a new strategy.
 """
 from __future__ import annotations
 
@@ -37,7 +65,14 @@ from risk_utils import (
 )
 
 
-# ============ Indicators & Regime ============
+# ---------------------------------------------------------------- News
+# The backtester has no historical news feed. This constant documents the
+# limitation explicitly so nobody later assumes backtest scores include news.
+BACKTEST_NEWS_AVAILABLE = False
+_NEWS_UNAVAILABLE = {"available": False, "score": 0.0, "news_count": 0}
+
+
+# ============ Indicators & Regime (bar-local, no lookahead) ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
     if i < 60:
         return None
@@ -216,7 +251,21 @@ class PortfolioState:
         return True, "ok"
 
     # ---- cash / position ops ----
-    def can_open(self, entry_notional: float, entry_fees: float) -> tuple[bool, str]:
+    def can_open(self, entry_notional: float, entry_fees: float,
+                 side: str) -> tuple[bool, str]:
+        """
+        Cash-secured gate for both sides.
+
+        This backtester does NOT simulate margin or leverage. To keep the
+        accounting model internally consistent, both LONG and SHORT require
+        the FULL notional + fees in cash at entry:
+
+          - LONG:  you pay the notional now, and later receive proceeds.
+          - SHORT: you receive proceeds on fill (see open_position), but the
+                   gate keeps cash >= notional so the model never opens a
+                   short it could not cover on a gap-up. This is a documented
+                   conservative limitation, not margin accounting.
+        """
         required = entry_notional + entry_fees
         if self.cash < required:
             return False, f"insufficient_cash ({self.cash:.2f} < {required:.2f})"
@@ -228,7 +277,7 @@ class PortfolioState:
         if pos.side == LONG:
             self.cash -= notional + entry_fees
         else:
-            # SHORT: proceeds increase cash; fees paid out of proceeds.
+            # SHORT: proceeds credited to cash, fees paid out of proceeds.
             self.cash += notional - entry_fees
         self.fees_paid += entry_fees
         pos.entry_fees = entry_fees
@@ -326,6 +375,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     if settings is None:
         settings = get_all_settings()
 
+    if not BACKTEST_NEWS_AVAILABLE:
+        print("ℹ️ backtest: historical news unavailable — passing "
+              "news={'available': False} to scoring (deterministic, no lookahead).")
+
     state = PortfolioState(start_equity, settings)
     all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
     cursors = {sym: 0 for sym in symbols_data}
@@ -376,7 +429,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             entry_notional = qty * fill_price
             entry_fees = qty * settings["fees_per_share"]
 
-            ok, why = state.can_open(entry_notional, entry_fees)
+            ok, why = state.can_open(entry_notional, entry_fees, side)
             if not ok:
                 pending[sym] = None
                 continue
@@ -488,8 +541,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                     continue
                 regime = compute_regime_at(spy_df, ts)
 
-                # LONG scoring — use the shared implementation from signals.py.
-                long_score = compute_signal_score(ind, regime)["score"]
+                # Shared scoring from signals.py.
+                # We pass news explicitly (unavailable → 0 contribution)
+                # so the behavior is deterministic and auditable.
+                long_score = compute_signal_score(ind, regime, news=_NEWS_UNAVAILABLE)["score"]
                 strong_uptrend = (
                     ind["last_close"] > ind["ema20"]
                     and ind["ema20"] > ind["ema50"]
@@ -521,7 +576,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 elif short_ok and not long_ok:
                     side, chosen_score = "sell", short_score
                 else:
-                    continue  # both or neither → no trade
+                    continue
 
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
@@ -567,6 +622,23 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             sym, final_exit, exit_fees,
             abs(exit_slip) * pos.qty, "END_OF_DATA", last_ts, last_prices,
         )
+
+    # Replace the last equity snapshot so equity_curve[-1] matches end_equity
+    # (after force-close, cash has been updated and positions are empty).
+    if all_times:
+        final_eq = state.equity(last_prices)
+        state._last_prices = dict(last_prices)
+        entry = {
+            "time": last_ts,
+            "equity": round(final_eq, 2),
+            "cash": round(state.cash, 2),
+            "unrealized": round(state.unrealized_pnl(last_prices), 2),
+            "n_positions": len(state.positions),
+        }
+        if state.equity_curve and state.equity_curve[-1]["time"] == last_ts:
+            state.equity_curve[-1] = entry
+        else:
+            state.equity_curve.append(entry)
 
     return {
         "start_equity": start_equity,
