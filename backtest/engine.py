@@ -1,22 +1,21 @@
 """
 Bar-driven Portfolio Backtester.
 
-Design invariants:
-  - One shared cash/equity/positions portfolio across all symbols.
-  - Cash accounting:
-      LONG entry : cash -= entry_notional + entry_fees
-      SHORT entry: cash += entry_notional - entry_fees   (proceeds - fees)
-      LONG exit  : cash += exit_notional  - exit_fees
-      SHORT exit : cash -= exit_notional  + exit_fees
-      equity(prices) = cash + sum(signed_market_value)
-        - long  => +qty*price
-        - short => -qty*price
-  - Equity curve marked-to-market every bar using last known Close per symbol.
-  - Signals computed on bar i, executed on bar i+1 Open (no lookahead).
-  - Stop/Target honour gap and same-candle conservative rule (STOP first).
-  - R-based trailing shared with monitor (uses Close, not High/Low).
-  - Consecutive losses → real time-based cooldown (from settings), not 9999.
-  - Signal logic imported from signals.py — no duplicated scoring.
+Cash accounting model (spot, no leverage):
+    LONG  entry: cash -= entry_notional + entry_fees
+    SHORT entry: cash += entry_notional - entry_fees   (proceeds - fees)
+    LONG  exit : cash += exit_notional  - exit_fees
+    SHORT exit : cash -= exit_notional  + exit_fees
+    equity(prices) = cash + sum(signed_market_value)
+        long  => +qty * price
+        short => -qty * price
+
+Equity curve marked-to-market every bar using last Close per symbol.
+Signals computed on bar i, executed at bar i+1 Open (no lookahead).
+Stop/Target honour gap and same-candle conservative rule (STOP first).
+R-based trailing shared with monitor (Close-based).
+Consecutive losses → real time-based cooldown from settings.
+Signal logic imported from signals.py — no duplicated scoring.
 """
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ from risk_utils import (
 )
 
 
-# ============ Indicators & Regime (unchanged logic, still bar-local) ============
+# ============ Indicators & Regime (bar-local, no lookahead) ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
     if i < 60:
         return None
@@ -164,9 +163,9 @@ class PortfolioState:
         self.cooldown_until: str | None = None
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
-        self._last_equity = start_equity
+        self._last_prices: dict[str, float] = {}
 
-    # ---- equity helpers ----
+    # ---- mark-to-market ----
     def signed_market_value(self, prices: dict[str, float]) -> float:
         mv = 0.0
         for sym, pos in self.positions.items():
@@ -193,9 +192,8 @@ class PortfolioState:
     # ---- day / risk gates ----
     def new_day(self, date_iso: str):
         self.current_date = date_iso
-        self.daily_start_equity = self._last_equity
+        self.daily_start_equity = self.equity(self._last_prices)
         self.trades_today = 0
-        # Cooldown is time-based; do NOT clear on day boundary.
 
     def can_trade(self, now_iso: str, prices: dict[str, float]) -> tuple[bool, str]:
         s = self.settings
@@ -214,7 +212,7 @@ class PortfolioState:
                 return False, "daily_loss"
         return True, "ok"
 
-    # ---- entry / exit ----
+    # ---- cash / position ops ----
     def can_open(self, entry_notional: float, entry_fees: float) -> tuple[bool, str]:
         required = entry_notional + entry_fees
         if self.cash < required:
@@ -226,7 +224,7 @@ class PortfolioState:
         notional = pos.entry_price * pos.qty
         if pos.side == LONG:
             self.cash -= notional + entry_fees
-        else:  # SHORT: receive proceeds, pay fees
+        else:
             self.cash += notional - entry_fees
         self.fees_paid += entry_fees
         pos.entry_fees = entry_fees
@@ -298,7 +296,7 @@ class PortfolioState:
 
     def snapshot(self, ts, prices: dict[str, float]):
         eq = self.equity(prices)
-        self._last_equity = eq
+        self._last_prices = dict(prices)
         self.equity_curve.append({
             "time": ts,
             "equity": round(eq, 2),
@@ -447,7 +445,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 )
                 continue
 
-            # R-based trailing (uses Close; matches monitor semantics)
+            # R-based trailing (Close-based, matches monitor)
             if pos.side == LONG:
                 if close > pos.highest_price:
                     pos.highest_price = close
@@ -518,7 +516,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 elif short_ok and not long_ok:
                     side, chosen_score = "sell", short_score
                 else:
-                    continue  # both or neither → no trade (avoid conflict)
+                    continue
 
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
