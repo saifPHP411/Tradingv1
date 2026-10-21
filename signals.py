@@ -199,7 +199,6 @@ def compute_all_indicators(symbol: str):
 
     vol_mean = float(np.mean(volumes[-20:]))
     vol_ratio = float(volumes[-1] / vol_mean) if vol_mean > 0 else 1.0
-
     mom5 = float((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 else 0.0
     mom10 = float((closes[-1] / closes[-11] - 1) * 100) if len(closes) >= 11 else 0.0
 
@@ -229,11 +228,8 @@ def compute_all_indicators(symbol: str):
     }
 
 
-def compute_signal_score(ind: dict, regime: dict | None = None,
-                         news: dict | None = None) -> dict:
-    """
-    Composite 0-100 score. Regime-aware.
-    """
+def compute_signal_score(ind: dict, regime: dict | None = None, news: dict | None = None) -> dict:
+    """Composite 0-100 score for LONG. Regime-aware."""
     trend = 0
     if ind["ema20"] > ind["ema50"]:
         trend += 12
@@ -242,7 +238,7 @@ def compute_signal_score(ind: dict, regime: dict | None = None,
     if ind["last_close"] > ind["sma50"]:
         trend += 5
     if ind["adx"] > 25:
-        trend += 5  # trending market adds confidence
+        trend += 5
 
     momentum = 0
     if ind["momentum_5d_pct"] > 0:
@@ -266,9 +262,9 @@ def compute_signal_score(ind: dict, regime: dict | None = None,
     if 0.2 <= ind["bb_pct_b"] <= 0.8:
         bb += 8
     if ind["bb_pct_b"] > 0.9:
-        bb -= 5  # overbought
+        bb -= 5
     if ind["bb_pct_b"] < 0.1:
-        bb += 3  # potential bounce zone for mean-reversion
+        bb += 3
     bb = max(0, bb)
 
     if ind["volume_ratio"] > 1.2:
@@ -278,7 +274,6 @@ def compute_signal_score(ind: dict, regime: dict | None = None,
     else:
         vol = 3
 
-    # News contribution (-10 to +10)
     news_component = 0
     if news and news.get("available"):
         news_component = int(news["score"] * 10)
@@ -286,22 +281,86 @@ def compute_signal_score(ind: dict, regime: dict | None = None,
     raw = trend + momentum + rsi_score + bb + vol + news_component
     raw = max(0, min(100, raw))
 
-    # Regime adjustment
     if regime:
         r = regime.get("regime", "UNKNOWN")
         if r == "BEAR":
-            raw = int(raw * 0.5)  # heavily discount in bear market
+            raw = int(raw * 0.5)
         elif r == "HIGH_VOLATILITY":
             raw = int(raw * 0.75)
         elif r == "SIDEWAYS":
             raw = int(raw * 0.9)
 
     return {
-        "score": raw,
-        "trend": trend,
-        "momentum": momentum,
-        "rsi": rsi_score,
-        "bb": bb,
-        "volume": vol,
-        "news": news_component,
+        "score": raw, "trend": trend, "momentum": momentum,
+        "rsi": rsi_score, "bb": bb, "volume": vol, "news": news_component,
+    }
+
+
+def compute_short_score(ind: dict, regime: dict | None = None) -> dict:
+    """
+    Mirror of compute_signal_score for SHORT.
+    Only used when settings['enable_short'] is on.
+    Not part of live strategy by default — this is a symmetric extension
+    of the existing indicator set, not a new strategy.
+    """
+    trend = 0
+    if ind["ema20"] < ind["ema50"]:
+        trend += 12
+    if ind["last_close"] < ind["ema20"]:
+        trend += 8
+    if ind["last_close"] < ind["sma50"]:
+        trend += 5
+    if ind["adx"] > 25:
+        trend += 5
+
+    momentum = 0
+    if ind["momentum_5d_pct"] < 0:
+        momentum += 8
+    if ind["momentum_10d_pct"] < 0:
+        momentum += 5
+    if ind["macd_hist"] < 0:
+        momentum += 7
+
+    rsi = ind["rsi14"]
+    # Symmetric to long: avoid shorting into extreme oversold
+    if 30 <= rsi <= 60:
+        rsi_score = 15
+    elif 60 < rsi <= 70:
+        rsi_score = 8
+    elif 20 <= rsi < 30:
+        rsi_score = 10
+    else:
+        rsi_score = 0
+
+    bb = 0
+    if 0.2 <= ind["bb_pct_b"] <= 0.8:
+        bb += 8
+    if ind["bb_pct_b"] < 0.1:
+        bb -= 5   # oversold — risky to short
+    if ind["bb_pct_b"] > 0.9:
+        bb += 3   # potential reversal zone
+    bb = max(0, bb)
+
+    if ind["volume_ratio"] > 1.2:
+        vol = 12
+    elif ind["volume_ratio"] > 0.8:
+        vol = 8
+    else:
+        vol = 3
+
+    raw = trend + momentum + rsi_score + bb + vol
+    raw = max(0, min(100, raw))
+
+    if regime:
+        r = regime.get("regime", "UNKNOWN")
+        if r == "BULL":
+            raw = int(raw * 0.5)
+        elif r == "HIGH_VOLATILITY":
+            raw = int(raw * 0.75)
+        elif r == "SIDEWAYS":
+            raw = int(raw * 0.9)
+
+    return {
+        "score": raw, "trend": trend, "momentum": momentum,
+        "rsi": rsi_score, "bb": bb, "volume": vol, "news": 0,
     }
