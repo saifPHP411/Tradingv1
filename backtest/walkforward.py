@@ -85,3 +85,51 @@ def aggregate_walkforward(results: list[dict]) -> dict:
         "positive_windows": sum(1 for r in all_returns if r > 0),
         "negative_windows": sum(1 for r in all_returns if r < 0),
     }
+
+def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
+                           train_months: int = 12,
+                           test_months: int = 3) -> list[dict]:
+    """
+    Rolling out-of-sample evaluation across a symbol set.
+    NO parameter optimization — just OOS windows.
+    """
+    from backtest.data import load_multi
+    from backtest.engine import simulate_portfolio
+    from backtest.metrics import calculate_metrics
+
+    results = []
+    cur = datetime.fromisoformat(start_date)
+    end = datetime.fromisoformat(end_date)
+
+    while True:
+        test_start = cur + relativedelta(months=train_months)
+        test_end = test_start + relativedelta(months=test_months)
+        if test_end > end:
+            break
+        print(f"\n Window: {test_start.date()} → {test_end.date()}")
+
+        data = load_multi(symbols,
+                          test_start.strftime("%Y-%m-%d"),
+                          test_end.strftime("%Y-%m-%d"))
+        if not data:
+            print(" ⚠️ insufficient data")
+            cur += relativedelta(months=test_months)
+            continue
+
+        spy = get_spy_for_period(test_start.strftime("%Y-%m-%d"),
+                                 test_end.strftime("%Y-%m-%d"))
+        result = simulate_portfolio(data, spy, start_equity=10000.0)
+        metrics = calculate_metrics(result["equity_curve"], result["trades"], 10000.0)
+
+        results.append({
+            "window": f"{test_start.date()}_to_{test_end.date()}",
+            "metrics": metrics,
+        })
+        print(f" Return: {metrics.get('total_return_pct', 0):+.2f}% | "
+              f"DD: {metrics.get('max_drawdown_pct', 0):.2f}% | "
+              f"Sharpe: {metrics.get('sharpe', 0):.2f} | "
+              f"Trades: {metrics.get('num_trades', 0)}")
+
+        cur += relativedelta(months=test_months)
+
+    return results
