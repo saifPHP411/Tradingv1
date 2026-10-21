@@ -1,5 +1,14 @@
+"""
+Walk-forward evaluation.
+
+Naming note: this module performs ROLLING OUT-OF-SAMPLE EVALUATION.
+It does NOT perform parameter optimization or in-sample training.
+Train windows are advanced over time, but no fitting occurs. Do not call
+this an "optimization" pipeline in reports or UI.
+"""
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+
 from backtest.data import load_ohlcv, load_multi, get_spy_for_period
 from backtest.engine import simulate, simulate_portfolio
 from backtest.metrics import calculate_metrics
@@ -7,7 +16,7 @@ from backtest.metrics import calculate_metrics
 
 def walk_forward(symbol: str, start_date: str, end_date: str,
                  train_months: int = 12, test_months: int = 3) -> list[dict]:
-    """Legacy single-symbol rolling OOS. Kept for compatibility."""
+    """Single-symbol rolling OOS evaluation (legacy, kept for compatibility)."""
     results = []
     cur = datetime.fromisoformat(start_date)
     end = datetime.fromisoformat(end_date)
@@ -44,9 +53,9 @@ def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
                            train_months: int = 12,
                            test_months: int = 3) -> list[dict]:
     """
-    Rolling OOS evaluation across a symbol set.
-    Uses simulate_portfolio so all symbols share one portfolio per window.
-    NO parameter optimization — this is pure OOS evaluation.
+    Portfolio rolling OOS evaluation.
+    Each window uses simulate_portfolio (shared cash/equity/exposure).
+    No parameter optimization is applied — this is pure OOS evaluation.
     """
     results = []
     cur = datetime.fromisoformat(start_date)
@@ -103,4 +112,4 @@ def aggregate_walkforward(results: list[dict]) -> dict:
         "avg_sharpe": round(float(np.mean(all_sharpes)), 2),
         "positive_windows": sum(1 for r in all_returns if r > 0),
         "negative_windows": sum(1 for r in all_returns if r < 0),
-    }
+      }
