@@ -120,16 +120,43 @@ def _sync_positions() -> list:
         position_view = {"symbol": sym, "qty": qty, "side": side}
         stop_view = broker_stops[0] if broker_stops else None
         ok, why = validate_position_protection(position_view, stop_view)
-        if not ok:
-            print(f"🚨 monitor: {sym} unprotected ({why}) — emergency close")
-            try:
-                from broker import _emergency_close_and_verify
-                _emergency_close_and_verify(sym)
-            except Exception as e:
-                print(f"🚨 monitor: emergency close failed: {e}")
-            log_exit_decision(sym, "EMERGENCY_NO_STOP", why, pnl_pct, current, entry)
-            delete_position_state(sym)
-            continue
+if not ok:
+    from safety import is_market_open
+    market_open = is_market_open()
+    log_exit_decision(sym, "EMERGENCY_NO_STOP", why, pnl_pct, current, entry)
+
+    # Try to attach a stop order first (works even outside market hours)
+    try:
+        from broker import _submit_stop
+        from risk_utils import normalize_price_for_symbol
+        state = get_position_state(sym)
+        stop_price = state.get("current_stop") if state else None
+        if stop_price:
+            stop_result = _submit_stop(
+                symbol=sym,
+                qty=qty,
+                stop_price=normalize_price_for_symbol(sym, float(stop_price)),
+                side_held="long" if side == "long" else "short",
+            )
+            if stop_result:
+                print(f"✅ monitor: attached stop to {sym} at {stop_price}")
+                update_position_state(
+                    sym, stop_order_id=stop_result["stop_order_id"],
+                    current_stop=stop_result["stop_price"],
+                )
+                continue  # protected — carry on
+    except Exception as e:
+        print(f"⚠️ monitor: stop attach for {sym} failed: {e}")
+
+    # Fall back to close only when market is open
+    if market_open:
+        from broker import _emergency_close_and_verify
+        _emergency_close_and_verify(sym)
+        delete_position_state(sym)
+    else:
+        print(f"⏸️ monitor: {sym} unprotected but market CLOSED — "
+              f"will retry at open. Close manually in Alpaca.")
+    continue
 
         live_stop_id = broker_stops[0]["id"]
         if state.get("stop_order_id") != live_stop_id:
