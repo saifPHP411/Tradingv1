@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 DB = Path(os.getenv("BACKTEST_DB_PATH", "backtest_results.db"))
@@ -13,6 +13,7 @@ def init():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             symbol TEXT,
+            run_type TEXT,
             start_date TEXT,
             end_date TEXT,
             params TEXT,
@@ -22,13 +23,15 @@ def init():
 
 
 def save_run(symbol: str, start_date: str, end_date: str,
-             params: dict, metrics: dict):
+             params: dict, metrics: dict, run_type: str = "single"):
     init()
     with sqlite3.connect(DB) as conn:
         conn.execute("""INSERT INTO runs
-            (timestamp, symbol, start_date, end_date, params, metrics, num_trades)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""", (
-            datetime.utcnow().isoformat(), symbol, start_date, end_date,
+            (timestamp, symbol, run_type, start_date, end_date,
+             params, metrics, num_trades)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+            datetime.now(timezone.utc).isoformat(), symbol, run_type,
+            start_date, end_date,
             json.dumps(params), json.dumps(metrics),
             metrics.get("num_trades", 0),
         ))
