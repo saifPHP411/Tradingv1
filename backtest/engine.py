@@ -32,6 +32,10 @@ Capital constraints (explicit):
     - Total exposure is additionally capped by max_portfolio_exposure_pct
       via validate_portfolio_exposure() (which uses abs market value, so it
       includes shorts).
+    - max_open_positions is enforced BOTH at signal-generation time (inside
+      can_trade) AND at order-execution time (inside the pending-entry loop).
+      The execution-time check is essential because multiple symbols can
+      queue entries in the same bar; without it, all of them would open.
 
 Other invariants:
     - Equity curve marked-to-market every bar (last Close per symbol).
@@ -476,7 +480,13 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             # Respect max_open_positions at execution time.
             # Multiple symbols may be pending in the same bar; the count
             # must be re-checked before each open, not only at signal time.
-            if len(state.positions) >= settings["max_open_positions"]:
+            # If the limit is missing or invalid, fail closed (0 opens).
+            limit = settings.get("max_open_positions")
+            try:
+                limit_int = int(limit)
+            except (TypeError, ValueError):
+                limit_int = 0
+            if limit_int <= 0 or len(state.positions) >= limit_int:
                 pending[sym] = None
                 continue
 
