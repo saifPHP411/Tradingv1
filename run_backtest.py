@@ -9,6 +9,20 @@ from backtest.report import save_report, print_summary
 from backtest.walkforward import walk_forward, aggregate_walkforward
 from backtest.storage import save_run
 
+from backtest.monte_carlo import run_monte_carlo
+mc = run_monte_carlo(
+    trades=result.get("trades", []),
+    initial_equity=initial,
+    n_sims=1000,
+)
+print("\n=== Monte Carlo (1000 shuffles) ===")
+print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
+print(f"  Final equity P5:     ${mc['final_equity']['p5']:.2f}")
+print(f"  Final equity P95:    ${mc['final_equity']['p95']:.2f}")
+print(f"  Max DD median:       {mc['max_drawdown_pct']['median']:.2f}%")
+print(f"  Max DD P95:          {mc['max_drawdown_pct']['p95']:.2f}%")
+print(f"  Prob. of ruin:       {mc['probability_of_ruin_pct']:.2f}%")
+
 
 def run_single(symbol: str, start: str, end: str, initial: float):
     print(f"🔄 Loading {symbol} from {start} to {end}...")
