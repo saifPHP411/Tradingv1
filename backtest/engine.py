@@ -269,12 +269,9 @@ class PortfolioState:
             cu = self._parse_ts(self.cooldown_until)
             now = self._parse_ts(now_iso)
             if cu is None or now is None:
-                # Unparseable timestamp: fail closed rather than silently allow.
                 return False, "cooldown_unparseable"
             if now < cu:
                 return False, "cooldown"
-            # Expired: clear cooldown and reset the loss counter so that
-            # trading can resume normally.
             self.cooldown_until = None
             self.consecutive_losses = 0
 
@@ -339,8 +336,6 @@ class PortfolioState:
         if pos.side == LONG:
             self.cash -= notional + entry_fees
         else:
-            # SHORT: credit proceeds to cash (equity identity), but reserve
-            # the same notional as collateral so proceeds are not spendable.
             self.cash += notional - entry_fees
             self.reserved_collateral += notional
         self.fees_paid += entry_fees
@@ -360,7 +355,6 @@ class PortfolioState:
         else:
             gross = (pos.entry_price - exit_price) * pos.qty
             self.cash -= exit_notional + exit_fees
-            # Release collateral reserved at SHORT entry.
             self.reserved_collateral -= pos.entry_price * pos.qty
             if self.reserved_collateral < 0:
                 self.reserved_collateral = 0.0
@@ -406,12 +400,9 @@ class PortfolioState:
             if self.consecutive_losses >= self.settings["max_consecutive_losses"]:
                 mins = int(self.settings.get("cooldown_minutes", 120))
                 if mins <= 0:
-                    # No cooldown requested: reset so trading can continue.
                     self.consecutive_losses = 0
                     self.cooldown_until = None
                 elif self.cooldown_until is None:
-                    # Start a fresh cooldown only if none is currently active.
-                    # An active cooldown is not extended by further losses.
                     try:
                         self.cooldown_until = (
                             pd.Timestamp(ts) + pd.Timedelta(minutes=mins)
@@ -481,6 +472,14 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             p = pending.get(sym)
             if p is None:
                 continue
+
+            # Respect max_open_positions at execution time.
+            # Multiple symbols may be pending in the same bar; the count
+            # must be re-checked before each open, not only at signal time.
+            if len(state.positions) >= settings["max_open_positions"]:
+                pending[sym] = None
+                continue
+
             row = _bar_row(df, ts)
             if row is None:
                 continue
@@ -619,8 +618,6 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                     continue
                 regime = compute_regime_at(spy_df, ts)
 
-                # Shared scoring from signals.py.
-                # News is passed explicitly as unavailable (deterministic).
                 long_score = compute_signal_score(
                     ind, regime, news=_NEWS_UNAVAILABLE)["score"]
                 strong_uptrend = (
@@ -654,7 +651,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 elif short_ok and not long_ok:
                     side, chosen_score = "sell", short_score
                 else:
-                    continue  # both or neither → no trade
+                    continue
 
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
