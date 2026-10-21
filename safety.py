@@ -84,11 +84,19 @@ def get_account_snapshot() -> dict:
         print(f"⚠️ safety: snapshot failed: {e}")
         return {"available": False, "reason": f"api_error:{e}"}
 
-
 def check_safety_gates() -> tuple[bool, str]:
+    from decision_log import is_kill_switch_active
+
+    # 1) Kill switch FIRST — highest priority
+    active, reason = is_kill_switch_active()
+    if active:
+        return False, f"kill_switch_active: {reason or 'manual'}"
+
+    # 2) Market hours
     if not is_market_open():
         return False, "market closed"
 
+    # 3) Cooldown
     cd = get_cooldown_until()
     if cd:
         try:
@@ -97,12 +105,14 @@ def check_safety_gates() -> tuple[bool, str]:
         except Exception:
             pass
 
+    # 4) Account data (FAIL-CLOSED)
     snap = get_account_snapshot()
     if not snap.get("available"):
         return False, f"account data unavailable ({snap.get('reason')})"
 
     settings = get_all_settings()
 
+    # 5) Daily loss
     dse = get_day_start_equity()
     if dse is None:
         set_day_start_equity(snap["equity"])
@@ -113,12 +123,15 @@ def check_safety_gates() -> tuple[bool, str]:
         if daily_pnl_pct <= -settings["max_daily_loss_pct"]:
             return False, f"daily loss limit ({daily_pnl_pct:.2%})"
 
+    # 6) Max open positions
     if snap["open_positions"] >= settings["max_open_positions"]:
         return False, f"max open positions ({settings['max_open_positions']})"
 
+    # 7) Max trades per day
     if snap["trades_today"] >= settings["max_trades_per_day"]:
         return False, f"max trades per day ({settings['max_trades_per_day']})"
 
+    # 8) Consecutive losses
     if get_consecutive_losses() >= settings["max_consecutive_losses"]:
         return False, "consecutive losses lock"
 
