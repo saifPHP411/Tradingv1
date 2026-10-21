@@ -233,3 +233,20 @@ def api_monitor_toggle():
         return {"running": False}
     monitor.start()
     return {"running": True}
+
+# ============ Kill Switch ============
+@app.get("/api/kill-switch")
+def api_kill_switch_status():
+    from decision_log import is_kill_switch_active
+    active, reason = is_kill_switch_active()
+    return {"active": active, "reason": reason}
+
+
+@app.post("/api/kill-switch")
+async def api_kill_switch(payload: dict):
+    from decision_log import set_kill_switch, is_kill_switch_active
+    active = bool(payload.get("active", True))
+    reason = str(payload.get("reason", ""))[:200]
+    set_kill_switch(active, reason)
+    current, current_reason = is_kill_switch_active()
+    return {"active": current, "reason": current_reason}
