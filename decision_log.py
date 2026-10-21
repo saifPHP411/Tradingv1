@@ -368,4 +368,31 @@ def is_kill_switch_active() -> tuple[bool, str]:
 def set_kill_switch(active: bool, reason: str = ""):
     set_trading_state("kill_switch_active", "true" if active else "false")
     set_trading_state("kill_switch_reason", reason if active else "")
+
+
+# ============ Structured events ============
+def emit_event(event_type: str, symbol: str | None = None,
+               trade_id: str | None = None, reason: str | None = None,
+               **data):
+    """Central event emitter. Logs to DB + stdout (for Railway logs)."""
+    payload = json.dumps(data, ensure_ascii=False, default=str) if data else None
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, symbol, trade_id, reason, data) "
+            "VALUES (?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), event_type, symbol,
+             trade_id, reason, payload),
+        )
+        conn.commit()
+
+    # Human-readable line for Railway logs
+    extra = f" {data}" if data else ""
+    print(f"📌 [{event_type}] symbol={symbol or '-'} "
+          f"reason={reason or '-'}{extra}")
+
+
+def recent_events(limit: int = 100) -> list:
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 init_db()
