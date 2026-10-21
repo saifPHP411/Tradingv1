@@ -1,21 +1,24 @@
 """
 Bar-driven Portfolio Backtester.
 
-Cash accounting model (spot, no leverage):
-    LONG  entry: cash -= entry_notional + entry_fees
-    SHORT entry: cash += entry_notional - entry_fees   (proceeds - fees)
-    LONG  exit : cash += exit_notional  - exit_fees
-    SHORT exit : cash -= exit_notional  + exit_fees
+Cash accounting model (spot, no leverage / no margin):
+    LONG  entry : cash -= entry_notional + entry_fees
+    SHORT entry : cash += entry_notional - entry_fees   (proceeds - fees)
+    LONG  exit  : cash += exit_notional  - exit_fees
+    SHORT exit  : cash -= exit_notional  + exit_fees
     equity(prices) = cash + sum(signed_market_value)
         long  => +qty * price
         short => -qty * price
 
-Equity curve marked-to-market every bar using last Close per symbol.
-Signals computed on bar i, executed at bar i+1 Open (no lookahead).
-Stop/Target honour gap and same-candle conservative rule (STOP first).
-R-based trailing shared with monitor (Close-based).
-Consecutive losses → real time-based cooldown from settings.
-Signal logic imported from signals.py — no duplicated scoring.
+Other invariants:
+    - Equity curve is marked-to-market every bar (last Close per symbol).
+    - Signals computed on bar i, executed on bar i+1 Open (no lookahead).
+    - Gap handled at Open; same-candle conflict resolved STOP-first.
+    - R-based trailing uses Close (matches monitor semantics).
+    - Consecutive losses trigger a *timed* cooldown from settings.
+    - Signal scoring imported from signals.py (no duplication).
+    - Strategy is LONG-only by design. SHORT execution exists, but
+      enable_short must be set explicitly; the default is 0.
 """
 from __future__ import annotations
 
@@ -34,7 +37,7 @@ from risk_utils import (
 )
 
 
-# ============ Indicators & Regime (bar-local, no lookahead) ============
+# ============ Indicators & Regime ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
     if i < 60:
         return None
@@ -225,6 +228,7 @@ class PortfolioState:
         if pos.side == LONG:
             self.cash -= notional + entry_fees
         else:
+            # SHORT: proceeds increase cash; fees paid out of proceeds.
             self.cash += notional - entry_fees
         self.fees_paid += entry_fees
         pos.entry_fees = entry_fees
@@ -331,7 +335,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     enable_short = bool(int(settings.get("enable_short", 0) or 0))
 
     for ts in all_times:
-        # ---- 0) Update last known closes for mark-to-market
+        # ---- 0) Update last known closes (mark-to-market)
         for sym, df in symbols_data.items():
             row = _bar_row(df, ts)
             if row is not None:
@@ -484,6 +488,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                     continue
                 regime = compute_regime_at(spy_df, ts)
 
+                # LONG scoring — use the shared implementation from signals.py.
                 long_score = compute_signal_score(ind, regime)["score"]
                 strong_uptrend = (
                     ind["last_close"] > ind["ema20"]
@@ -516,7 +521,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 elif short_ok and not long_ok:
                     side, chosen_score = "sell", short_score
                 else:
-                    continue
+                    continue  # both or neither → no trade
 
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
