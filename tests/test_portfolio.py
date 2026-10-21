@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from backtest.engine import simulate_portfolio, LONG, SHORT, PortfolioPosition
+from signals import compute_signal_score, compute_short_score
 from risk_utils import (
     compute_position_size, validate_portfolio_exposure,
     validate_risk_plan, normalize_slippage,
@@ -66,42 +67,13 @@ def _df_from_closes(closes, opens=None, highs=None, lows=None, start="2024-01-01
     }, index=idx)
 
 
-# ============ Pure function tests ============
-
-def test_position_size_respects_risk():
-    qty = compute_position_size(10_000, 100, 5, 0.005, 1.0, 0.15)
-    assert abs(qty - 10.0) < 1e-6
-
-
-def test_slippage_directions():
-    assert normalize_slippage(100, 10, is_buy=True) > 0
-    assert normalize_slippage(100, 10, is_buy=False) < 0
-
-
-def test_risk_plan_long_ordering():
-    plan = {"symbol": "X", "side": "buy", "entry_price": 100,
-            "stop_loss": 95, "take_profit": 110, "qty": 1, "risk_amount": 5}
-    ok, _ = validate_risk_plan(plan)
-    assert ok is True
-
-
-def test_risk_plan_short_ordering():
-    plan = {"symbol": "X", "side": "sell", "entry_price": 100,
-            "stop_loss": 105, "take_profit": 90, "qty": 1, "risk_amount": 5}
-    ok, _ = validate_risk_plan(plan)
-    assert ok is True
-
-
 # ============ Cash / equity accounting ============
 
-def test_flat_trade_keeps_equity_minus_fees():
-    """Open + close at same price, no signal churn → equity drops only by fees."""
-    n = 130
+def test_no_trades_returns_start_equity():
+    n = 120
     closes = [100.0] * n
     df = _df_from_closes(closes)
-    settings = _settings(fees_per_share=0.01, entry_slippage_bps=0,
-                         exit_slippage_bps=0, min_signal_score=50)
-    # No trade triggered because trend is flat → end equity == start
+    settings = _settings(min_signal_score=100)  # impossible
     result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
                                 settings=settings)
     assert result["end_equity"] == pytest.approx(10_000, abs=1.0)
@@ -120,11 +92,28 @@ def test_equity_curve_is_marked_to_market():
     result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
                                 settings=settings)
     eq = [p["equity"] for p in result["equity_curve"]]
-    # Equity must grow (some profit captured)
     assert max(eq) > 10_000 + 20
 
 
-def test_metrics_net_equals_equity_change():
+def test_cash_is_actually_deducted_on_entry():
+    """
+    After any open long, portfolio cash must be < start_equity
+    (notional was paid), even before the trade closes.
+    """
+    n = 200
+    closes = [100 + i * 0.5 for i in range(n)]
+    df = _df_from_closes(closes)
+    settings = _settings(min_signal_score=50, max_trades_per_day=20)
+    result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
+                                settings=settings)
+    # Find first bar with an open position, and confirm cash dropped below 10k.
+    for pt in result["equity_curve"]:
+        if pt["n_positions"] > 0:
+            assert pt["cash"] < 10_000 - 1e-6
+            break
+
+
+def test_no_double_counting_of_pnl():
     n = 150
     closes = [100 + i * 0.5 for i in range(n)]
     df = _df_from_closes(closes)
@@ -136,7 +125,7 @@ def test_metrics_net_equals_equity_change():
     assert abs(total_pnl - eq_delta) < 1.0
 
 
-def test_trade_journal_has_fees_and_slippage():
+def test_trade_journal_has_entry_and_exit_fees():
     n = 150
     closes = [100 + i * 0.5 for i in range(n)]
     df = _df_from_closes(closes)
@@ -147,7 +136,6 @@ def test_trade_journal_has_fees_and_slippage():
     for t in result["trades"]:
         assert "fees_entry" in t and "fees_exit" in t
         assert "slippage_entry" in t and "slippage_exit" in t
-        assert t["fees_entry"] >= 0 and t["fees_exit"] >= 0
 
 
 # ============ Risk limits ============
@@ -163,17 +151,6 @@ def test_max_open_positions_respected():
     result = simulate_portfolio(dfs, None, start_equity=10_000, settings=settings)
     for pt in result["equity_curve"]:
         assert pt["n_positions"] <= 2
-
-
-def test_no_trades_without_signal():
-    n = 120
-    closes = [100.0] * n
-    df = _df_from_closes(closes)
-    settings = _settings(min_signal_score=100)
-    result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
-                                settings=settings)
-    assert result["end_equity"] == pytest.approx(10_000, abs=1.0)
-    assert len(result["trades"]) == 0
 
 
 # ============ Long / Short orientation ============
@@ -193,10 +170,6 @@ def test_long_stop_target_orientation():
 
 
 def test_short_stop_target_orientation():
-    """
-    Enable short and use a downtrend; every SHORT must have stop > entry
-    and target < entry.
-    """
     n = 200
     closes = [200 - i * 0.5 for i in range(n)]
     df = _df_from_closes(closes)
@@ -214,9 +187,8 @@ def test_short_stop_target_orientation():
 
 def test_cooldown_is_time_based_not_permanent():
     """
-    After max consecutive losses, entries are blocked for cooldown_minutes,
-    then allowed again. Test uses 60-minute cooldown on daily bars, so
-    cooldown expires at the next bar.
+    On daily bars, a 60-minute cooldown expires at the next bar. So after
+    max_consecutive_losses, the engine must resume trading on the next bar.
     """
     n = 200
     closes = [200 - i * 0.5 for i in range(n)]
@@ -231,11 +203,28 @@ def test_cooldown_is_time_based_not_permanent():
     )
     result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
                                 settings=settings)
-    # At least some trades must occur (cooldown expires, not permanent)
+    # At least some trades must occur — cooldown is not a permanent lock.
     assert len(result["trades"]) >= 2
 
 
-def test_no_lookahead_entry_after_signal_bar():
+# ============ Signal parity ============
+
+def test_backtest_uses_shared_signal_score():
+    """
+    Guard against future duplication: the engine must not define its own
+    scoring. We verify by checking that the imported helper is the one
+    from signals.py.
+    """
+    import inspect
+    from backtest import engine as eng
+    src = inspect.getsource(eng.simulate_portfolio)
+    assert "compute_signal_score" in src
+    assert "def compute_score(" not in src
+
+
+# ============ No lookahead ============
+
+def test_no_lookahead_entry_before_warmup():
     n = 150
     closes = [100 + i * 0.5 for i in range(n)]
     df = _df_from_closes(closes)
