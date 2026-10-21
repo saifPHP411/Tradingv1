@@ -1,3 +1,15 @@
+"""
+Bar-driven Portfolio Backtester.
+
+Design invariants:
+  - All symbols share one cash/equity/positions portfolio.
+  - Signals computed at bar i, executed at bar i+1 open (no lookahead).
+  - Stop/Target honoured with gap and same-candle conservative rule.
+  - Long and Short supported.
+  - R-based trailing shared with monitor.
+"""
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
@@ -6,9 +18,13 @@ from signals import (
     compute_macd, compute_bollinger, compute_adx, compute_stochastic,
 )
 from settings import get_all_settings
-from risk_utils import normalize_price_for_symbol
+from risk_utils import (
+    normalize_price_for_symbol, compute_position_size,
+    validate_portfolio_exposure, normalize_slippage,
+)
 
 
+# ============ Indicators & Regime (shared with live) ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
     if i < 60:
         return None
@@ -47,8 +63,10 @@ def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
         "ema20": float(ema20), "ema50": float(ema50),
         "macd_hist": float(macd_hist) if macd_hist is not None else 0.0,
         "bb_pct_b": float(pct_b) if pct_b is not None else 0.5,
+        "bb_bandwidth": float(bb_bw) if bb_bw is not None else 0.0,
         "adx": float(adx),
         "stoch_k": float(k) if k is not None else 50.0,
+        "stoch_d": float(d) if d is not None else 50.0,
         "volume_ratio": float(vol_ratio),
         "momentum_5d_pct": float(mom5),
         "momentum_10d_pct": float(mom10),
@@ -64,7 +82,6 @@ def compute_regime_at(spy_df: pd.DataFrame, ts) -> dict:
         window = spy_df.iloc[:0]
     if len(window) < 200:
         return {"regime": "UNKNOWN", "size_multiplier": 0.5}
-
     closes = window["Close"].values.astype(float)
     highs = window["High"].values.astype(float)
     lows = window["Low"].values.astype(float)
@@ -75,7 +92,6 @@ def compute_regime_at(spy_df: pd.DataFrame, ts) -> dict:
     rsi = compute_rsi_wilder(closes)
     if any(v is None for v in [sma50, sma200, atr, rsi]):
         return {"regime": "UNKNOWN", "size_multiplier": 0.5}
-
     atr_pct = (atr / price) * 100 if price > 0 else 0
     if atr_pct >= 3.0:
         return {"regime": "HIGH_VOLATILITY", "size_multiplier": 0.4}
@@ -145,9 +161,22 @@ def compute_score(indicators: dict, regime: dict) -> int:
     return raw
 
 
-class Position:
-    def __init__(self, symbol, entry_price, qty, stop, target, entry_time, entry_idx):
+# ============ Position models ============
+LONG = "long"
+SHORT = "short"
+
+
+class PortfolioPosition:
+    __slots__ = (
+        "symbol", "side", "entry_price", "qty", "stop", "initial_stop",
+        "target", "entry_time", "entry_idx", "highest_price",
+        "lowest_price", "bars_held",
+    )
+
+    def __init__(self, symbol: str, side: str, entry_price: float, qty: float,
+                 stop: float, target: float, entry_time, entry_idx: int):
         self.symbol = symbol
+        self.side = side          # LONG | SHORT
         self.entry_price = entry_price
         self.qty = qty
         self.stop = stop
@@ -155,207 +184,371 @@ class Position:
         self.target = target
         self.entry_time = entry_time
         self.entry_idx = entry_idx
-        self.highest_close = entry_price
+        self.highest_price = entry_price
+        self.lowest_price = entry_price
         self.bars_held = 0
 
-    def risk_per_share(self):
+    def risk_per_share(self) -> float:
         return abs(self.entry_price - self.initial_stop)
 
+    def market_value(self, current_price: float) -> float:
+        return abs(self.qty * current_price)
 
-def simulate(
-    symbol: str,
-    df: pd.DataFrame,
-    spy_df: pd.DataFrame | None,
-    start_equity: float = 10000.0,
-    max_hold_bars: int = 60,
-) -> dict:
+
+# ============ Portfolio state ============
+class PortfolioState:
+    def __init__(self, start_equity: float, settings: dict):
+        self.equity = start_equity
+        self.cash = start_equity
+        self.settings = settings
+        self.positions: dict[str, PortfolioPosition] = {}
+        self.trades: list[dict] = []
+        self.equity_curve: list[dict] = []
+        self.daily_start_equity = start_equity
+        self.current_date: str | None = None
+        self.trades_today = 0
+        self.consecutive_losses = 0
+        self.cooldown_until: str | None = None
+
+    def new_day(self, date_iso: str):
+        self.current_date = date_iso
+        self.daily_start_equity = self.equity
+        self.trades_today = 0
+        if self.cooldown_until and self.cooldown_until <= date_iso:
+            self.cooldown_until = None
+
+    def can_trade(self, now_iso: str) -> tuple[bool, str]:
+        s = self.settings
+        if self.cooldown_until and now_iso < self.cooldown_until:
+            return False, "cooldown"
+        if self.consecutive_losses >= s["max_consecutive_losses"]:
+            return False, "consecutive_losses"
+        if self.trades_today >= s["max_trades_per_day"]:
+            return False, "max_trades_per_day"
+        if len(self.positions) >= s["max_open_positions"]:
+            return False, "max_open_positions"
+        if self.daily_start_equity > 0:
+            daily_pnl = (self.equity - self.daily_start_equity) / self.daily_start_equity
+            if daily_pnl <= -s["max_daily_loss_pct"]:
+                return False, "daily_loss"
+        return True, "ok"
+
+    def record_trade(self, trade: dict):
+        self.trades.append(trade)
+        self.equity += trade["net_pnl"]
+        self.cash += trade["net_pnl"]
+        if trade["net_pnl"] < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= self.settings["max_consecutive_losses"]:
+                # Block rest of the backtest (deterministic, conservative)
+                self.cooldown_until = "9999-12-31"
+        else:
+            self.consecutive_losses = 0
+
+    def snapshot(self, ts):
+        self.equity_curve.append({"time": ts, "equity": round(self.equity, 2)})
+
+
+# ============ Shared helpers ============
+def _close_price(df: pd.DataFrame, ts) -> float | None:
+    try:
+        return float(df.loc[ts, "Close"])
+    except Exception:
+        return None
+
+
+def _bar_row(df: pd.DataFrame, ts):
+    try:
+        return df.loc[ts]
+    except Exception:
+        return None
+
+
+# ============ Main Portfolio Simulation ============
+def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
+                       spy_df: pd.DataFrame | None,
+                       start_equity: float = 10000.0,
+                       settings: dict | None = None) -> dict:
     """
-    Bar-driven simulation.
-    - Decisions use data up to bar i only.
-    - Entry fills at next bar's Open + slippage (no lookahead).
-    - Gap through stop honored.
-    - Same-candle SL+TP → conservative: stop first.
+    Portfolio-level backtest with shared cash, equity, exposure, limits.
+    Supports LONG and SHORT. Executes next-bar open after signal.
     """
-    settings = get_all_settings()
-    equity = start_equity
-    equity_curve = []
-    trades = []
-    position: Position | None = None
-    pending_entry = None
+    if settings is None:
+        settings = get_all_settings()
+    state = PortfolioState(start_equity, settings)
 
-    n_bars = len(df)
-    for i in range(60, n_bars):
-        row = df.iloc[i]
-        ts = df.index[i]
-        open_p = float(row["Open"])
-        high = float(row["High"])
-        low = float(row["Low"])
-        close = float(row["Close"])
+    all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
+    cursors = {sym: 0 for sym in symbols_data}
+    pending: dict[str, dict | None] = {sym: None for sym in symbols_data}
+    last_ts = all_times[-1] if all_times else None
 
-        # ---- Execute pending entry at THIS bar's open (from signal on i-1)
-        if pending_entry is not None:
-            slip = pending_entry["entry_ref"] * (settings["entry_slippage_bps"] / 10000.0)
+    for ts in all_times:
+        date_iso = ts.date().isoformat()
+        if state.current_date != date_iso:
+            state.new_day(date_iso)
+
+        # ---- 1) Execute pending entries at this bar's open
+        for sym, df in symbols_data.items():
+            p = pending.get(sym)
+            if p is None:
+                continue
+            row = _bar_row(df, ts)
+            if row is None:
+                continue
+            open_p = float(row["Open"])
+            is_buy = p["side"] == "buy"
+            slip = normalize_slippage(open_p, settings["entry_slippage_bps"], is_buy)
             fill_price = open_p + slip
-            stop_price = fill_price - pending_entry["stop_dist"]
-            target_price = fill_price + pending_entry["target_dist"]
-            qty = pending_entry["qty"]
 
-            fees = qty * settings["fees_per_share"]
-            equity -= fees
-
-            position = Position(
-                symbol=symbol, entry_price=fill_price, qty=qty,
-                stop=normalize_price_for_symbol(symbol, stop_price),
-                target=normalize_price_for_symbol(symbol, target_price),
-                entry_time=ts, entry_idx=i,
-            )
-            trade_record = {
-                "symbol": symbol, "side": "BUY",
-                "entry_time": ts, "entry_price": fill_price,
-                "qty": qty,
-                "initial_stop": position.initial_stop,
-                "take_profit": position.target,
-                "signal_bar_idx": pending_entry["signal_bar_idx"],
-                "regime": pending_entry.get("regime", ""),
-                "signal_score": pending_entry.get("score", 0),
-                "fees_entry": fees,
-                "slippage_entry": slip * qty,
-                "risk_amount": abs(fill_price - position.initial_stop) * qty,
-            }
-            pending_entry = None
-
-        # ---- Manage open position
-        if position is not None:
-            position.bars_held += 1
-            exit_reason = None
-            exit_price = None
-
-            # Gap handling: if OPEN is beyond stop, exit at open (worse than stop)
-            if position.side if hasattr(position, "side") else True:
-                if position.stop is not None:
-                    # LONG
-                    if open_p <= position.stop:
-                        exit_price = open_p
-                        exit_reason = "STOP_GAP"
-                    elif open_p >= position.target:
-                        exit_price = open_p
-                        exit_reason = "TARGET_GAP"
-                    elif low <= position.stop:
-                        # Same-candle conflict: stop first (conservative)
-                        exit_price = position.stop
-                        exit_reason = "STOP"
-                    elif high >= position.target:
-                        exit_price = position.target
-                        exit_reason = "TARGET"
-                    elif position.bars_held >= max_hold_bars:
-                        exit_price = close
-                        exit_reason = "MAX_HOLD"
-
-            if exit_price is not None:
-                slip_out = exit_price * (settings["exit_slippage_bps"] / 10000.0)
-                final_exit = exit_price - slip_out
-                fees_out = position.qty * settings["fees_per_share"]
-                gross_pnl = (final_exit - position.entry_price) * position.qty
-                net_pnl = gross_pnl - fees_out
-                equity += net_pnl
-
-                trade_record.update({
-                    "exit_time": ts,
-                    "exit_price": final_exit,
-                    "exit_reason": exit_reason,
-                    "gross_pnl": round(gross_pnl, 4),
-                    "fees_exit": round(fees_out, 4),
-                    "slippage_exit": round(slip_out * position.qty, 4),
-                    "net_pnl": round(net_pnl, 4),
-                    "r_multiple": round(
-                        (final_exit - position.entry_price) / position.risk_per_share(), 3
-                    ) if position.risk_per_share() > 0 else 0,
-                    "bars_held": position.bars_held,
-                })
-                trades.append(trade_record)
-                position = None
-            else:
-                # R-based trailing
-                if close > position.highest_close:
-                    position.highest_close = close
-                rps = position.risk_per_share()
-                if rps > 0:
-                    pnl_r = (close - position.entry_price) / rps
-                    if pnl_r >= settings["trailing_activation_r"]:
-                        new_stop = position.highest_close - (rps * settings["trailing_distance_r"])
-                        if new_stop > position.stop and new_stop < close:
-                            position.stop = normalize_price_for_symbol(symbol, new_stop)
-
-        # ---- Look for new signal (execute on next bar's open)
-        if position is None and pending_entry is None:
-            ind = compute_indicators_at(df, i)
-            if ind is None:
-                equity_curve.append({"time": ts, "equity": round(equity, 2)})
+            if fill_price <= 0:
+                pending[sym] = None
                 continue
 
-            regime = compute_regime_at(spy_df, ts)
-            score = compute_score(ind, regime)
+            if p["side"] == "buy":
+                stop_price = fill_price - p["stop_dist"]
+                target_price = fill_price + p["target_dist"]
+                side = LONG
+            else:
+                stop_price = fill_price + p["stop_dist"]
+                target_price = fill_price - p["target_dist"]
+                side = SHORT
 
-            strong_uptrend = (
-                ind["last_close"] > ind["ema20"] and
-                ind["ema20"] > ind["ema50"] and
-                ind["adx"] > 25
+            stop_price = normalize_price_for_symbol(sym, stop_price)
+            target_price = normalize_price_for_symbol(sym, target_price)
+            qty = p["qty"]
+            notional = qty * fill_price
+
+            ok, why = validate_portfolio_exposure(
+                state.equity, state.positions, notional,
+                settings["max_portfolio_exposure_pct"]
             )
+            if not ok:
+                pending[sym] = None
+                continue
+            if notional > state.cash:
+                pending[sym] = None
+                continue
 
-            if score >= settings["min_signal_score"] and regime["regime"] != "BEAR" and strong_uptrend:
+            pos = PortfolioPosition(
+                symbol=sym, side=side, entry_price=fill_price, qty=qty,
+                stop=stop_price, target=target_price,
+                entry_time=ts, entry_idx=cursors[sym],
+            )
+            state.positions[sym] = pos
+            state.trades_today += 1
+            pending[sym] = None
+
+        # ---- 2) Manage open positions
+        for sym in list(state.positions.keys()):
+            pos = state.positions[sym]
+            df = symbols_data[sym]
+            row = _bar_row(df, ts)
+            if row is None:
+                continue
+            open_p = float(row["Open"])
+            high = float(row["High"])
+            low = float(row["Low"])
+            close = float(row["Close"])
+            pos.bars_held += 1
+
+            exit_price = None
+            exit_reason = None
+
+            if pos.side == LONG:
+                if open_p <= pos.stop:
+                    exit_price, exit_reason = open_p, "STOP_GAP"
+                elif open_p >= pos.target:
+                    exit_price, exit_reason = open_p, "TARGET_GAP"
+                elif low <= pos.stop:
+                    exit_price, exit_reason = pos.stop, "STOP"
+                elif high >= pos.target:
+                    exit_price, exit_reason = pos.target, "TARGET"
+                elif pos.bars_held >= 60:
+                    exit_price, exit_reason = close, "MAX_HOLD"
+            else:  # SHORT
+                if open_p >= pos.stop:
+                    exit_price, exit_reason = open_p, "STOP_GAP"
+                elif open_p <= pos.target:
+                    exit_price, exit_reason = open_p, "TARGET_GAP"
+                elif high >= pos.stop:
+                    exit_price, exit_reason = pos.stop, "STOP"
+                elif low <= pos.target:
+                    exit_price, exit_reason = pos.target, "TARGET"
+                elif pos.bars_held >= 60:
+                    exit_price, exit_reason = close, "MAX_HOLD"
+
+            if exit_price is not None:
+                is_buy_exit = pos.side == SHORT
+                slip = normalize_slippage(exit_price, settings["exit_slippage_bps"], is_buy_exit)
+                final_exit = exit_price + slip
+                fees = pos.qty * settings["fees_per_share"]
+                if pos.side == LONG:
+                    gross = (final_exit - pos.entry_price) * pos.qty
+                    rps = pos.risk_per_share()
+                    r_multiple = (final_exit - pos.entry_price) / rps if rps > 0 else 0.0
+                else:
+                    gross = (pos.entry_price - final_exit) * pos.qty
+                    rps = pos.risk_per_share()
+                    r_multiple = (pos.entry_price - final_exit) / rps if rps > 0 else 0.0
+                net = gross - fees
+
+                state.record_trade({
+                    "symbol": sym,
+                    "side": "BUY" if pos.side == LONG else "SELL",
+                    "direction": pos.side,
+                    "entry_time": pos.entry_time,
+                    "entry_price": pos.entry_price,
+                    "exit_time": ts,
+                    "exit_price": final_exit,
+                    "qty": pos.qty,
+                    "initial_stop": pos.initial_stop,
+                    "final_stop": pos.stop,
+                    "take_profit": pos.target,
+                    "gross_pnl": round(gross, 4),
+                    "fees_exit": round(fees, 4),
+                    "slippage_exit": round(slip * pos.qty, 4),
+                    "net_pnl": round(net, 4),
+                    "r_multiple": round(r_multiple, 3),
+                    "bars_held": pos.bars_held,
+                    "exit_reason": exit_reason,
+                    "portfolio_equity_after": round(state.equity, 2),
+                })
+                del state.positions[sym]
+                continue
+
+            # R-based trailing
+            if pos.side == LONG:
+                if close > pos.highest_price:
+                    pos.highest_price = close
+                rps = pos.risk_per_share()
+                if rps > 0:
+                    pnl_r = (close - pos.entry_price) / rps
+                    if pnl_r >= settings["trailing_activation_r"]:
+                        new_stop = pos.highest_price - (rps * settings["trailing_distance_r"])
+                        if new_stop > pos.stop and new_stop < close:
+                            pos.stop = normalize_price_for_symbol(sym, new_stop)
+            else:
+                if close < pos.lowest_price:
+                    pos.lowest_price = close
+                rps = pos.risk_per_share()
+                if rps > 0:
+                    pnl_r = (pos.entry_price - close) / rps
+                    if pnl_r >= settings["trailing_activation_r"]:
+                        new_stop = pos.lowest_price + (rps * settings["trailing_distance_r"])
+                        if new_stop < pos.stop and new_stop > close:
+                            pos.stop = normalize_price_for_symbol(sym, new_stop)
+
+        # ---- 3) Generate signals (executed next bar)
+        if state.can_trade(ts.isoformat())[0]:
+            for sym, df in symbols_data.items():
+                if sym in state.positions or pending.get(sym) is not None:
+                    continue
+                try:
+                    idx = df.index.get_loc(ts)
+                except KeyError:
+                    continue
+                if idx < 60:
+                    continue
+                ind = compute_indicators_at(df, idx)
+                if ind is None:
+                    continue
+                regime = compute_regime_at(spy_df, ts)
+                score = compute_score(ind, regime)
+                if score < settings["min_signal_score"]:
+                    continue
+                if regime["regime"] == "BEAR":
+                    continue
+                strong_uptrend = (
+                    ind["last_close"] > ind["ema20"]
+                    and ind["ema20"] > ind["ema50"]
+                    and ind["adx"] > 25
+                )
+                if not strong_uptrend:
+                    continue
+
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
+                if stop_dist <= 0 or stop_dist > ind["last_close"] * 0.20:
+                    continue
                 target_dist = stop_dist * settings["take_profit_rr"]
 
-                if stop_dist > 0 and stop_dist < close * 0.20:
-                    risk_mult = regime.get("size_multiplier", 1.0)
-                    risk_amount = equity * settings["max_risk_per_trade"] * risk_mult
-                    qty = risk_amount / stop_dist
+                risk_mult = regime.get("size_multiplier", 1.0)
+                qty = compute_position_size(
+                    state.equity, ind["last_close"], stop_dist,
+                    settings["max_risk_per_trade"], risk_mult,
+                    settings["max_position_pct"],
+                )
+                if qty <= 0 or qty * ind["last_close"] < 1.0:
+                    continue
 
-                    max_notional = equity * settings["max_position_pct"]
-                    if qty * close > max_notional:
-                        qty = max_notional / close
+                pending[sym] = {
+                    "side": "buy",
+                    "qty": qty,
+                    "stop_dist": stop_dist,
+                    "target_dist": target_dist,
+                    "signal_bar_idx": idx,
+                    "regime": regime["regime"],
+                    "score": score,
+                }
 
-                    if qty > 0 and qty * close >= 1.0:
-                        pending_entry = {
-                            "qty": qty,
-                            "stop_dist": stop_dist,
-                            "target_dist": target_dist,
-                            "entry_ref": close,
-                            "signal_bar_idx": i,
-                            "regime": regime["regime"],
-                            "score": score,
-                        }
+        state.snapshot(ts)
 
-        equity_curve.append({"time": ts, "equity": round(equity, 2)})
-
-    # Force close any open position at end
-    if position is not None:
-        final_close = float(df.iloc[-1]["Close"])
-        slip_out = final_close * (settings["exit_slippage_bps"] / 10000.0)
-        final_exit = final_close - slip_out
-        fees_out = position.qty * settings["fees_per_share"]
-        gross_pnl = (final_exit - position.entry_price) * position.qty
-        net_pnl = gross_pnl - fees_out
-        equity += net_pnl
-        trade_record.update({
-            "exit_time": df.index[-1],
+    # Force-close any open positions at end
+    for sym, pos in list(state.positions.items()):
+        df = symbols_data[sym]
+        try:
+            final_close = float(df.iloc[-1]["Close"])
+        except Exception:
+            continue
+        is_buy_exit = pos.side == SHORT
+        slip = normalize_slippage(final_close, settings["exit_slippage_bps"], is_buy_exit)
+        final_exit = final_close + slip
+        fees = pos.qty * settings["fees_per_share"]
+        if pos.side == LONG:
+            gross = (final_exit - pos.entry_price) * pos.qty
+            rps = pos.risk_per_share()
+            r_multiple = (final_exit - pos.entry_price) / rps if rps > 0 else 0.0
+        else:
+            gross = (pos.entry_price - final_exit) * pos.qty
+            rps = pos.risk_per_share()
+            r_multiple = (pos.entry_price - final_exit) / rps if rps > 0 else 0.0
+        net = gross - fees
+        state.record_trade({
+            "symbol": sym,
+            "side": "BUY" if pos.side == LONG else "SELL",
+            "direction": pos.side,
+            "entry_time": pos.entry_time,
+            "entry_price": pos.entry_price,
+            "exit_time": last_ts,
             "exit_price": final_exit,
+            "qty": pos.qty,
+            "initial_stop": pos.initial_stop,
+            "final_stop": pos.stop,
+            "take_profit": pos.target,
+            "gross_pnl": round(gross, 4),
+            "fees_exit": round(fees, 4),
+            "net_pnl": round(net, 4),
+            "r_multiple": round(r_multiple, 3),
+            "bars_held": pos.bars_held,
             "exit_reason": "END_OF_DATA",
-            "gross_pnl": round(gross_pnl, 4),
-            "fees_exit": round(fees_out, 4),
-            "net_pnl": round(net_pnl, 4),
-            "r_multiple": round(
-                (final_exit - position.entry_price) / position.risk_per_share(), 3
-            ) if position.risk_per_share() > 0 else 0,
-            "bars_held": position.bars_held,
+            "portfolio_equity_after": round(state.equity, 2),
         })
-        trades.append(trade_record)
+        del state.positions[sym]
 
     return {
-        "symbol": symbol,
         "start_equity": start_equity,
-        "end_equity": round(equity, 2),
-        "trades": trades,
-        "equity_curve": equity_curve,
+        "end_equity": round(state.equity, 2),
+        "trades": state.trades,
+        "equity_curve": state.equity_curve,
+        "final_positions": len(state.positions),
     }
+
+
+# ============ Legacy single-symbol entry (kept for compatibility) ============
+def simulate(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
+             start_equity: float = 10000.0, max_hold_bars: int = 60) -> dict:
+    """Single-symbol convenience wrapper around simulate_portfolio."""
+    r = simulate_portfolio({symbol: df}, spy_df, start_equity)
+    # Adapt to old shape (adds 'symbol')
+    r["symbol"] = symbol
+    return r
