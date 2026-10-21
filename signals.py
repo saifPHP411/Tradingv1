@@ -364,3 +364,70 @@ def compute_short_score(ind: dict, regime: dict | None = None) -> dict:
         "score": raw, "trend": trend, "momentum": momentum,
         "rsi": rsi_score, "bb": bb, "volume": vol, "news": 0,
     }
+
+def compute_short_score(ind: dict, regime: dict | None = None) -> dict:
+    """
+    Mirror of compute_signal_score for SHORT.
+    Used only when settings['enable_short'] = 1 (backtest only by default).
+    """
+    trend = 0
+    if ind["ema20"] < ind["ema50"]:
+        trend += 12
+    if ind["last_close"] < ind["ema20"]:
+        trend += 8
+    if ind["last_close"] < ind["sma50"]:
+        trend += 5
+    if ind["adx"] > 25:
+        trend += 5
+
+    momentum = 0
+    if ind["momentum_5d_pct"] < 0:
+        momentum += 8
+    if ind["momentum_10d_pct"] < 0:
+        momentum += 5
+    if ind["macd_hist"] < 0:
+        momentum += 7
+
+    rsi = ind["rsi14"]
+    # Avoid shorting into oversold extremes.
+    if 30 <= rsi <= 60:
+        rsi_score = 15
+    elif 60 < rsi <= 70:
+        rsi_score = 8
+    elif 20 <= rsi < 30:
+        rsi_score = 10
+    else:
+        rsi_score = 0
+
+    bb = 0
+    if 0.2 <= ind["bb_pct_b"] <= 0.8:
+        bb += 8
+    if ind["bb_pct_b"] < 0.1:
+        bb -= 5
+    if ind["bb_pct_b"] > 0.9:
+        bb += 3
+    bb = max(0, bb)
+
+    if ind["volume_ratio"] > 1.2:
+        vol = 12
+    elif ind["volume_ratio"] > 0.8:
+        vol = 8
+    else:
+        vol = 3
+
+    raw = trend + momentum + rsi_score + bb + vol
+    raw = max(0, min(100, raw))
+
+    if regime:
+        r = regime.get("regime", "UNKNOWN")
+        if r == "BULL":
+            raw = int(raw * 0.5)
+        elif r == "HIGH_VOLATILITY":
+            raw = int(raw * 0.75)
+        elif r == "SIDEWAYS":
+            raw = int(raw * 0.9)
+
+    return {
+        "score": raw, "trend": trend, "momentum": momentum,
+        "rsi": rsi_score, "bb": bb, "volume": vol, "news": 0,
+    }
