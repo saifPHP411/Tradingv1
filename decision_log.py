@@ -350,5 +350,14 @@ def delete_trade_state(trade_id: str):
         conn.execute("DELETE FROM trade_state WHERE trade_id=?", (trade_id,))
         conn.commit()
 
+# ============ Kill Switch ============
+def is_kill_switch_active() -> tuple[bool, str]:
+    val = get_trading_state("kill_switch_active", "false")
+    reason = get_trading_state("kill_switch_reason", "") or ""
+    return val == "true", reason
 
+
+def set_kill_switch(active: bool, reason: str = ""):
+    set_trading_state("kill_switch_active", "true" if active else "false")
+    set_trading_state("kill_switch_reason", reason if active else "")
 init_db()
