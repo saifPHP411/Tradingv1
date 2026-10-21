@@ -1,52 +1,62 @@
 """
 Bar-driven Portfolio Backtester.
 
-Accounting model: CASH-SECURED SPOT (no margin, no leverage).
+Accounting model: CASH-SECURED SPOT with RESERVED COLLATERAL for shorts.
+No margin, no leverage.
+
+Formulas (per position, per leg):
 
     LONG  entry : cash -= entry_notional + entry_fees
-    SHORT entry : cash += entry_notional - entry_fees   (proceeds - fees)
     LONG  exit  : cash += exit_notional  - exit_fees
-    SHORT exit  : cash -= exit_notional  + exit_fees
 
+    SHORT entry : cash += entry_notional - entry_fees
+                  reserved_collateral += entry_notional
+    SHORT exit  : cash -= exit_notional  + exit_fees
+                  reserved_collateral -= entry_notional
+
+    available_cash = cash - reserved_collateral
     equity(prices) = cash + sum(signed_market_value)
         long  => +qty * price
         short => -qty * price
 
-    realized_pnl  is accumulated when positions close.
+    realized_pnl accumulates on close.
     unrealized_pnl is derived on demand from open positions and current prices.
-    equity is always cash + signed_market_value — no double counting.
+    No double counting: equity = cash + signed_market_value always.
 
-Capital model constraints (explicit):
-    - No margin and no leverage is simulated. Both LONG and SHORT entries
-      require the FULL notional + fees in cash at entry time. For SHORT,
-      proceeds are credited on fill (see formula above), but the gate at
-      entry is conservative — the model never opens a short it cannot
-      cover on a gap-up. This is a documented limitation, not margin
-      accounting.
+Capital constraints (explicit):
+    - can_open() requires available_cash >= notional + fees for BOTH sides.
+    - For SHORT, proceeds are credited to cash (so the equity identity holds),
+      but the same notional is reserved, so the proceeds are NOT spendable.
+      This is an exposure-based short model with reserved collateral, not
+      margin accounting.
+    - Total exposure is additionally capped by max_portfolio_exposure_pct
+      via validate_portfolio_exposure() (which uses abs market value, so it
+      includes shorts).
 
 Other invariants:
-    - Equity curve is marked-to-market every bar (last Close per symbol).
-    - A final snapshot is appended after force-closing remaining positions
-      so that equity_curve[-1].equity == end_equity.
+    - Equity curve marked-to-market every bar (last Close per symbol).
+    - A final snapshot is appended after force-closing open positions so
+      equity_curve[-1].equity == end_equity.
     - Signals computed on bar i, executed on bar i+1 Open (no lookahead).
     - Gap handled at Open; same-candle conflict resolved STOP-first.
     - R-based trailing uses Close (matches monitor semantics).
-    - Consecutive losses trigger a *timed* cooldown from settings
-      (settings['cooldown_minutes']).
-    - Signal scoring is imported from signals.py — no duplicated scoring.
-    - BACKTEST_NEWS_AVAILABLE is False: no historical news feed is used.
-      We pass an explicit news={"available": False} dict to the score
-      function so the decision is deterministic and auditable. The live
-      strategy can add up to ±10 points from news, so backtest scores
-      may differ from live scores by that amount. This is a documented
-      input limitation, not a claim of full signal parity.
+    - Consecutive losses trigger a *timed* cooldown from
+      settings['cooldown_minutes']. When the cooldown expires, both
+      cooldown_until and consecutive_losses are reset so trading can resume.
+      An active cooldown is never extended by subsequent losses.
+    - Signal scoring is imported from signals.py (no duplication).
+    - Historical news is unavailable in the backtest. We pass an explicit
+      news={'available': False} dict to compute_signal_score(), which yields
+      news_component = 0 deterministically. Live may add up to ±10 points
+      from news, so backtest scores can differ from live by that amount.
+      This is a documented input limitation, not full signal parity.
 
 Strategy vs execution:
-    - The strategy is LONG-only by design.
-    - The execution engine is LONG and SHORT capable.
-    - SHORT signals are gated by settings['enable_short'] (default 0)
-      and use compute_short_score() from signals.py — a symmetric
-      mirror of compute_signal_score(). This is not a new strategy.
+    - Strategy is LONG-only by design (enable_short defaults to 0).
+    - Execution engine is LONG and SHORT capable.
+    - SHORT signals (when enable_short=1) use compute_short_score() from
+      signals.py, a symmetric mirror of compute_signal_score(). It is not
+      a new strategy.
 """
 from __future__ import annotations
 
@@ -72,7 +82,7 @@ BACKTEST_NEWS_AVAILABLE = False
 _NEWS_UNAVAILABLE = {"available": False, "score": 0.0, "news_count": 0}
 
 
-# ============ Indicators & Regime (bar-local, no lookahead) ============
+# ============ Indicators & Regime ============
 def compute_indicators_at(df: pd.DataFrame, i: int) -> dict | None:
     if i < 60:
         return None
@@ -190,6 +200,7 @@ class PortfolioState:
     def __init__(self, start_equity: float, settings: dict):
         self.start_equity = start_equity
         self.cash = start_equity
+        self.reserved_collateral = 0.0
         self.settings = settings
         self.positions: dict[str, PortfolioPosition] = {}
         self.trades: list[dict] = []
@@ -227,6 +238,23 @@ class PortfolioState:
                 total += (pos.entry_price - price) * pos.qty
         return total
 
+    @property
+    def available_cash(self) -> float:
+        """Cash that is not tied up as reserved collateral for shorts."""
+        return self.cash - self.reserved_collateral
+
+    # ---- timestamp helper ----
+    @staticmethod
+    def _parse_ts(x):
+        """Parse any pandas-compatible timestamp into a naive UTC Timestamp."""
+        try:
+            t = pd.Timestamp(x)
+        except Exception:
+            return None
+        if t.tz is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        return t
+
     # ---- day / risk gates ----
     def new_day(self, date_iso: str):
         self.current_date = date_iso
@@ -235,10 +263,37 @@ class PortfolioState:
 
     def can_trade(self, now_iso: str, prices: dict[str, float]) -> tuple[bool, str]:
         s = self.settings
-        if self.cooldown_until and now_iso < self.cooldown_until:
-            return False, "cooldown"
+
+        # ---- Cooldown handling ----
+        if self.cooldown_until:
+            cu = self._parse_ts(self.cooldown_until)
+            now = self._parse_ts(now_iso)
+            if cu is None or now is None:
+                # Unparseable timestamp: fail closed rather than silently allow.
+                return False, "cooldown_unparseable"
+            if now < cu:
+                return False, "cooldown"
+            # Expired: clear cooldown and reset the loss counter so that
+            # trading can resume normally.
+            self.cooldown_until = None
+            self.consecutive_losses = 0
+
+        # Defensive: if the loss threshold was reached but no cooldown was set
+        # (e.g., timestamp conversion failed inside record_trade), start one
+        # from now, or reset if cooldown_minutes <= 0. Never permanently lock.
         if self.consecutive_losses >= s["max_consecutive_losses"]:
-            return False, "consecutive_losses"
+            mins = int(s.get("cooldown_minutes", 120))
+            if mins <= 0:
+                self.consecutive_losses = 0
+            else:
+                now = self._parse_ts(now_iso)
+                if now is None:
+                    return False, "cooldown_unparseable"
+                self.cooldown_until = (
+                    now + pd.Timedelta(minutes=mins)
+                ).isoformat()
+                return False, "cooldown"
+
         if self.trades_today >= s["max_trades_per_day"]:
             return False, "max_trades_per_day"
         if len(self.positions) >= s["max_open_positions"]:
@@ -252,23 +307,30 @@ class PortfolioState:
 
     # ---- cash / position ops ----
     def can_open(self, entry_notional: float, entry_fees: float,
-                 side: str) -> tuple[bool, str]:
+                 side: str = "long") -> tuple[bool, str]:
         """
-        Cash-secured gate for both sides.
+        Cash-secured gate with reserved collateral (SHORT-safe).
 
-        This backtester does NOT simulate margin or leverage. To keep the
-        accounting model internally consistent, both LONG and SHORT require
-        the FULL notional + fees in cash at entry:
+            available = cash - reserved_collateral
+            require available >= entry_notional + entry_fees
 
-          - LONG:  you pay the notional now, and later receive proceeds.
-          - SHORT: you receive proceeds on fill (see open_position), but the
-                   gate keeps cash >= notional so the model never opens a
-                   short it could not cover on a gap-up. This is a documented
-                   conservative limitation, not margin accounting.
+        For SHORT, proceeds are credited to cash on fill (so the equity
+        identity holds), but the same notional is added to
+        reserved_collateral. The proceeds are therefore NOT spendable:
+        available_cash stays at the pre-trade level.
+
+        `side` is accepted for API compatibility. The reserved-collateral
+        rule applies to both LONG and SHORT. Total exposure is additionally
+        capped by max_portfolio_exposure_pct via validate_portfolio_exposure.
         """
+        available = self.available_cash
         required = entry_notional + entry_fees
-        if self.cash < required:
-            return False, f"insufficient_cash ({self.cash:.2f} < {required:.2f})"
+        if available < required:
+            return False, (
+                f"insufficient_cash (available={available:.2f} < "
+                f"required={required:.2f}; cash={self.cash:.2f}, "
+                f"reserved={self.reserved_collateral:.2f})"
+            )
         return True, "ok"
 
     def open_position(self, pos: PortfolioPosition, entry_fees: float,
@@ -277,8 +339,10 @@ class PortfolioState:
         if pos.side == LONG:
             self.cash -= notional + entry_fees
         else:
-            # SHORT: proceeds credited to cash, fees paid out of proceeds.
+            # SHORT: credit proceeds to cash (equity identity), but reserve
+            # the same notional as collateral so proceeds are not spendable.
             self.cash += notional - entry_fees
+            self.reserved_collateral += notional
         self.fees_paid += entry_fees
         pos.entry_fees = entry_fees
         pos.entry_slippage_cost = entry_slippage_cost
@@ -296,6 +360,10 @@ class PortfolioState:
         else:
             gross = (pos.entry_price - exit_price) * pos.qty
             self.cash -= exit_notional + exit_fees
+            # Release collateral reserved at SHORT entry.
+            self.reserved_collateral -= pos.entry_price * pos.qty
+            if self.reserved_collateral < 0:
+                self.reserved_collateral = 0.0
 
         self.fees_paid += exit_fees
         total_net = gross - exit_fees - pos.entry_fees
@@ -329,6 +397,7 @@ class PortfolioState:
             "exit_reason": exit_reason,
             "portfolio_equity_after": round(self.equity(prices), 2),
             "portfolio_cash_after": round(self.cash, 2),
+            "portfolio_reserved_after": round(self.reserved_collateral, 2),
         }
         self.trades.append(trade)
 
@@ -336,14 +405,21 @@ class PortfolioState:
             self.consecutive_losses += 1
             if self.consecutive_losses >= self.settings["max_consecutive_losses"]:
                 mins = int(self.settings.get("cooldown_minutes", 120))
-                try:
-                    self.cooldown_until = (
-                        pd.Timestamp(ts) + pd.Timedelta(minutes=mins)
-                    ).isoformat()
-                except Exception:
+                if mins <= 0:
+                    # No cooldown requested: reset so trading can continue.
+                    self.consecutive_losses = 0
                     self.cooldown_until = None
+                elif self.cooldown_until is None:
+                    # Start a fresh cooldown only if none is currently active.
+                    # An active cooldown is not extended by further losses.
+                    try:
+                        self.cooldown_until = (
+                            pd.Timestamp(ts) + pd.Timedelta(minutes=mins)
+                        ).isoformat()
+                    except Exception:
+                        self.cooldown_until = None
                 print(f"🛑 cooldown: {self.consecutive_losses} consecutive losses "
-                      f"→ blocked until {self.cooldown_until}")
+                      f"→ active until {self.cooldown_until}")
         else:
             self.consecutive_losses = 0
 
@@ -354,6 +430,8 @@ class PortfolioState:
             "time": ts,
             "equity": round(eq, 2),
             "cash": round(self.cash, 2),
+            "reserved_collateral": round(self.reserved_collateral, 2),
+            "available_cash": round(self.available_cash, 2),
             "unrealized": round(self.unrealized_pnl(prices), 2),
             "n_positions": len(self.positions),
         })
@@ -376,8 +454,8 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         settings = get_all_settings()
 
     if not BACKTEST_NEWS_AVAILABLE:
-        print("ℹ️ backtest: historical news unavailable — passing "
-              "news={'available': False} to scoring (deterministic, no lookahead).")
+        print("ℹ️ backtest: historical news unavailable — scoring with "
+              "news={'available': False} (deterministic, no lookahead).")
 
     state = PortfolioState(start_equity, settings)
     all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
@@ -542,9 +620,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 regime = compute_regime_at(spy_df, ts)
 
                 # Shared scoring from signals.py.
-                # We pass news explicitly (unavailable → 0 contribution)
-                # so the behavior is deterministic and auditable.
-                long_score = compute_signal_score(ind, regime, news=_NEWS_UNAVAILABLE)["score"]
+                # News is passed explicitly as unavailable (deterministic).
+                long_score = compute_signal_score(
+                    ind, regime, news=_NEWS_UNAVAILABLE)["score"]
                 strong_uptrend = (
                     ind["last_close"] > ind["ema20"]
                     and ind["ema20"] > ind["ema50"]
@@ -576,7 +654,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 elif short_ok and not long_ok:
                     side, chosen_score = "sell", short_score
                 else:
-                    continue
+                    continue  # both or neither → no trade
 
                 atr = ind["atr14"]
                 stop_dist = atr * settings["stop_atr_multiplier"]
@@ -623,27 +701,29 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             abs(exit_slip) * pos.qty, "END_OF_DATA", last_ts, last_prices,
         )
 
-    # Replace the last equity snapshot so equity_curve[-1] matches end_equity
-    # (after force-close, cash has been updated and positions are empty).
+    # Final snapshot: after force-close, equity_curve[-1] must match end_equity.
     if all_times:
         final_eq = state.equity(last_prices)
         state._last_prices = dict(last_prices)
-        entry = {
+        final_entry = {
             "time": last_ts,
             "equity": round(final_eq, 2),
             "cash": round(state.cash, 2),
+            "reserved_collateral": round(state.reserved_collateral, 2),
+            "available_cash": round(state.available_cash, 2),
             "unrealized": round(state.unrealized_pnl(last_prices), 2),
             "n_positions": len(state.positions),
         }
         if state.equity_curve and state.equity_curve[-1]["time"] == last_ts:
-            state.equity_curve[-1] = entry
+            state.equity_curve[-1] = final_entry
         else:
-            state.equity_curve.append(entry)
+            state.equity_curve.append(final_entry)
 
     return {
         "start_equity": start_equity,
         "end_equity": round(state.equity(last_prices), 2),
         "final_cash": round(state.cash, 2),
+        "final_reserved_collateral": round(state.reserved_collateral, 2),
         "trades": state.trades,
         "equity_curve": state.equity_curve,
         "final_positions": len(state.positions),
