@@ -1,13 +1,13 @@
 import argparse
-from datetime import datetime, timedelta
-
 from backtest.data import load_ohlcv, load_multi, get_spy_for_period
 from backtest.engine import simulate, simulate_portfolio
 from backtest.metrics import calculate_metrics
 from backtest.report import (
     save_report, print_summary, print_portfolio_summary,
 )
-from backtest.walkforward import walk_forward, aggregate_walkforward
+from backtest.walkforward import (
+    walk_forward, walk_forward_portfolio, aggregate_walkforward,
+)
 from backtest.storage import save_run
 from backtest.monte_carlo import run_monte_carlo
 
@@ -20,15 +20,12 @@ def run_single(symbol: str, start: str, end: str, initial: float):
         return None
     spy_df = get_spy_for_period(start, end)
     print(f"✓ {len(df)} bars loaded")
-
     result = simulate(symbol, df, spy_df, start_equity=initial)
     metrics = calculate_metrics(result["equity_curve"], result["trades"], initial)
-
     print_summary(result, metrics)
     path = save_report(result, metrics, f"single_{symbol}")
     print(f"📁 Report saved: {path}")
     save_run(symbol, start, end, {}, metrics)
-
     mc = run_monte_carlo(result["trades"], initial, n_sims=1000)
     print("\n=== Monte Carlo (1000 shuffles) ===")
     print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
@@ -37,12 +34,11 @@ def run_single(symbol: str, start: str, end: str, initial: float):
     print(f"  Max DD median:       {mc['max_drawdown_pct']['median']:.2f}%")
     print(f"  Max DD P95:          {mc['max_drawdown_pct']['p95']:.2f}%")
     print(f"  Prob. of ruin:       {mc['probability_of_ruin_pct']:.2f}%")
-
     return result, metrics
 
 
 def run_multi(symbols: list[str], start: str, end: str, initial: float):
-    """Legacy per-symbol mode (kept for compatibility)."""
+    """Legacy per-symbol mode (each symbol gets its own starting cash)."""
     all_metrics = []
     for sym in symbols:
         print(f"\n{'='*60}")
@@ -73,16 +69,11 @@ def run_portfolio(symbols: list[str], start: str, end: str, initial: float):
         return
     spy = get_spy_for_period(start, end)
     print(f"✓ {len(data)} symbols loaded")
-
     result = simulate_portfolio(data, spy, start_equity=initial)
-    metrics = calculate_metrics(
-        result["equity_curve"], result["trades"], initial,
-    )
+    metrics = calculate_metrics(result["equity_curve"], result["trades"], initial)
     print_portfolio_summary(list(data.keys()), result, metrics)
-
     path = save_report(result, metrics, "portfolio")
     print(f"📁 Report saved: {path}")
-
     mc = run_monte_carlo(result["trades"], initial, n_sims=1000)
     print("\n=== Monte Carlo (1000 shuffles) ===")
     print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
@@ -108,8 +99,20 @@ def main():
     args = parser.parse_args()
 
     if args.walkforward:
-        results = walk_forward(args.symbol, args.start, args.end,
-                               args.train_months, args.test_months)
+        if args.portfolio:
+            syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if not syms:
+                print("❌ --portfolio --walkforward requires --symbols")
+                return
+            results = walk_forward_portfolio(
+                syms, args.start, args.end,
+                args.train_months, args.test_months,
+            )
+        else:
+            results = walk_forward(
+                args.symbol, args.start, args.end,
+                args.train_months, args.test_months,
+            )
         agg = aggregate_walkforward(results)
         print("\n" + "=" * 60)
         print("📊 WALK-FORWARD AGGREGATE")
