@@ -74,6 +74,14 @@ def init_db():
             except Exception:
                 pass  # already exists
 
+        conn.execute("""CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    event_type TEXT,
+    symbol TEXT,
+    trade_id TEXT,
+    reason TEXT,
+    data TEXT)""")
         conn.commit()
 
 
