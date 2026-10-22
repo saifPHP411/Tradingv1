@@ -370,6 +370,25 @@ def set_kill_switch(active: bool, reason: str = ""):
     set_trading_state("kill_switch_reason", reason if active else "")
 
 
+# ============ Protection / startup reconciliation ============
+def get_protection_unverified() -> bool:
+    """True when a position is known to be unprotected.
+
+    Set by the monitor on startup (or whenever protection cannot be
+    reconstructed). While set, new entries must be blocked.
+    """
+    return get_trading_state("protection_unverified", "false") == "true"
+
+
+def set_protection_unverified(flag: bool, reason: str = ""):
+    set_trading_state("protection_unverified", "true" if flag else "false")
+    set_trading_state("protection_unverified_reason", reason if flag else "")
+
+
+def get_protection_unverified_reason() -> str:
+    return get_trading_state("protection_unverified_reason", "") or ""
+
+
 # ============ Structured events ============
 def emit_event(event_type: str, symbol: str | None = None,
                trade_id: str | None = None, reason: str | None = None,

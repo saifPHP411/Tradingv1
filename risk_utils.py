@@ -4,6 +4,8 @@ No component is allowed to invent stop/target/slippage logic outside these helpe
 """
 from __future__ import annotations
 
+import math
+
 
 def normalize_price_for_symbol(symbol: str, price: float, tick_size: float = 0.01) -> float:
     if price is None or price <= 0:
@@ -99,3 +101,45 @@ def normalize_slippage(price: float, bps: float, is_buy: bool) -> float:
     """
     slip = price * (bps / 10000.0)
     return slip if is_buy else -slip
+
+
+# ============ Broker-compatible sizing ============
+
+# Alpaca stock orders: a fractional quantity is only valid for a MARKET + DAY
+# order. A protective STOP order must be whole-share. Therefore any entry that
+# needs a protective stop must be sized in WHOLE shares.
+MIN_WHOLE_SHARES = 1
+
+
+def whole_share_qty(raw_qty: float) -> int:
+    """Floor a risk-based quantity to a whole, broker-stoppable share count.
+
+    Fractional sizes are intentionally not used: Alpaca cannot attach a valid
+    stop order to a fractional position, and this project never opens an
+    unprotected position.
+    """
+    if raw_qty is None or not math.isfinite(float(raw_qty)) or raw_qty <= 0:
+        return 0
+    return int(math.floor(float(raw_qty)))
+
+
+def can_protect_with_stop(qty: int, price: float, stop_price: float,
+                          side: str = "buy") -> tuple[bool, str]:
+    """Whether ``qty`` can be entered AND protected with a valid stop order.
+
+    A valid protected trade requires at least one whole share and a stop price
+    strictly on the correct side of the entry. Sub-one-share risk budgets are
+    rejected here (the caller must skip the trade, never inflate capital).
+    """
+    if qty is None or qty < MIN_WHOLE_SHARES:
+        return False, (f"qty {qty} < {MIN_WHOLE_SHARES} whole share — "
+                       f"cannot place a valid protective stop")
+    if price is None or price <= 0:
+        return False, f"invalid entry price {price}"
+    if stop_price is None or stop_price <= 0:
+        return False, f"invalid stop price {stop_price}"
+    if side in ("buy", "long") and stop_price >= price:
+        return False, f"long stop {stop_price} must be < entry {price}"
+    if side in ("sell", "short") and stop_price <= price:
+        return False, f"short stop {stop_price} must be > entry {price}"
+    return True, "ok"

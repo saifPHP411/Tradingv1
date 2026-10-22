@@ -170,7 +170,7 @@ def get_all_settings() -> dict:
         "regime_enabled": int(get_setting("regime_enabled")),
         "news_enabled": int(get_setting("news_enabled")),
         # explicit flags
-        "dry_run": get_trading_mode() != "LIVE",
+        "dry_run": is_dry_run(),
         "trading_mode": get_trading_mode(),
         "settings_version": SETTINGS_VERSION,
     }
@@ -190,7 +190,32 @@ def update_settings(payload: dict):
 
 
 def is_dry_run() -> bool:
-    return get_trading_mode() != "LIVE"
+    """True only when the process must never submit a broker order.
+
+    BACKTEST is the only dry-run mode. PAPER targets Alpaca's paper endpoint
+    and is allowed to submit (gated by safety + risk checks); LIVE is allowed
+    only when the explicit live safeguards are satisfied.
+    """
+    return get_trading_mode() == "BACKTEST"
+
+
+def is_paper() -> bool:
+    """True when orders (if any) go to Alpaca's PAPER endpoint."""
+    return get_trading_mode() == "PAPER"
+
+
+def is_live() -> bool:
+    """True only under the explicit live authorization safeguards."""
+    return get_trading_mode() == "LIVE"
+
+
+def broker_submission_allowed() -> bool:
+    """Whether this process may ever call the broker to submit an order.
+
+    BACKTEST must never submit. PAPER and LIVE may submit, but only after the
+    safety and risk gates in broker.execute_order approve the order.
+    """
+    return get_trading_mode() in ("PAPER", "LIVE")
 
 
 def set_dry_run(v: bool):
