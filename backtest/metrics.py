@@ -7,6 +7,23 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
     """
     periods_per_year: 252 for daily bars, 252*390 for 1-minute intraday,
                       52 for weekly, 12 for monthly.
+
+    Known limitations (documented, not silently "fixed" here — changing any of
+    these would change reported numbers, so it needs an explicit decision):
+
+    - ``periods_per_year`` defaults to 252. Callers that pass intraday curves
+      without overriding it get a mis-annualized Sharpe/Sortino/CAGR.
+    - ``sharpe``/``sortino`` are computed from simple (not log) returns and use
+      the population standard deviation; ``sortino`` divides by the standard
+      deviation of *negative* returns rather than a downside deviation about a
+      minimum-acceptable-return target.
+    - ``total_return_pct`` floors a negative terminal equity at 0 (a
+      cash-secured account cannot lose more than its capital), while the raw
+      value is preserved in ``final_equity_raw``/``negative_equity``.
+    - ``profit_factor`` is ``None`` when there are no losing trades (undefined),
+      not ``inf``.
+    - ``max_drawdown_pct`` is floored at -100%.
+    - ``equity_ruined`` is true if ANY curve value is <= 0, not only the last.
     """
     if not equity_curve or len(equity_curve) < 2:
         return {"error": "no data"}

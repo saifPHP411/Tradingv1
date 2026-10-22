@@ -18,6 +18,7 @@ Aggregate:
         cum = Π(1 + r_i / 100); cumulative = (cum - 1) * 100
     It is NOT the arithmetic sum.
 """
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import math
@@ -203,21 +204,38 @@ def aggregate_walkforward(results: list[dict]) -> dict:
     nor to the trade count, nor to the averages.
 
     Invalid cases:
-      - ``metrics`` missing / not a mapping (e.g. ``{"error": "no data"}`` has
-        no ``total_return_pct`` key).
+      - a result entry that is not a mapping (e.g. ``None``), or whose
+        ``metrics`` is missing / not a mapping (e.g. ``{"error": "no data"}``
+        has no ``total_return_pct`` key). Malformed entries must not crash
+        aggregation.
       - ``total_return_pct`` absent, non-numeric, NaN, +inf or -inf.
       - ``total_return_pct < -100%``: impossible for a cash-secured account.
         It is recorded as invalid and clamped to -100% for compounding only so
         ``(1 + r)`` can never go negative and flip the product's sign.
       - ``total_return_pct == -100%`` is valid and means a ruined account.
 
-    Invalid windows are reported in ``invalid_windows`` (never dropped
-    silently), and ``num_invalid_windows`` / ``total_trades_invalid_windows``
-    are surfaced so the exclusion is visible rather than implied.
+    A non-numeric ``num_trades`` on an invalid window is treated as 0 rather
+    than crashing the ``total_trades_invalid_windows`` tally. Invalid windows
+    are reported in ``invalid_windows`` (never dropped silently), and
+    ``num_invalid_windows`` / ``total_trades_invalid_windows`` are surfaced so
+    the exclusion is visible rather than implied.
     """
     if not results:
         return {"error": "no windows"}
     import numpy as np
+
+    def _window_label(r, idx):
+        return r.get("window", idx) if isinstance(r, Mapping) else idx
+
+    def _trades_of(m) -> int:
+        """Trades attributed to a window; non-numeric counts as 0."""
+        if not isinstance(m, Mapping):
+            return 0
+        try:
+            return int(m.get("num_trades", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     total_trades = 0
     total_trades_invalid = 0
     all_returns: list[float] = []
@@ -225,8 +243,15 @@ def aggregate_walkforward(results: list[dict]) -> dict:
     invalid_windows: list[dict] = []
     compounded = 1.0
     for idx, r in enumerate(results):
-        m = r.get("metrics", {}) or {}
-        n_trades = m.get("num_trades", 0) or 0
+        m = r.get("metrics", {}) if isinstance(r, Mapping) else None
+        if not isinstance(m, Mapping):
+            invalid_windows.append({
+                "window": _window_label(r, idx),
+                "reason": "malformed result entry (missing or non-mapping metrics)",
+                "value": m,
+            })
+            continue
+        n_trades = _trades_of(m)
 
         # A window is valid only if it carries a numeric finite return.
         raw_ret = m.get("total_return_pct", None)
@@ -236,7 +261,7 @@ def aggregate_walkforward(results: list[dict]) -> dict:
             ret = float("nan")
 
         if not math.isfinite(ret):
-            invalid_windows.append({"window": r.get("window", idx),
+            invalid_windows.append({"window": _window_label(r, idx),
                                     "reason": "missing or non-finite total_return_pct",
                                     "value": raw_ret})
             total_trades_invalid += n_trades
@@ -246,7 +271,7 @@ def aggregate_walkforward(results: list[dict]) -> dict:
             # A cash-secured account cannot lose more than 100%. Clamp for
             # compounding rather than let (1 + r) go negative and flip the
             # product's sign. The window is reported invalid.
-            invalid_windows.append({"window": r.get("window", idx),
+            invalid_windows.append({"window": _window_label(r, idx),
                                     "reason": "return below -100%; clamped",
                                     "value": ret})
             ret = -100.0
