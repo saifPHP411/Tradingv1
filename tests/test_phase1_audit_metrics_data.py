@@ -26,7 +26,7 @@ import pandas as pd
 import pytest
 
 from backtest.data import _normalize
-from backtest.engine import simulate_portfolio, PortfolioState
+from backtest.engine import simulate_portfolio, PortfolioState, _naive_index
 from backtest.metrics import calculate_metrics
 from backtest.walkforward import aggregate_walkforward, _naive_ts
 
@@ -277,6 +277,114 @@ def test_engine_normalizes_naive_window_boundary_against_tz_index():
                                 settings=_settings(), trading_start_ts=start)
     for t in result["trades"]:
         assert _naive_ts(t["entry_time"]) >= start
+
+
+# ---- Engine-level duplicate-timestamp handling (direct simulate_portfolio) ----
+
+def _dup_ohlcv(idx, closes, dup_positions, dup_close):
+    """Build an OHLCV frame with extra rows duplicating chosen timestamps."""
+    rows = [[c, c * 1.02, c * 0.98, c, 1_000_000] for c in closes]
+    full_idx = list(idx)
+    for pos in dup_positions:
+        ts = idx[pos]
+        rows.append([dup_close, dup_close * 1.02, dup_close * 0.98,
+                     dup_close, 1_000_000])
+        full_idx.append(ts)
+    return _raw_df(rows, pd.DatetimeIndex(full_idx))
+
+
+def test_naive_index_dedupes_and_sorts_unsorted_duplicates():
+    """_naive_index must sort and drop duplicates (first kept), like _normalize."""
+    idx = pd.to_datetime(["2024-01-03", "2024-01-01", "2024-01-02", "2024-01-02"])
+    df = _raw_df([
+        [10, 11, 9, 10, 100],
+        [10, 11, 9, 10, 100],
+        [10, 11, 9, 10, 100],
+        [99, 99, 99, 99, 999],   # duplicate 2024-01-02; first occurrence kept
+    ], idx)
+
+    out = _naive_index(df)
+    assert out.index.is_unique
+    assert out.index.is_monotonic_increasing
+    assert len(out) == 3
+    assert float(out.loc["2024-01-02", "Close"]) == 10.0
+
+
+def test_engine_direct_call_unsorted_duplicate_timestamps_does_not_crash():
+    """
+    Regression: a direct simulate_portfolio call with an unsorted index that
+    contains duplicate timestamps must not raise (previously
+    ``float(row["Close"])`` got a Series from ``df.loc[ts]``).
+    """
+    n = 120
+    idx = pd.date_range("2024-01-01", periods=n, freq="D")
+    closes = 100 + np.arange(n) * 0.5
+    df = _dup_ohlcv(idx, closes, dup_positions=[50, 51], dup_close=999.0)
+    unsorted = df.iloc[::-1].copy()
+
+    result = simulate_portfolio({"AAA": unsorted}, None, start_equity=10_000,
+                                settings=_settings(), max_hold_bars=5)
+    assert result["end_equity"] > 0
+
+
+def test_engine_direct_call_tz_aware_duplicate_timestamps_does_not_crash():
+    """tz-aware index + duplicates through a direct simulate_portfolio call."""
+    n = 120
+    idx = pd.date_range("2024-01-01", periods=n, freq="D", tz="America/New_York")
+    closes = 100 + np.arange(n) * 0.5
+    df = _dup_ohlcv(idx, closes, dup_positions=[60], dup_close=999.0)
+
+    result = simulate_portfolio({"AAA": df}, None, start_equity=10_000,
+                                settings=_settings(), max_hold_bars=5)
+    assert result["end_equity"] > 0
+
+
+def test_engine_dedupe_policy_matches_normalize():
+    """
+    Deterministic: the engine's kept row for a duplicated timestamp must be the
+    same physical row ``backtest.data._normalize`` keeps (first occurrence).
+    """
+    idx = pd.to_datetime(["2024-01-02", "2024-01-01", "2024-01-02", "2024-01-03"])
+    rows = [
+        [10, 11, 9, 10, 100],
+        [10, 11, 9, 10, 100],
+        [99, 99, 99, 99, 999],   # duplicate 2024-01-02 (second occurrence)
+        [10, 11, 9, 10, 100],
+    ]
+    df = _raw_df(rows, idx)
+
+    engine_out = _naive_index(df)
+    data_out = _normalize(df)
+
+    assert engine_out.index.equals(data_out.index)
+    assert (engine_out["Close"].to_numpy()
+            == data_out["Close"].to_numpy()).all()
+    # The first-seen duplicate (Close 10), not the later Close 99, is kept.
+    assert float(engine_out.loc["2024-01-02", "Close"]) == 10.0
+
+
+def test_engine_tz_aware_dedupe_policy_matches_normalize():
+    """
+    tz-aware equivalence. ``_normalize`` dedupes *before* converting the index
+    to naive UTC, while ``_naive_index`` converts *first* and dedupes after.
+    Because the conversion is injective and order-preserving, both must still
+    keep the same physical row for a duplicated timestamp.
+    """
+    idx = pd.date_range("2024-01-01", periods=3, freq="D", tz="America/New_York")
+    idx = idx.append(pd.DatetimeIndex([idx[1]]))          # duplicate 2024-01-02
+    closes = [10, 20, 30, 99]
+    df = _raw_df([[c, c * 1.02, c * 0.98, c, 1_000] for c in closes], idx)
+
+    engine_out = _naive_index(df)
+    data_out = _normalize(df)
+
+    assert engine_out.index.is_unique
+    assert engine_out.index.tz is None                    # naive UTC afterwards
+    assert engine_out.index.equals(data_out.index)
+    assert (engine_out["Close"].to_numpy()
+            == data_out["Close"].to_numpy()).all()
+    # First occurrence of the duplicated bar (Close 20), not the later 99.
+    assert engine_out["Close"].tolist() == [10.0, 20.0, 30.0]
 
 
 # ==================== C. Walk-forward robustness ====================
