@@ -75,6 +75,34 @@ def _filter_to_window(equity_curve: list, trades: list, test_start_ts,
     return curve, trade_list
 
 
+def _filter_rejections_to_window(rejections, test_start_ts, test_end_ts=None):
+    """Keep only the rejection events recorded inside the OOS window.
+
+    Same half-open ``[start, end)`` convention as ``_filter_to_window`` (the
+    final window is open-ended). Rejections carry a ``time`` field. A malformed
+    entry without a usable ``time`` is dropped rather than crashing the driver;
+    rejections never affect metrics, trade counts, or returns.
+    """
+    if not rejections:
+        return []
+    start = _naive_ts(test_start_ts)
+    end = _naive_ts(test_end_ts) if test_end_ts is not None else None
+    kept = []
+    for r in rejections:
+        if not isinstance(r, Mapping):
+            continue
+        t = r.get("time")
+        if t is None:
+            continue
+        t = _naive_ts(t)
+        if t < start:
+            continue
+        if end is not None and t >= end:
+            continue
+        kept.append(r)
+    return kept
+
+
 def walk_forward(symbol: str, start_date: str, end_date: str,
                  train_months: int = 12, test_months: int = 3,
                  initial_equity: float = 10000.0,
@@ -118,11 +146,16 @@ def walk_forward(symbol: str, start_date: str, end_date: str,
             full_result["equity_curve"], full_result["trades"],
             test_start_ts, test_end_ts,
         )
+        rejections = _filter_rejections_to_window(
+            full_result.get("rejections"), test_start_ts, test_end_ts,
+        )
         metrics = calculate_metrics(curve, trades, initial_equity)
 
         results.append({
             "window": f"{test_start.date()}_to_{test_end.date()}",
-            "result": {"equity_curve": curve, "trades": trades},
+            "result": {"equity_curve": curve, "trades": trades,
+                       "rejections": rejections,
+                       "num_rejections": len(rejections)},
             "metrics": metrics,
         })
         print(f" Return: {metrics.get('total_return_pct', 0):+.2f}% | "
@@ -178,11 +211,16 @@ def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
             full_result["equity_curve"], full_result["trades"],
             test_start_ts, test_end_ts,
         )
+        rejections = _filter_rejections_to_window(
+            full_result.get("rejections"), test_start_ts, test_end_ts,
+        )
         metrics = calculate_metrics(curve, trades, initial_equity)
 
         results.append({
             "window": f"{test_start.date()}_to_{test_end.date()}",
-            "result": {"equity_curve": curve, "trades": trades},
+            "result": {"equity_curve": curve, "trades": trades,
+                       "rejections": rejections,
+                       "num_rejections": len(rejections)},
             "metrics": metrics,
         })
         print(f" Return: {metrics.get('total_return_pct', 0):+.2f}% | "

@@ -23,8 +23,15 @@ def init():
 
 
 def save_run(symbol: str, start_date: str, end_date: str,
-             params: dict, metrics: dict, run_type: str = "single"):
+             params: dict, metrics: dict, run_type: str = "single",
+             num_rejections: int = 0):
+    """Persist a run. ``num_rejections`` (rejection EVENTS) is stored inside the
+    existing ``params`` JSON so no schema change or migration is needed.
+
+    A copy is merged so the caller's ``params`` dict is never mutated.
+    """
     init()
+    params = {**params, "num_rejections": int(num_rejections)}
     with sqlite3.connect(DB) as conn:
         conn.execute("""INSERT INTO runs
             (timestamp, symbol, run_type, start_date, end_date,

@@ -56,7 +56,8 @@ def run_single(symbol: str, start: str, end: str, initial: float,
     print_summary(result, metrics)
     path = save_report(result, metrics, f"single_{symbol}")
     print(f"📁 Report saved: {path}")
-    save_run(symbol, start, end, {}, metrics)
+    save_run(symbol, start, end, {}, metrics,
+             num_rejections=len(result.get("rejections") or []))
     mc = run_monte_carlo(result["trades"], initial, n_sims=1000)
     _print_monte_carlo(mc)
     return result, metrics
