@@ -17,7 +17,13 @@ from decision_log import (
     update_position_state, delete_position_state, log_exit_decision,
     recent_lessons, set_position_initial_stop,
     update_stop_order_id, set_trailing_active,
+    set_protection_unverified, get_protection_unverified,
 )
+try:
+    from decision_log import emit_event
+except ImportError:
+    def emit_event(*args, **kwargs):
+        pass
 from broker import move_broker_stop
 from risk_utils import normalize_price_for_symbol, validate_position_protection
 
@@ -55,12 +61,17 @@ def _sync_positions() -> list:
             GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)
         )
     except Exception as e:
+        # Cannot read broker state → protection cannot be verified for ANY
+        # position. Fail closed so no new entry is opened on an unknown book.
         print(f"⚠️ monitor: fetch failed: {e}")
+        set_protection_unverified(True, "broker position/order fetch failed")
+        emit_event("PROTECTION_UNVERIFIED", reason="broker state fetch failed")
         return []
 
     settings = get_all_settings()
     result = []
     live_symbols = set()
+    unresolved = []
 
     stops_by_symbol = {}
     for o in open_orders:
@@ -101,8 +112,12 @@ def _sync_positions() -> list:
                     stop = entry + stop_dist
                     target = entry - stop_dist * settings["take_profit_rr"]
             else:
-                # Last resort: percentage fallback but log it
+                # Cannot reconstruct protection → block new entries and alert.
                 print(f"🚨 monitor: {sym} no ATR — cannot reconstruct protection")
+                unresolved.append(sym)
+                set_protection_unverified(True, f"{sym}: protection not reconstructable")
+                emit_event("PROTECTION_UNVERIFIED", symbol=sym,
+                           reason="no ATR — cannot reconstruct protection")
                 continue
 
             upsert_position_state(sym, entry, qty, side)
@@ -120,43 +135,47 @@ def _sync_positions() -> list:
         position_view = {"symbol": sym, "qty": qty, "side": side}
         stop_view = broker_stops[0] if broker_stops else None
         ok, why = validate_position_protection(position_view, stop_view)
-if not ok:
-    from safety import is_market_open
-    market_open = is_market_open()
-    log_exit_decision(sym, "EMERGENCY_NO_STOP", why, pnl_pct, current, entry)
+        if not ok:
+            from safety import is_market_open
+            market_open = is_market_open()
+            log_exit_decision(sym, "EMERGENCY_NO_STOP", why, pnl_pct, current, entry)
 
-    # Try to attach a stop order first (works even outside market hours)
-    try:
-        from broker import _submit_stop
-        from risk_utils import normalize_price_for_symbol
-        state = get_position_state(sym)
-        stop_price = state.get("current_stop") if state else None
-        if stop_price:
-            stop_result = _submit_stop(
-                symbol=sym,
-                qty=qty,
-                stop_price=normalize_price_for_symbol(sym, float(stop_price)),
-                side_held="long" if side == "long" else "short",
-            )
-            if stop_result:
-                print(f"✅ monitor: attached stop to {sym} at {stop_price}")
-                update_position_state(
-                    sym, stop_order_id=stop_result["stop_order_id"],
-                    current_stop=stop_result["stop_price"],
-                )
-                continue  # protected — carry on
-    except Exception as e:
-        print(f"⚠️ monitor: stop attach for {sym} failed: {e}")
+            # Try to attach a stop order first (works even outside market hours)
+            try:
+                from broker import _submit_stop
+                from risk_utils import normalize_price_for_symbol
+                state = get_position_state(sym)
+                stop_price = state.get("current_stop") if state else None
+                if stop_price:
+                    stop_result = _submit_stop(
+                        symbol=sym,
+                        qty=qty,
+                        stop_price=normalize_price_for_symbol(sym, float(stop_price)),
+                        side_held="long" if side == "long" else "short",
+                    )
+                    if stop_result:
+                        print(f"✅ monitor: attached stop to {sym} at {stop_price}")
+                        update_position_state(
+                            sym, stop_order_id=stop_result["stop_order_id"],
+                            current_stop=stop_result["stop_price"],
+                        )
+                        continue  # protected — carry on
+            except Exception as e:
+                print(f"⚠️ monitor: stop attach for {sym} failed: {e}")
 
-    # Fall back to close only when market is open
-    if market_open:
-        from broker import _emergency_close_and_verify
-        _emergency_close_and_verify(sym)
-        delete_position_state(sym)
-    else:
-        print(f"⏸️ monitor: {sym} unprotected but market CLOSED — "
-              f"will retry at open. Close manually in Alpaca.")
-    continue
+            # Fall back to close only when market is open
+            if market_open:
+                from broker import _emergency_close_and_verify
+                _emergency_close_and_verify(sym)
+                delete_position_state(sym)
+            else:
+                # Still unprotected and cannot act → block new entries + alert.
+                unresolved.append(sym)
+                set_protection_unverified(True, f"{sym}: unprotected, market closed")
+                emit_event("PROTECTION_UNVERIFIED", symbol=sym, reason=why)
+                print(f"⏸️ monitor: {sym} unprotected but market CLOSED — "
+                      f"will retry at open. Close manually in Alpaca.")
+            continue
 
         live_stop_id = broker_stops[0]["id"]
         if state.get("stop_order_id") != live_stop_id:
@@ -180,6 +199,11 @@ if not ok:
         if s["symbol"] not in live_symbols:
             delete_position_state(s["symbol"])
             print(f"🧹 monitor: cleaned {s['symbol']}")
+
+    # Clear the flag only when every live position is verified protected.
+    if not unresolved and get_protection_unverified():
+        set_protection_unverified(False)
+        print("✅ monitor: all positions verified protected — protection flag cleared")
 
     return result
 
@@ -357,6 +381,26 @@ class PositionMonitor:
     def start(self):
         if self.is_running():
             return
+        # Reconcile broker positions/orders BEFORE trading: reconstruct and
+        # verify protection, and block new entries if it cannot be verified.
+        try:
+            from decision_log import is_kill_switch_active
+            active, kreason = is_kill_switch_active()
+            if active:
+                try:
+                    from broker import kill_switch_report
+                    rep = kill_switch_report()
+                    print(f"🛑 monitor: kill switch active ({kreason}); "
+                          f"positions={rep['positions']} "
+                          f"open_orders={rep['open_orders']} error={rep['error']}")
+                except Exception as e:
+                    print(f"⚠️ monitor: kill switch report failed: {e}")
+            recon = _sync_positions()
+            print(f"🔄 monitor: startup reconciliation — {len(recon)} position(s) verified")
+        except Exception as e:
+            print(f"🚨 monitor: startup reconciliation failed: {e}")
+            set_protection_unverified(True, "startup reconciliation failed")
+            emit_event("PROTECTION_UNVERIFIED", reason="startup reconciliation failed")
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="position-monitor")
         self._thread.start()

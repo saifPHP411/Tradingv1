@@ -5,21 +5,17 @@ import numpy as np
 import requests
 from config import FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY
 
-def fetch_yfinance(symbol: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="3mo")
-    if hist.empty:
-        return {}
-    closes = hist["Close"].values
-    volumes = hist["Volume"].values
-    return {
-        "last_close": float(closes[-1]),
-        "sma20": float(np.mean(closes[-20:])),
-        "sma50": float(np.mean(closes[-50:])),
-        "rsi14": _compute_rsi(closes[-15:]),
-        "avg_volume": float(np.mean(volumes[-20:])),
-        "price_change_5d_pct": float((closes[-1] / closes[-6] - 1) * 100),
-    }
+
+def fetch_ohlcv(symbol: str, period: str = "6mo") -> pd.DataFrame | None:
+    """Daily OHLCV bars, oldest→newest. Single source for the live path."""
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
 
 def fetch_finnhub_sentiment(symbol: str) -> dict:
     if not FINNHUB_API_KEY:
@@ -50,15 +46,28 @@ def fetch_alpha_vantage_news(symbol: str) -> dict:
         return {}
 
 def fetch_market_data(symbol: str) -> dict:
-    """يجمع البيانات من كل المصادر المتاحة."""
-    base = fetch_yfinance(symbol)
-    if not base:
-        return {"error": "لا توجد بيانات أساسية"}
-    base["symbol"] = symbol
-    base.update(fetch_finnhub_sentiment(symbol))
-    base.update(fetch_alpha_vantage_news(symbol))
-    base["sources_used"] = [k for k in ["last_close", "alpha_sentiment_avg", "news_count"] if k in base]
-    return base
+    """Assemble the live market_data contract for one symbol.
+
+    Indicators come from ``signals.compute_indicators_from_ohlcv`` — the same
+    implementation the analyst/risk agents expect — over one correctly ordered
+    OHLCV window. Invalid, stale, short or non-finite data fails closed with an
+    ``error`` key (callers must treat that as HOLD / no new entry).
+    """
+    from signals import compute_indicators_from_ohlcv
+
+    df = fetch_ohlcv(symbol)
+    if df is None or df.empty:
+        return {"error": "no market data", "symbol": symbol}
+
+    ind = compute_indicators_from_ohlcv(df)
+    if not ind:
+        return {"error": "invalid or stale market data", "symbol": symbol}
+
+    ind["symbol"] = symbol
+    ind.update(fetch_finnhub_sentiment(symbol))
+    ind.update(fetch_alpha_vantage_news(symbol))
+    ind["sources_used"] = [k for k in ["last_close", "alpha_sentiment_avg", "news_count"] if k in ind]
+    return ind
 
 def _compute_rsi(prices: np.ndarray) -> float:
     deltas = np.diff(prices)

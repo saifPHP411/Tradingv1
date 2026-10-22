@@ -4,10 +4,13 @@ from settings import get_all_settings
 from state import TradingState
 from signals import compute_signal_score
 from safety import get_account_snapshot
-from risk_engine import check_portfolio_exposure
+from risk_engine import check_portfolio_exposure, get_committed_exposure_value
 from regime import get_market_regime
 from news import get_news_sentiment
-from risk_utils import validate_risk_plan, normalize_price_for_symbol
+from risk_utils import (
+    validate_risk_plan, normalize_price_for_symbol,
+    whole_share_qty, can_protect_with_stop,
+)
 import json, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
@@ -136,13 +139,37 @@ def risk_manager_agent(state: TradingState) -> dict:
     if not snap.get("available"):
         return _veto(symbol, f"account data unavailable ({snap.get('reason')})")
 
-    equity = snap.get("equity", 0) or 0
-    buying_power = snap.get("buying_power", 0) or 0
+    acct_equity = snap.get("equity", 0) or 0
+    acct_buying_power = snap.get("buying_power", 0) or 0
 
+    # ---- Risk budget ----
+    # trading_capital > 0 is a HARD test budget. It caps sizing, per-trade risk
+    # and the total committed exposure this process will take, regardless of the
+    # (possibly very large) virtual account equity/buying power. It is a cap on
+    # capital at risk, NOT a synthetic balance substituted for real broker data:
+    # the real account numbers remain an additional, never-relaxed limit
+    # (equity = min(budget, account equity), buying_power likewise).
+    #
+    # Semantics (deterministic, no P&L drift):
+    #   budget            = trading_capital  (a hard exposure cap, constant)
+    #   committed         = market value of currently open positions
+    #   remaining buying  = max(budget - committed, 0)
+    #   per-trade risk    = min(budget, account equity) * max_risk_per_trade * mult
+    # Realized/unrealized P&L never RAISES the budget. Aggregate drawdown is
+    # caught by the daily-loss gate, which is also measured against this budget.
     trading_capital = settings.get("trading_capital", 0) or 0
     if trading_capital > 0:
-        equity = min(equity, trading_capital)
-        buying_power = min(buying_power, trading_capital)
+        committed = get_committed_exposure_value()
+        if committed is None:
+            # Cannot prove remaining budget → fail closed.
+            return _veto(symbol, "open exposure unknown — budget cannot be enforced")
+        remaining = max(trading_capital - committed, 0.0)
+        equity = min(trading_capital, acct_equity) if acct_equity > 0 else trading_capital
+        buying_power = min(remaining, acct_buying_power) \
+            if acct_buying_power > 0 else remaining
+    else:
+        equity = acct_equity
+        buying_power = acct_buying_power
 
     if equity <= 0:
         return _veto(symbol, "equity <= 0")
@@ -171,13 +198,25 @@ def risk_manager_agent(state: TradingState) -> dict:
         stop_price = last + stop_distance
         take_profit = last - target_distance
 
-    pos_size = risk_amount / stop_distance
-    if pos_size <= 0:
+    raw_qty = risk_amount / stop_distance
+    if raw_qty <= 0:
         return _veto(symbol, "position size <= 0")
 
     max_notional = equity * settings["max_position_pct"]
-    if pos_size * last > max_notional:
-        pos_size = max_notional / last
+    if raw_qty * last > max_notional:
+        raw_qty = max_notional / last
+
+    # Whole-share policy: a protective stop requires whole shares at Alpaca.
+    # Floor to whole shares; if the budget cannot fund even one whole share
+    # (with a valid stop) we SKIP the trade rather than fractional-size it or
+    # raise the risk budget.
+    pos_size = whole_share_qty(raw_qty)
+    ok_prot, why_prot = can_protect_with_stop(
+        pos_size, last, stop_price, "buy" if signal == "BUY" else "sell")
+    if not ok_prot:
+        return _veto(symbol, f"cannot protect: {why_prot} "
+                             f"(budget {trading_capital or equity:.2f}, "
+                             f"risk/size {raw_qty:.4f})")
 
     estimated_cost = pos_size * last
     if estimated_cost > buying_power:
@@ -190,7 +229,6 @@ def risk_manager_agent(state: TradingState) -> dict:
         if not exp_ok:
             return _veto(symbol, f"exposure: {exp_reason}")
 
-    pos_size = round(pos_size, 4)
     actual_risk = pos_size * stop_distance
     if actual_risk > risk_amount * 1.05:
         return _veto(symbol, f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}")

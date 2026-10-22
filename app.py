@@ -116,8 +116,14 @@ def dashboard(request: Request):
 @app.get("/api/status")
 def api_status():
     snap = get_account_snapshot()
+    from decision_log import (
+        get_protection_unverified, get_protection_unverified_reason,
+    )
     base = {
         "dry_run": is_dry_run(),
+        "trading_mode": get_all_settings().get("trading_mode"),
+        "protection_unverified": get_protection_unverified(),
+        "protection_unverified_reason": get_protection_unverified_reason(),
         **controller.status(),
     }
 
@@ -249,4 +255,24 @@ async def api_kill_switch(payload: dict):
     reason = str(payload.get("reason", ""))[:200]
     set_kill_switch(active, reason)
     current, current_reason = is_kill_switch_active()
-    return {"active": current, "reason": current_reason}
+    result = {"active": current, "reason": current_reason}
+    # Read-only operator report — does NOT cancel or flatten anything.
+    if current:
+        try:
+            from broker import kill_switch_report
+            result["report"] = kill_switch_report()
+        except Exception as e:
+            result["report"] = {"error": str(e)}
+    return result
+
+
+@app.get("/api/protection")
+def api_protection_status():
+    """Whether new entries are currently blocked by unverified protection."""
+    from decision_log import (
+        get_protection_unverified, get_protection_unverified_reason,
+    )
+    return {
+        "protection_unverified": get_protection_unverified(),
+        "reason": get_protection_unverified_reason(),
+    }

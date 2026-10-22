@@ -85,12 +85,18 @@ def get_account_snapshot() -> dict:
         return {"available": False, "reason": f"api_error:{e}"}
 
 def check_safety_gates() -> tuple[bool, str]:
-    from decision_log import is_kill_switch_active
+    from decision_log import is_kill_switch_active, get_protection_unverified
 
     # 1) Kill switch FIRST — highest priority
     active, reason = is_kill_switch_active()
     if active:
         return False, f"kill_switch_active: {reason or 'manual'}"
+
+    # 1b) An unresolved/unprotected position blocks all new entries.
+    if get_protection_unverified():
+        from decision_log import get_protection_unverified_reason
+        return False, (f"protection_unverified: "
+                       f"{get_protection_unverified_reason() or 'operator action required'}")
 
     # 2) Market hours
     if not is_market_open():
@@ -112,14 +118,30 @@ def check_safety_gates() -> tuple[bool, str]:
 
     settings = get_all_settings()
 
-    # 5) Daily loss
+    # 5) Daily loss — measured against the effective budget so a large virtual
+    #    account balance cannot widen the $ test budget.
+    #
+    #    Limitation (documented, not silently "fixed"): both the day-start
+    #    baseline and the current value are clamped to min(budget, equity), so
+    #    while the paper account equity far exceeds the budget this gate only
+    #    trips when account equity itself falls to/below the budget. It is NOT a
+    #    detector of the process's own realized $ loss; that needs P&L tracking
+    #    from the decision log, which is a larger change than budget clamping.
+    trading_capital = settings.get("trading_capital", 0) or 0
+
+    def _effective_equity(eq: float) -> float:
+        if trading_capital > 0 and eq > 0:
+            return min(trading_capital, eq)
+        return eq
+
+    cur_eff = _effective_equity(snap["equity"])
     dse = get_day_start_equity()
     if dse is None:
-        set_day_start_equity(snap["equity"])
-        dse = snap["equity"]
+        set_day_start_equity(cur_eff)
+        dse = cur_eff
 
     if dse > 0:
-        daily_pnl_pct = (snap["equity"] - dse) / dse
+        daily_pnl_pct = (cur_eff - dse) / dse
         if daily_pnl_pct <= -settings["max_daily_loss_pct"]:
             return False, f"daily loss limit ({daily_pnl_pct:.2%})"
 

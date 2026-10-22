@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
+import math
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 def fetch_ohlcv(symbol: str, period: str = "6mo"):
@@ -144,9 +145,15 @@ def compute_stochastic(highs, lows, closes, period=14, smooth=3):
 def validate_ohlcv(df) -> tuple[bool, str]:
     if df is None or len(df) < 60:
         return False, "insufficient bars"
-    closes = df["Close"].values
-    highs = df["High"].values
-    lows = df["Low"].values
+    for col in ("Close", "High", "Low", "Volume"):
+        if col not in df.columns:
+            return False, f"missing column {col}"
+    closes = df["Close"].values.astype(float)
+    highs = df["High"].values.astype(float)
+    lows = df["Low"].values.astype(float)
+    if not (np.all(np.isfinite(closes)) and np.all(np.isfinite(highs))
+            and np.all(np.isfinite(lows))):
+        return False, "non-finite prices (NaN/Inf)"
     if np.any(closes <= 0) or np.any(highs <= 0) or np.any(lows <= 0):
         return False, "non-positive prices"
     if np.any(highs < lows):
@@ -159,7 +166,7 @@ def validate_ohlcv(df) -> tuple[bool, str]:
     else:
         last_dt = last_ts
     try:
-        now = datetime.now(last_dt.tzinfo) if last_dt.tzinfo else datetime.utcnow()
+        now = datetime.now(last_dt.tzinfo) if last_dt.tzinfo else datetime.now(timezone.utc).replace(tzinfo=None)
         if (now - last_dt) > timedelta(days=5):
             return False, "stale data >5d"
     except Exception:
@@ -167,11 +174,18 @@ def validate_ohlcv(df) -> tuple[bool, str]:
     return True, "ok"
 
 
-def compute_all_indicators(symbol: str):
-    df = fetch_ohlcv(symbol)
+def compute_indicators_from_ohlcv(df) -> dict | None:
+    """Pure: compute the live indicator contract from an OHLCV DataFrame.
+
+    This is the SINGLE implementation used by both the live path
+    (``data_layer.fetch_market_data``) and ``compute_all_indicators`` so the
+    ordering, formulas and bar window can never drift between them. Returns
+    ``None`` when the data is invalid/stale or any required indicator is not a
+    finite number, so callers fail closed.
+    """
     ok, reason = validate_ohlcv(df)
     if not ok:
-        print(f"⚠️ signals[{symbol}]: {reason}")
+        print(f"⚠️ signals: {reason}")
         return None
 
     closes = df["Close"].values.astype(float)
@@ -198,8 +212,7 @@ def compute_all_indicators(symbol: str):
     mom5 = float((closes[-1] / closes[-6] - 1) * 100) if len(closes) >= 6 else 0.0
     mom10 = float((closes[-1] / closes[-11] - 1) * 100) if len(closes) >= 11 else 0.0
 
-    return {
-        "symbol": symbol,
+    ind = {
         "last_close": float(closes[-1]),
         "atr14": round(float(atr), 4),
         "rsi14": round(float(rsi), 2),
@@ -222,6 +235,47 @@ def compute_all_indicators(symbol: str):
         "low_20d": round(float(np.min(lows[-20:])), 2),
         "bars": int(len(closes)),
     }
+
+    ok, reason = validate_indicators(ind)
+    if not ok:
+        print(f"⚠️ signals: {reason}")
+        return None
+    return ind
+
+
+# Keys the analyst/risk agents and the signal scorer require, with the value
+# each must be a finite number. Missing or non-finite ⇒ fail closed.
+REQUIRED_INDICATOR_KEYS = (
+    "last_close", "atr14", "rsi14", "sma20", "sma50", "ema20", "ema50",
+    "macd_hist", "bb_pct_b", "bb_bandwidth", "adx", "stoch_k", "stoch_d",
+    "volume_ratio", "momentum_5d_pct", "momentum_10d_pct",
+)
+
+
+def validate_indicators(ind) -> tuple[bool, str]:
+    """Reject a missing / non-finite indicator contract."""
+    if not isinstance(ind, dict):
+        return False, "indicators not a mapping"
+    for k in REQUIRED_INDICATOR_KEYS:
+        if k not in ind:
+            return False, f"missing indicator {k}"
+        v = ind[k]
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return False, f"non-numeric indicator {k}={v!r}"
+        if not math.isfinite(fv):
+            return False, f"non-finite indicator {k}={v!r}"
+    if ind["last_close"] <= 0:
+        return False, "last_close <= 0"
+    if ind["atr14"] <= 0:
+        return False, "atr14 <= 0"
+    return True, "ok"
+
+
+def compute_all_indicators(symbol: str):
+    df = fetch_ohlcv(symbol)
+    return compute_indicators_from_ohlcv(df)
 
 
 def compute_signal_score(ind: dict, regime: dict | None = None, news: dict | None = None) -> dict:
