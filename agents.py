@@ -27,30 +27,43 @@ def analyst_agent(state: TradingState) -> dict:
     if not data or "atr14" not in data:
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": "no valid indicators", "signal_score": 0},
-            "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة"],
+                               "reason": "no valid indicators", "signal_score": 0,
+                               "diagnostic": {"stage": "input", "llm_called": False}},
+            "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة (LLM not called)"],
         }
 
     settings = get_all_settings()
     regime = get_market_regime() if settings["regime_enabled"] else None
     news = get_news_sentiment(symbol) if settings["news_enabled"] else None
     sig = compute_signal_score(data, regime, news)
+    score_parts = {key: sig.get(key, 0) for key in
+                   ("trend", "momentum", "rsi", "bb", "volume", "news")}
+    regime_name = regime["regime"] if regime else "UNKNOWN"
 
     if sig["score"] < settings["min_signal_score"]:
+        reason = f"signal score below threshold ({sig['score']} < {settings['min_signal_score']})"
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": f"score={sig['score']} < {settings['min_signal_score']}",
-                               "signal_score": sig["score"]},
-            "logs": [f"المحلل[{symbol}]: HOLD — score {sig['score']} < {settings['min_signal_score']}"],
+                               "reason": reason, "signal_score": sig["score"],
+                               "regime": regime_name,
+                               "diagnostic": {"stage": "signal_score", "llm_called": False,
+                                              "threshold": settings["min_signal_score"],
+                                              "score_components": score_parts}},
+            "logs": [f"المحلل[{symbol}]: HOLD — {reason}; components={score_parts}; "
+                     f"regime={regime_name}; LLM not called"],
         }
 
-    regime_name = regime["regime"] if regime else "UNKNOWN"
     if regime_name == "BEAR":
+        reason = "BEAR market — no new longs"
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": "BEAR market — no new longs",
-                               "signal_score": sig["score"]},
-            "logs": [f"المحلل[{symbol}]: HOLD — سوق هابط (BEAR)"],
+                               "reason": reason, "signal_score": sig["score"],
+                               "regime": regime_name,
+                               "diagnostic": {"stage": "regime", "llm_called": False,
+                                              "threshold": settings["min_signal_score"],
+                                              "score_components": score_parts}},
+            "logs": [f"المحلل[{symbol}]: HOLD — {reason}; score={sig['score']}; "
+                     f"LLM not called"],
         }
 
     memory = state.get("memory_context", "")
@@ -86,19 +99,36 @@ def analyst_agent(state: TradingState) -> dict:
 أجب JSON فقط: {{"signal":"BUY"|"SELL"|"HOLD","confidence":0-1,"reason":"سطر واحد"}}"""
 
     report = {"signal": "HOLD", "confidence": 0.0, "reason": "LLM invalid"}
+    llm_attempts = 0
+    llm_status = "invalid_response"
+    llm_error_type = None
     for attempt in range(2):
+        llm_attempts += 1
         try:
             suffix = "\n\nJSON فقط." if attempt else ""
             resp = llm.invoke(prompt + suffix)
             report = _parse_llm_json(resp.content)
             if report.get("signal") in ("BUY", "SELL", "HOLD") and report.get("confidence", 0) > 0:
+                llm_status = "success"
                 break
         except Exception as e:
-            report = {"signal": "HOLD", "confidence": 0.0, "reason": f"LLM err: {e}"}
+            # Do not copy exception text into reports/logs: HTTP clients may
+            # include URLs, headers, or other credential-bearing details.
+            llm_status = "error"
+            llm_error_type = type(e).__name__
+            report = {"signal": "HOLD", "confidence": 0.0,
+                      "reason": "LLM request failed"}
 
     report["signal_score"] = sig["score"]
     report["regime"] = regime_name
     report["agent"] = "analyst"
+    report["diagnostic"] = {"stage": "llm", "llm_called": True,
+                            "threshold": settings["min_signal_score"],
+                            "score_components": score_parts,
+                            "llm_attempts": llm_attempts,
+                            "llm_status": llm_status}
+    if llm_error_type:
+        report["diagnostic"]["llm_error_type"] = llm_error_type
     log = (f"المحلل[{symbol}]: {report.get('signal')} "
            f"conf={report.get('confidence', 0):.2f} "
            f"score={sig['score']} regime={regime_name}")
