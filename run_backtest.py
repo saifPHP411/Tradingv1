@@ -27,6 +27,20 @@ def _engine_settings(max_hold_bars=None, enable_short=None):
     return s
 
 
+def _print_monte_carlo(mc: dict):
+    """Print Monte Carlo results, handling the zero-trade 'error' payload."""
+    print("\n=== Monte Carlo (1000 shuffles) ===")
+    if "error" in mc:
+        print(f"  skipped: {mc['error']}")
+        return
+    print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
+    print(f"  Final equity P5:     ${mc['final_equity']['p5']:.2f}")
+    print(f"  Final equity P95:    ${mc['final_equity']['p95']:.2f}")
+    print(f"  Max DD median:       {mc['max_drawdown_pct']['median']:.2f}%")
+    print(f"  Max DD P95:          {mc['max_drawdown_pct']['p95']:.2f}%")
+    print(f"  Prob. of ruin:       {mc['probability_of_ruin_pct']:.2f}%")
+
+
 def run_single(symbol: str, start: str, end: str, initial: float,
                settings=None, max_hold_bars=None):
     print(f"🔄 Loading {symbol} from {start} to {end}...")
@@ -44,13 +58,7 @@ def run_single(symbol: str, start: str, end: str, initial: float,
     print(f"📁 Report saved: {path}")
     save_run(symbol, start, end, {}, metrics)
     mc = run_monte_carlo(result["trades"], initial, n_sims=1000)
-    print("\n=== Monte Carlo (1000 shuffles) ===")
-    print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
-    print(f"  Final equity P5:     ${mc['final_equity']['p5']:.2f}")
-    print(f"  Final equity P95:    ${mc['final_equity']['p95']:.2f}")
-    print(f"  Max DD median:       {mc['max_drawdown_pct']['median']:.2f}%")
-    print(f"  Max DD P95:          {mc['max_drawdown_pct']['p95']:.2f}%")
-    print(f"  Prob. of ruin:       {mc['probability_of_ruin_pct']:.2f}%")
+    _print_monte_carlo(mc)
     return result, metrics
 
 
@@ -96,13 +104,7 @@ def run_portfolio(symbols: list[str], start: str, end: str, initial: float,
     path = save_report(result, metrics, "portfolio")
     print(f"📁 Report saved: {path}")
     mc = run_monte_carlo(result["trades"], initial, n_sims=1000)
-    print("\n=== Monte Carlo (1000 shuffles) ===")
-    print(f"  Final equity median: ${mc['final_equity']['median']:.2f}")
-    print(f"  Final equity P5:     ${mc['final_equity']['p5']:.2f}")
-    print(f"  Final equity P95:    ${mc['final_equity']['p95']:.2f}")
-    print(f"  Max DD median:       {mc['max_drawdown_pct']['median']:.2f}%")
-    print(f"  Max DD P95:          {mc['max_drawdown_pct']['p95']:.2f}%")
-    print(f"  Prob. of ruin:       {mc['probability_of_ruin_pct']:.2f}%")
+    _print_monte_carlo(mc)
 
 
 def main():

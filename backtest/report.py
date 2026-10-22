@@ -6,6 +6,12 @@ REPORT_DIR = Path("backtest_reports")
 REPORT_DIR.mkdir(exist_ok=True)
 
 
+def _fmt_profit_factor(metrics: dict) -> str:
+    """Human-readable profit factor; 'N/A' when undefined (None or missing)."""
+    pf = metrics.get("profit_factor")
+    return "N/A" if pf is None else f"{pf}"
+
+
 def save_report(result: dict, metrics: dict, name: str) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = REPORT_DIR / f"{name}_{ts}.json"
@@ -28,6 +34,13 @@ def print_summary(result: dict, metrics: dict):
     print(f"{'='*60}")
     print(f"Start Equity: ${result.get('start_equity', 0):,.2f}")
     print(f"End Equity: ${result.get('end_equity', 0):,.2f}")
+    raw_final = metrics.get("final_equity_raw")
+    if raw_final is not None and raw_final < 0:
+        print(f"⚠️ FINAL EQUITY BELOW ZERO: ${raw_final:,.2f} "
+              f"(account balance is negative; return capped at -100%)")
+    elif metrics.get("equity_ruined"):
+        print("⚠️ ACCOUNT RUINED: equity reached zero "
+              "(reported final equity floored at $0.00)")
     print(f"Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"CAGR: {metrics.get('cagr_pct', 0):+.2f}%")
     print(f"Max Drawdown: {metrics.get('max_drawdown_pct', 0):.2f}%")
@@ -37,7 +50,7 @@ def print_summary(result: dict, metrics: dict):
     print(f"{'─'*60}")
     print(f"Trades: {metrics.get('num_trades', 0)}")
     print(f"Win Rate: {metrics.get('win_rate_pct', 0):.1f}%")
-    print(f"Profit Factor: {metrics.get('profit_factor', 'N/A')}")
+    print(f"Profit Factor: {_fmt_profit_factor(metrics)}")
     print(f"Expectancy: ${metrics.get('expectancy', 0):.2f}")
     print(f"Avg R: {metrics.get('avg_r_multiple', 0):.2f}R")
     print(f"Max Consec Losses: {metrics.get('max_consecutive_losses', 0)}")
@@ -54,11 +67,18 @@ def print_portfolio_summary(symbols: list[str], result: dict, metrics: dict):
     print(f"{'='*60}")
     print(f"Start Equity: ${result.get('start_equity', 0):,.2f}")
     print(f"End Equity: ${result.get('end_equity', 0):,.2f}")
+    raw_final = metrics.get("final_equity_raw")
+    if raw_final is not None and raw_final < 0:
+        print(f"⚠️ FINAL EQUITY BELOW ZERO: ${raw_final:,.2f} "
+              f"(account balance is negative; return capped at -100%)")
+    elif metrics.get("equity_ruined"):
+        print("⚠️ ACCOUNT RUINED: equity reached zero "
+              "(reported final equity floored at $0.00)")
     print(f"Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"Max Drawdown: {metrics.get('max_drawdown_pct', 0):.2f}%")
     print(f"Sharpe: {metrics.get('sharpe', 0):.2f}")
     print(f"Sortino: {metrics.get('sortino', 0):.2f}")
-    print(f"Profit Factor: {metrics.get('profit_factor', 'N/A')}")
+    print(f"Profit Factor: {_fmt_profit_factor(metrics)}")
     print(f"Win Rate: {metrics.get('win_rate_pct', 0):.1f}%")
     print(f"Avg R: {metrics.get('avg_r_multiple', 0):.2f}R")
     print(f"Trades: {metrics.get('num_trades', 0)}")

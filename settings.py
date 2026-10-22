@@ -92,6 +92,16 @@ def _migrate_if_needed():
     If persistent settings came from SETTINGS_VERSION < 2, overwrite
     every risk-critical key with the new config defaults and drop legacy keys.
     This prevents old DB values from silently overriding new risk model.
+
+    Migration semantics (intentional, tested in tests/test_phase1_6_remediation.py):
+      - The risk-critical keys listed below are FORCED back to the current
+        config defaults on a version bump, so an operator-tuned value is
+        deliberately discarded when the risk model changes. The keys that are
+        NOT in that list (max_open_positions, max_trades_per_day,
+        max_daily_loss_pct) are preserved.
+      - Legacy percentage keys are blanked so the monitor cannot read them.
+      - The migration is idempotent: once the stored version equals
+        SETTINGS_VERSION, only missing defaults are filled.
     """
     raw = get_trading_state(_VERSION_KEY)
     current = int(raw) if raw and raw.isdigit() else 1
