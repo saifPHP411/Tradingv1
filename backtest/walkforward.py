@@ -248,8 +248,10 @@ def aggregate_walkforward(results: list[dict]) -> dict:
         aggregation.
       - ``total_return_pct`` absent, non-numeric, NaN, +inf or -inf.
       - ``total_return_pct < -100%``: impossible for a cash-secured account.
-        It is recorded as invalid and clamped to -100% for compounding only so
-        ``(1 + r)`` can never go negative and flip the product's sign.
+        It is recorded as invalid. Its clamped value (-100%) is used **only**
+        for the compounded-return product, so ``(1 + r)`` can never go negative
+        and flip the product's sign; it does not enter the valid-window
+        statistics (average, std, sharpe, positive/negative counts).
       - ``total_return_pct == -100%`` is valid and means a ruined account.
 
     A non-numeric ``num_trades`` on an invalid window is treated as 0 rather
@@ -314,17 +316,23 @@ def aggregate_walkforward(results: list[dict]) -> dict:
                                     "value": ret})
             ret = -100.0
             total_trades_invalid += n_trades
+            stat_eligible = False
         else:
             # Valid window: its trades count toward the aggregate.
             total_trades += n_trades
+            stat_eligible = True
 
-        all_returns.append(ret)
-        sharpe = m.get("sharpe", 0)
-        try:
-            sharpe = float(sharpe)
-        except (TypeError, ValueError):
-            sharpe = 0.0
-        all_sharpes.append(sharpe if math.isfinite(sharpe) else 0.0)
+        # Statistics describe VALID windows only. An invalid clamped window
+        # still participates in compounding below, but must not enter the
+        # valid-window population (avg/std/sharpe, positive/negative counts).
+        if stat_eligible:
+            all_returns.append(ret)
+            sharpe = m.get("sharpe", 0)
+            try:
+                sharpe = float(sharpe)
+            except (TypeError, ValueError):
+                sharpe = 0.0
+            all_sharpes.append(sharpe if math.isfinite(sharpe) else 0.0)
         compounded *= (1.0 + ret / 100.0)
 
     cumulative_return_pct = (compounded - 1.0) * 100.0
