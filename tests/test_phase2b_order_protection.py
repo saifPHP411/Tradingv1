@@ -323,6 +323,45 @@ def test_sync_positions_fetch_failure_fails_closed(monkeypatch):
         decision_log.set_protection_unverified(False)
 
 
+def test_sync_positions_keeps_unverified_when_emergency_close_fails(monkeypatch):
+    import monitor
+    import decision_log
+
+    class Pos:
+        symbol = "AAPL"
+        qty = "5"
+        side = type("S", (), {"value": "long"})()
+        avg_entry_price = "100"
+        current_price = "100"
+        unrealized_plpc = "0"
+
+    class Client:
+        def get_all_positions(self):
+            return [Pos()]
+        def get_orders(self, *a, **k):
+            return []
+
+    monkeypatch.setattr(monitor, "_alpaca", lambda: Client())
+    monkeypatch.setattr(monitor, "get_position_state", lambda s: {"atr": 1})
+    deleted = []
+    monkeypatch.setattr(monitor, "delete_position_state", lambda sym: deleted.append(sym))
+    import broker
+    import safety
+    monkeypatch.setattr(safety, "is_market_open", lambda: True)
+    monkeypatch.setattr(broker, "_emergency_close_and_verify", lambda sym: False)
+    monkeypatch.setattr(broker, "_submit_stop", lambda **kwargs: None)
+
+    import signals
+    monkeypatch.setattr(signals, "compute_all_indicators", lambda s: None)
+    decision_log.set_protection_unverified(False)
+    try:
+        out = monitor._sync_positions()
+        assert decision_log.get_protection_unverified() is True
+        assert out == []
+        assert deleted == [], 'position state must not be deleted when emergency close is unverified'
+    finally:
+        decision_log.set_protection_unverified(False)
+
 def test_sync_positions_does_not_clear_flag_when_unresolved(monkeypatch):
     # A symbol whose protection cannot be reconstructed must keep the flag set
     # (the end-of-sync clear must not run while anything is unresolved).
