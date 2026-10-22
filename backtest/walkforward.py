@@ -20,28 +20,47 @@ Aggregate:
 """
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
+import math
 import pandas as pd
 
 from backtest.data import load_ohlcv, load_multi, get_spy_for_period
 from backtest.engine import simulate, simulate_portfolio
 from backtest.metrics import calculate_metrics
+from settings import get_all_settings
 
 
 WARMUP_DAYS = 200
 
 
+def _naive_ts(x):
+    """Normalize any timestamp-like value to a naive UTC pandas Timestamp.
+
+    Data is normalized to naive UTC by backtest.data; walk-forward window
+    boundaries are built from naive datetimes. Normalizing here keeps both
+    sides comparable even if a caller passes a tz-aware boundary.
+    """
+    t = pd.Timestamp(x)
+    if t.tz is not None:
+        t = t.tz_convert("UTC").tz_localize(None)
+    return t
+
+
 def _filter_to_window(equity_curve: list, trades: list, test_start_ts):
     """Keep only the test-window portion of the result."""
-    curve = [p for p in equity_curve if pd.Timestamp(p["time"]) >= test_start_ts]
+    start = _naive_ts(test_start_ts)
+    curve = [p for p in equity_curve if _naive_ts(p["time"]) >= start]
     trade_list = [
         t for t in trades
-        if pd.Timestamp(t["entry_time"]) >= test_start_ts
+        if _naive_ts(t["entry_time"]) >= start
     ]
     return curve, trade_list
 
 
 def walk_forward(symbol: str, start_date: str, end_date: str,
-                 train_months: int = 12, test_months: int = 3) -> list[dict]:
+                 train_months: int = 12, test_months: int = 3,
+                 initial_equity: float = 10000.0,
+                 max_hold_bars: int | None = None,
+                 settings: dict | None = None) -> list[dict]:
     """Single-symbol rolling OOS evaluation (legacy, kept for compatibility)."""
     results = []
     cur = datetime.fromisoformat(start_date)
@@ -65,13 +84,14 @@ def walk_forward(symbol: str, start_date: str, end_date: str,
         test_start_ts = pd.Timestamp(test_start)
 
         full_result = simulate(
-            symbol, df, spy_df, start_equity=10000.0,
+            symbol, df, spy_df, start_equity=initial_equity,
             trading_start_ts=test_start_ts,
+            max_hold_bars=max_hold_bars, settings=settings,
         )
         curve, trades = _filter_to_window(
             full_result["equity_curve"], full_result["trades"], test_start_ts
         )
-        metrics = calculate_metrics(curve, trades, 10000.0)
+        metrics = calculate_metrics(curve, trades, initial_equity)
 
         results.append({
             "window": f"{test_start.date()}_to_{test_end.date()}",
@@ -88,7 +108,10 @@ def walk_forward(symbol: str, start_date: str, end_date: str,
 
 def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
                            train_months: int = 12,
-                           test_months: int = 3) -> list[dict]:
+                           test_months: int = 3,
+                           initial_equity: float = 10000.0,
+                           max_hold_bars: int | None = None,
+                           settings: dict | None = None) -> list[dict]:
     """
     Portfolio rolling OOS evaluation.
     Each window shares cash/equity/exposure via simulate_portfolio.
@@ -115,13 +138,14 @@ def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
         test_start_ts = pd.Timestamp(test_start)
 
         full_result = simulate_portfolio(
-            data, spy, start_equity=10000.0,
+            data, spy, start_equity=initial_equity,
             trading_start_ts=test_start_ts,
+            max_hold_bars=max_hold_bars, settings=settings,
         )
         curve, trades = _filter_to_window(
             full_result["equity_curve"], full_result["trades"], test_start_ts
         )
-        metrics = calculate_metrics(curve, trades, 10000.0)
+        metrics = calculate_metrics(curve, trades, initial_equity)
 
         results.append({
             "window": f"{test_start.date()}_to_{test_end.date()}",
@@ -137,30 +161,76 @@ def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
 
 
 def aggregate_walkforward(results: list[dict]) -> dict:
+    """
+    Compound per-window returns into a single cumulative figure.
+
+    Per-window returns are validated before compounding:
+      - NaN / +inf / -inf are rejected (a window whose equity curve was
+        degenerate must not silently poison the cumulative result).
+      - a return below -100% is impossible for a cash-secured account and is
+        treated as a complete loss (-100%), never as a negative multiplier
+        that would flip the sign of the cumulative product.
+
+    Rejected windows are reported in `invalid_windows` rather than dropped
+    silently.
+    """
     if not results:
         return {"error": "no windows"}
     import numpy as np
     total_trades = 0
     all_returns: list[float] = []
     all_sharpes: list[float] = []
+    invalid_windows: list[dict] = []
     compounded = 1.0
-    for r in results:
-        m = r["metrics"]
-        total_trades += m.get("num_trades", 0)
-        ret = float(m.get("total_return_pct", 0))
+    for idx, r in enumerate(results):
+        m = r.get("metrics", {}) or {}
+        total_trades += m.get("num_trades", 0) or 0
+
+        raw_ret = m.get("total_return_pct", 0)
+        try:
+            ret = float(raw_ret)
+        except (TypeError, ValueError):
+            ret = float("nan")
+
+        if not math.isfinite(ret):
+            invalid_windows.append({"window": r.get("window", idx),
+                                    "reason": "non-finite total_return_pct",
+                                    "value": raw_ret})
+            continue
+
+        if ret < -100.0:
+            # A cash-secured account cannot lose more than 100%. Clamp rather
+            # than let (1 + r) go negative and flip the product's sign.
+            invalid_windows.append({"window": r.get("window", idx),
+                                    "reason": "return below -100%; clamped",
+                                    "value": ret})
+            ret = -100.0
+
         all_returns.append(ret)
-        all_sharpes.append(float(m.get("sharpe", 0)))
+        sharpe = m.get("sharpe", 0)
+        try:
+            sharpe = float(sharpe)
+        except (TypeError, ValueError):
+            sharpe = 0.0
+        all_sharpes.append(sharpe if math.isfinite(sharpe) else 0.0)
         compounded *= (1.0 + ret / 100.0)
 
     cumulative_return_pct = (compounded - 1.0) * 100.0
 
-    return {
+    out = {
         "num_windows": len(results),
+        "num_valid_windows": len(all_returns),
         "total_trades": total_trades,
         "cumulative_return_pct": round(cumulative_return_pct, 2),
-        "avg_return_per_window": round(float(np.mean(all_returns)), 2),
-        "std_return_per_window": round(float(np.std(all_returns)), 2),
-        "avg_sharpe": round(float(np.mean(all_sharpes)), 2),
+        "avg_return_per_window": (round(float(np.mean(all_returns)), 2)
+                                  if all_returns else 0.0),
+        "std_return_per_window": (round(float(np.std(all_returns)), 2)
+                                  if all_returns else 0.0),
+        "avg_sharpe": (round(float(np.mean(all_sharpes)), 2)
+                       if all_sharpes else 0.0),
         "positive_windows": sum(1 for r in all_returns if r > 0),
         "negative_windows": sum(1 for r in all_returns if r < 0),
-                   }
+    }
+    if invalid_windows:
+        out["invalid_windows"] = invalid_windows
+    return out
