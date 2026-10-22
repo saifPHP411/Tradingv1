@@ -28,7 +28,10 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
 
     # A cash-secured account cannot lose more than 100% of its capital, so
     # floor the terminal equity at zero when computing return-based metrics.
-    final_equity = max(float(values[-1]), 0.0)
+    # Keep the RAW terminal equity too: when SHORT losses exceed capital the
+    # real balance can be negative, and reporting 0 would conceal that.
+    final_equity_raw = float(values[-1])
+    final_equity = max(final_equity_raw, 0.0)
     total_return_pct = ((final_equity / initial_equity - 1) * 100
                         if initial_equity > 0 else 0.0)
 
@@ -72,7 +75,9 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
             "calmar": round(float(calmar), 2),
             "num_trades": 0,
             "equity_ruined": equity_ruined,
+            "negative_equity": bool(final_equity_raw < 0),
             "final_equity": round(final_equity, 2),
+            "final_equity_raw": round(final_equity_raw, 2),
         }
 
     pnls = [t["net_pnl"] for t in trades]
@@ -133,5 +138,7 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
         "total_fees": round(float(total_fees), 2),
         "total_slippage": round(float(total_slip), 2),
         "final_equity": round(final_equity, 2),
+        "final_equity_raw": round(final_equity_raw, 2),
         "equity_ruined": equity_ruined,
+        "negative_equity": bool(final_equity_raw < 0),
     }

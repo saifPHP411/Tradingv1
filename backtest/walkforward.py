@@ -45,14 +45,32 @@ def _naive_ts(x):
     return t
 
 
-def _filter_to_window(equity_curve: list, trades: list, test_start_ts):
-    """Keep only the test-window portion of the result."""
+def _filter_to_window(equity_curve: list, trades: list, test_start_ts,
+                      test_end_ts=None):
+    """Keep only the test-window portion of the result.
+
+    Interval convention: OOS windows are **half-open** ``[start, end)`` so a
+    timestamp on the shared boundary between two adjacent windows belongs to
+    exactly one window and is never double counted. The walk-forward driver
+    passes ``test_end_ts=None`` for the final window, which means "no upper
+    bound": there is no subsequent window to own that boundary, so the final
+    data point must not be discarded.
+
+    Comparisons are timezone-safe (both sides normalized to naive UTC).
+    """
     start = _naive_ts(test_start_ts)
-    curve = [p for p in equity_curve if _naive_ts(p["time"]) >= start]
-    trade_list = [
-        t for t in trades
-        if _naive_ts(t["entry_time"]) >= start
-    ]
+    end = _naive_ts(test_end_ts) if test_end_ts is not None else None
+
+    def _in_window(t) -> bool:
+        t = _naive_ts(t)
+        if t < start:
+            return False
+        if end is not None and t >= end:
+            return False
+        return True
+
+    curve = [p for p in equity_curve if _in_window(p["time"])]
+    trade_list = [t for t in trades if _in_window(t["entry_time"])]
     return curve, trade_list
 
 
@@ -83,13 +101,21 @@ def walk_forward(symbol: str, start_date: str, end_date: str,
         spy_df = get_spy_for_period(load_start, test_end.strftime("%Y-%m-%d"))
         test_start_ts = pd.Timestamp(test_start)
 
+        # Adjacent OOS windows share a boundary date. Use half-open intervals
+        # [test_start, test_end) so the shared boundary belongs to the NEXT
+        # window only. The final window has no successor, so it is open-ended
+        # and keeps the last data point.
+        is_last_window = (test_end + relativedelta(months=test_months)) > end
+        test_end_ts = None if is_last_window else pd.Timestamp(test_end)
+
         full_result = simulate(
             symbol, df, spy_df, start_equity=initial_equity,
             trading_start_ts=test_start_ts,
             max_hold_bars=max_hold_bars, settings=settings,
         )
         curve, trades = _filter_to_window(
-            full_result["equity_curve"], full_result["trades"], test_start_ts
+            full_result["equity_curve"], full_result["trades"],
+            test_start_ts, test_end_ts,
         )
         metrics = calculate_metrics(curve, trades, initial_equity)
 
@@ -137,13 +163,19 @@ def walk_forward_portfolio(symbols: list[str], start_date: str, end_date: str,
         spy = get_spy_for_period(load_start, test_end.strftime("%Y-%m-%d"))
         test_start_ts = pd.Timestamp(test_start)
 
+        # Half-open [test_start, test_end) windows; the final window is
+        # open-ended so the last data point is retained (see _filter_to_window).
+        is_last_window = (test_end + relativedelta(months=test_months)) > end
+        test_end_ts = None if is_last_window else pd.Timestamp(test_end)
+
         full_result = simulate_portfolio(
             data, spy, start_equity=initial_equity,
             trading_start_ts=test_start_ts,
             max_hold_bars=max_hold_bars, settings=settings,
         )
         curve, trades = _filter_to_window(
-            full_result["equity_curve"], full_result["trades"], test_start_ts
+            full_result["equity_curve"], full_result["trades"],
+            test_start_ts, test_end_ts,
         )
         metrics = calculate_metrics(curve, trades, initial_equity)
 
@@ -164,29 +196,40 @@ def aggregate_walkforward(results: list[dict]) -> dict:
     """
     Compound per-window returns into a single cumulative figure.
 
-    Per-window returns are validated before compounding:
-      - NaN / +inf / -inf are rejected (a window whose equity curve was
-        degenerate must not silently poison the cumulative result).
-      - a return below -100% is impossible for a cash-secured account and is
-        treated as a complete loss (-100%), never as a negative multiplier
-        that would flip the sign of the cumulative product.
+    Validity rule (single, explicit): a window is **valid** only if its
+    ``metrics`` is a mapping that contains a numeric, finite
+    ``total_return_pct``. Everything else is an **invalid** window and
+    contributes NOTHING to the aggregate — neither to the compounded return,
+    nor to the trade count, nor to the averages.
 
-    Rejected windows are reported in `invalid_windows` rather than dropped
-    silently.
+    Invalid cases:
+      - ``metrics`` missing / not a mapping (e.g. ``{"error": "no data"}`` has
+        no ``total_return_pct`` key).
+      - ``total_return_pct`` absent, non-numeric, NaN, +inf or -inf.
+      - ``total_return_pct < -100%``: impossible for a cash-secured account.
+        It is recorded as invalid and clamped to -100% for compounding only so
+        ``(1 + r)`` can never go negative and flip the product's sign.
+      - ``total_return_pct == -100%`` is valid and means a ruined account.
+
+    Invalid windows are reported in ``invalid_windows`` (never dropped
+    silently), and ``num_invalid_windows`` / ``total_trades_invalid_windows``
+    are surfaced so the exclusion is visible rather than implied.
     """
     if not results:
         return {"error": "no windows"}
     import numpy as np
     total_trades = 0
+    total_trades_invalid = 0
     all_returns: list[float] = []
     all_sharpes: list[float] = []
     invalid_windows: list[dict] = []
     compounded = 1.0
     for idx, r in enumerate(results):
         m = r.get("metrics", {}) or {}
-        total_trades += m.get("num_trades", 0) or 0
+        n_trades = m.get("num_trades", 0) or 0
 
-        raw_ret = m.get("total_return_pct", 0)
+        # A window is valid only if it carries a numeric finite return.
+        raw_ret = m.get("total_return_pct", None)
         try:
             ret = float(raw_ret)
         except (TypeError, ValueError):
@@ -194,17 +237,23 @@ def aggregate_walkforward(results: list[dict]) -> dict:
 
         if not math.isfinite(ret):
             invalid_windows.append({"window": r.get("window", idx),
-                                    "reason": "non-finite total_return_pct",
+                                    "reason": "missing or non-finite total_return_pct",
                                     "value": raw_ret})
+            total_trades_invalid += n_trades
             continue
 
         if ret < -100.0:
-            # A cash-secured account cannot lose more than 100%. Clamp rather
-            # than let (1 + r) go negative and flip the product's sign.
+            # A cash-secured account cannot lose more than 100%. Clamp for
+            # compounding rather than let (1 + r) go negative and flip the
+            # product's sign. The window is reported invalid.
             invalid_windows.append({"window": r.get("window", idx),
                                     "reason": "return below -100%; clamped",
                                     "value": ret})
             ret = -100.0
+            total_trades_invalid += n_trades
+        else:
+            # Valid window: its trades count toward the aggregate.
+            total_trades += n_trades
 
         all_returns.append(ret)
         sharpe = m.get("sharpe", 0)
@@ -219,8 +268,10 @@ def aggregate_walkforward(results: list[dict]) -> dict:
 
     out = {
         "num_windows": len(results),
-        "num_valid_windows": len(all_returns),
+        "num_valid_windows": len(results) - len(invalid_windows),
+        "num_invalid_windows": len(invalid_windows),
         "total_trades": total_trades,
+        "total_trades_invalid_windows": total_trades_invalid,
         "cumulative_return_pct": round(cumulative_return_pct, 2),
         "avg_return_per_window": (round(float(np.mean(all_returns)), 2)
                                   if all_returns else 0.0),

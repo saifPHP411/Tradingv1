@@ -55,6 +55,25 @@ Execution realism:
 Strategy vs execution:
     - Strategy is LONG-only by design (enable_short defaults to 0).
     - Execution engine is LONG and SHORT capable.
+
+Live-only settings (NOT applied by this backtester):
+    Several keys in the shared settings dict exist for the live/paper
+    monitor and agents and have NO backtest equivalent. They are accepted
+    (so run_backtest.py does not crash) but deliberately ignored here:
+      - min_confidence, llm_exit_min_confidence: LLM confidence gates.
+      - min_hold_minutes, min_loss_to_close_pct: live exit-agent noise
+        filters (the backtest exit model is stop/target/trailing/max_hold).
+      - min_stop_move_pct: minimum trailing-stop move; the backtest trails
+        on every bar that satisfies the activation rule.
+      - allow_extended_hours, cycle_interval_minutes, exit_check_seconds,
+        exit_llm_interval_seconds: live session/polling cadence.
+      - trading_capital: live sizing override.
+    regime_enabled/news_enabled exist in settings, but the backtest always
+    computes regime from SPY (no news is used: historical news is
+    unavailable and using it would risk lookahead). Do not add future news
+    or LLM predictions to historical backtests.
+    This means backtest and live results are NOT expected to match exactly;
+    this engine models the mechanical risk/exit rules, not the LLM overlay.
 """
 from __future__ import annotations
 
@@ -278,15 +297,38 @@ class PortfolioState:
             return False, "max_trades_per_day"
         if len(self.positions) >= s["max_open_positions"]:
             return False, "max_open_positions"
-        if self.daily_start_equity > 0:
-            eq = self.equity(prices)
-            daily_pnl = (eq - self.daily_start_equity) / self.daily_start_equity
-            if daily_pnl <= -s["max_daily_loss_pct"]:
-                return False, "daily_loss"
+        # Fail closed on an already-ruined account. A non-positive daily start
+        # equity means the account had no capital to protect at the start of
+        # the session, so the daily-loss ratio is undefined. Previously the
+        # check was skipped and new entries were allowed. This gate only blocks
+        # NEW entries; position management/exits are driven separately in the
+        # bar loop and are unaffected.
+        if self.daily_start_equity <= 0:
+            return False, "ruined_account"
+        eq = self.equity(prices)
+        daily_pnl = (eq - self.daily_start_equity) / self.daily_start_equity
+        if daily_pnl <= -s["max_daily_loss_pct"]:
+            return False, "daily_loss"
         return True, "ok"
 
     def can_open(self, entry_notional: float, entry_fees: float,
-                 side: str = "long") -> tuple[bool, str]:
+                 side: str = "long",
+                 equity: float | None = None) -> tuple[bool, str]:
+        """
+        Capital check for a new position.
+
+        ``equity`` (optional) is the marked-to-market portfolio equity at the
+        decision point. When supplied and non-positive, no new position may be
+        opened: a cash-secured account that has been wiped out (or driven
+        negative by a short loss) must not take on fresh risk even if
+        available_cash still looks positive. Callers that omit ``equity`` keep
+        the legacy cash-only behaviour.
+        """
+        if equity is not None and equity <= 0:
+            return False, (
+                f"non_positive_equity (equity={equity:.2f}; "
+                f"available={self.available_cash:.2f})"
+            )
         available = self.available_cash
         required = entry_notional + entry_fees
         if available < required:
@@ -458,6 +500,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
     cursors = {sym: 0 for sym in symbols_data}
     pending = {sym: None for sym in symbols_data}
+    # Entries rejected for a non-positive derived stop/target. Exposed in the
+    # result so a malformed gap is observable instead of silently skipped.
+    rejections: list[dict] = []
     last_prices: dict[str, float] = {}
     # Prices known at the CURRENT bar's open = the last completed bar's close.
     # Execution-time risk gates must use these, not this bar's close, or the
@@ -516,13 +561,48 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 target_price = fill_price - p["target_dist"]
                 side = SHORT
 
+            # A bar can gap far enough that the derived stop or target is zero
+            # or negative. Such a price is not a valid protection level, and
+            # normalize_price_for_symbol() would raise ValueError and abort the
+            # whole backtest. Reject this one entry and keep simulating; never
+            # clamp a nonsensical level to an arbitrary positive number.
+            if stop_price <= 0 or target_price <= 0:
+                rejections.append({
+                    "symbol": sym, "time": ts, "reason": "invalid_stop_or_target",
+                    "fill_price": round(fill_price, 6),
+                    "stop_price": round(stop_price, 6),
+                    "target_price": round(target_price, 6),
+                })
+                print(f"⚠️ backtest: {sym} entry rejected at {ts} — "
+                      f"non-positive stop/target (stop={stop_price:.4f}, "
+                      f"target={target_price:.4f}, fill={fill_price:.4f})")
+                pending[sym] = None
+                continue
+
             stop_price = normalize_price_for_symbol(sym, stop_price)
             target_price = normalize_price_for_symbol(sym, target_price)
+            # Tick rounding can collapse a tiny positive level to zero; that is
+            # equally invalid, so reject it rather than open an unprotected
+            # position.
+            if stop_price <= 0 or target_price <= 0:
+                rejections.append({
+                    "symbol": sym, "time": ts,
+                    "reason": "invalid_stop_or_target_after_rounding",
+                    "fill_price": round(fill_price, 6),
+                    "stop_price": round(stop_price, 6),
+                    "target_price": round(target_price, 6),
+                })
+                print(f"⚠️ backtest: {sym} entry rejected at {ts} — "
+                      f"stop/target rounded to non-positive "
+                      f"(stop={stop_price:.4f}, target={target_price:.4f})")
+                pending[sym] = None
+                continue
             qty = p["qty"]
             entry_notional = qty * fill_price
             entry_fees = qty * settings["fees_per_share"]
 
-            ok, _ = state.can_open(entry_notional, entry_fees, side)
+            ok, _ = state.can_open(entry_notional, entry_fees, side,
+                                   equity=state.equity(gate_prices))
             if not ok:
                 pending[sym] = None
                 continue
@@ -748,6 +828,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         "equity_curve": state.equity_curve,
         "final_positions": len(state.positions),
         "total_fees_paid": round(state.fees_paid, 2),
+        "rejections": rejections,
     }
 
 
