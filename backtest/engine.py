@@ -442,7 +442,8 @@ def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
     with naive window boundaries. Non-datetime indices are returned unchanged.
     Sorting here also protects direct callers of ``simulate_portfolio`` that
     bypass ``backtest.data._normalize``: indicator windows must contain only
-    bars at or before the timestamp being evaluated.
+    bars at or before the timestamp being evaluated. Duplicate timestamps are
+    dropped (first kept) for the same reason, so ``df.loc[ts]`` returns one bar.
     """
     if df is None:
         return None
@@ -454,6 +455,12 @@ def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
         out = df
     if not out.index.is_monotonic_increasing:
         out = out.sort_index(kind="stable")
+    # Drop duplicate timestamps (keep the first) so ``df.loc[ts]`` yields a
+    # scalar bar instead of a Series. Same policy as ``backtest.data._normalize``;
+    # the stable sort above preserves original order among equal keys, so the
+    # kept "first" row is the one _normalize would have kept too.
+    if not out.index.is_unique:
+        out = out[~out.index.duplicated(keep="first")]
     return out
 
 
