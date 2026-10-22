@@ -76,13 +76,13 @@ def _sync_positions() -> list:
     stops_by_symbol = {}
     for o in open_orders:
         try:
-            otype = str(o.order_type).lower() if o.order_type else ""
+            otype = str(getattr(o.order_type, "value", o.order_type)).lower() if o.order_type else ""
             if "stop" in otype:
                 stops_by_symbol.setdefault(o.symbol, []).append({
                     "id": str(o.id),
                     "stop_price": float(o.stop_price) if o.stop_price else None,
                     "qty": float(o.qty) if o.qty else 0,
-                    "side": str(o.side).lower() if o.side else None,
+                    "side": str(getattr(o.side, "value", o.side)).lower() if o.side else None,
                 })
         except Exception:
             continue

@@ -8,8 +8,9 @@ No network, no real Alpaca contact, no order submission.
 import pytest
 
 import broker
-from conftest import FakeClient, FakeOrder, filled_order, stop_order
+from types import SimpleNamespace
 
+from conftest import FakeClient, FakeOrder, filled_order, stop_order
 
 def _wire(monkeypatch, client, gates=(True, "ok")):
     monkeypatch.setattr(broker, "_client", lambda: client)
@@ -395,3 +396,45 @@ def test_sync_positions_does_not_clear_flag_when_unresolved(monkeypatch):
         assert decision_log.get_protection_unverified() is True
     finally:
         decision_log.set_protection_unverified(False)
+
+def test_move_broker_stop_handles_enum_order_type(monkeypatch):
+    old_stop = FakeOrder(
+        "OLD",
+        "AAPL",
+        5,
+        SimpleNamespace(value="sell"),
+        SimpleNamespace(value="stop"),
+        "new",
+        stop_price=90.0,
+    )
+
+    client = FakeClient(open_orders=[old_stop])
+    _wire(monkeypatch, client)
+
+    monkeypatch.setattr(
+        broker,
+        "_submit_stop",
+        lambda *a, **k: {
+            "stop_order_id": "NEW",
+            "stop_price": 95.0,
+        },
+    )
+
+    result = broker.move_broker_stop("AAPL", 95.0, 5, "long")
+
+    assert result["stop_order_id"] == "NEW"
+    assert client.cancelled == ["OLD"]
+
+
+def test_move_broker_stop_does_not_cancel_when_new_stop_fails(monkeypatch):
+    old_stop = stop_order("OLD", "AAPL", 5, "sell", 90.0)
+
+    client = FakeClient(open_orders=[old_stop])
+    _wire(monkeypatch, client)
+
+    monkeypatch.setattr(broker, "_submit_stop", lambda *a, **k: None)
+
+    result = broker.move_broker_stop("AAPL", 95.0, 5, "long")
+
+    assert result is None
+    assert client.cancelled == []
