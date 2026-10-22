@@ -243,6 +243,30 @@ def test_engine_accepts_tz_aware_index_without_typeerror():
     assert result["end_equity"] > 0
 
 
+def test_engine_sorts_direct_input_before_building_indicator_windows(monkeypatch):
+    """Unsorted caller data must not put later bars in an earlier prefix."""
+    import backtest.engine as engine
+
+    observed = []
+
+    def inspect_prefix(df, i):
+        prefix = df.iloc[:i + 1]
+        observed.append((prefix.index.is_monotonic_increasing, prefix.index[-1]))
+        return None  # This test isolates chronology, not strategy decisions.
+
+    monkeypatch.setattr(engine, "compute_indicators_at", inspect_prefix)
+    idx = pd.date_range("2024-01-01", periods=70, freq="D")
+    closes = np.linspace(100.0, 110.0, len(idx))
+    df = _raw_df([[c, c + 1, c - 1, c, 1_000] for c in closes], idx)
+    unsorted = df.iloc[::-1].copy()
+
+    engine.simulate_portfolio({"AAA": unsorted}, None, start_equity=10_000,
+                              settings=_settings())
+
+    assert observed, "expected indicator evaluation after warmup"
+    assert observed == [(True, ts) for ts in idx[60:]]
+
+
 def test_engine_normalizes_naive_window_boundary_against_tz_index():
     n = 200
     idx = pd.date_range("2024-01-01", periods=n, freq="D", tz="America/New_York")

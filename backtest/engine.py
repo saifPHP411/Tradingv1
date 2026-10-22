@@ -436,10 +436,13 @@ def _bar_row(df, ts):
 
 
 def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a shallow copy of df with a naive-UTC DatetimeIndex.
+    """Return a chronologically ordered frame with a naive-UTC DatetimeIndex.
 
     tz-aware indices (yfinance) would otherwise raise TypeError when compared
     with naive window boundaries. Non-datetime indices are returned unchanged.
+    Sorting here also protects direct callers of ``simulate_portfolio`` that
+    bypass ``backtest.data._normalize``: indicator windows must contain only
+    bars at or before the timestamp being evaluated.
     """
     if df is None:
         return None
@@ -447,8 +450,11 @@ def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
         out = df.copy()
         out.index = idx.tz_convert("UTC").tz_localize(None)
-        return out
-    return df
+    else:
+        out = df
+    if not out.index.is_monotonic_increasing:
+        out = out.sort_index(kind="stable")
+    return out
 
 
 # ============ Main Portfolio Simulation ============
