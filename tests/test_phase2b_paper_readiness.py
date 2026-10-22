@@ -246,6 +246,134 @@ def test_analyst_receives_indicators_and_does_not_hold_on_valid_data(monkeypatch
     assert out["analyst_report"].get("reason") != "no valid indicators"
 
 
+def test_analyst_diagnoses_score_gate_before_llm(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "regime_enabled": 0, "news_enabled": 0, "min_signal_score": 70,
+    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a: {
+        "score": 56, "trend": 20, "momentum": 13, "rsi": 15,
+        "bb": 0, "volume": 8, "news": 0,
+    })
+    monkeypatch.setattr(agents, "llm", type("NoCallLLM", (), {
+        "invoke": lambda *a, **k: pytest.fail("LLM must not be called")
+    })())
+
+    out = agents.analyst_agent({"symbol": "AAPL", "market_data": {"atr14": 1}})
+    report = out["analyst_report"]
+    assert report["signal"] == "HOLD"
+    assert report["diagnostic"] == {
+        "stage": "signal_score", "llm_called": False, "threshold": 70,
+        "score_components": {"trend": 20, "momentum": 13, "rsi": 15,
+                             "bb": 0, "volume": 8, "news": 0},
+    }
+    assert "LLM not called" in out["logs"][0]
+
+
+def test_analyst_diagnoses_bear_gate_without_calling_llm(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "regime_enabled": 1, "news_enabled": 0, "min_signal_score": 70,
+    })
+    monkeypatch.setattr(agents, "get_market_regime", lambda: {"regime": "BEAR"})
+    monkeypatch.setattr(agents, "get_news_sentiment", lambda _s: None)
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a: {
+        "score": 80, "trend": 25, "momentum": 20, "rsi": 15,
+        "bb": 8, "volume": 12, "news": 0,
+    })
+    monkeypatch.setattr(agents, "llm", type("NoCallLLM", (), {
+        "invoke": lambda *a, **k: pytest.fail("LLM must not be called")
+    })())
+
+    report = agents.analyst_agent({"symbol": "AAPL", "market_data": {"atr14": 1}})["analyst_report"]
+    assert report["reason"] == "BEAR market — no new longs"
+    assert report["diagnostic"]["stage"] == "regime"
+    assert report["diagnostic"]["llm_called"] is False
+
+
+def test_analyst_reads_valid_llm_json_and_records_success(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "regime_enabled": 0, "news_enabled": 0, "min_signal_score": 70,
+    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a: {
+        "score": 82, "trend": 25, "momentum": 20, "rsi": 15,
+        "bb": 8, "volume": 12, "news": 0,
+    })
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _prompt):
+            self.calls += 1
+            return type("Response", (), {"content":
+                '{"signal":"BUY","confidence":0.91,"reason":"trend"}'})()
+
+    fake = FakeLLM()
+    monkeypatch.setattr(agents, "llm", fake)
+    report = agents.analyst_agent({
+        "symbol": "AAPL", "market_data": {
+            "atr14": 1, "last_close": 100, "ema20": 99, "ema50": 98,
+            "rsi14": 55, "adx": 30, "macd_hist": 1,
+            "bb_pct_b": 0.5, "bb_bandwidth": 5, "stoch_k": 50,
+            "stoch_d": 45, "volume_ratio": 1.1,
+            "momentum_5d_pct": 1, "momentum_10d_pct": 2,
+        },
+    })["analyst_report"]
+
+    assert fake.calls == 1
+    assert report["signal"] == "BUY"
+    assert report["confidence"] == pytest.approx(0.91)
+    assert report["diagnostic"]["llm_status"] == "success"
+    assert report["diagnostic"]["llm_attempts"] == 1
+
+
+def test_analyst_retries_invalid_llm_output_and_sanitizes_errors(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "regime_enabled": 0, "news_enabled": 0, "min_signal_score": 70,
+    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a: {
+        "score": 82, "trend": 25, "momentum": 20, "rsi": 15,
+        "bb": 8, "volume": 12, "news": 0,
+    })
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _prompt):
+            self.calls += 1
+            if self.calls == 1:
+                return type("Response", (), {"content": "not json"})()
+            raise RuntimeError("Authorization: Bearer secret-value")
+
+    fake = FakeLLM()
+    monkeypatch.setattr(agents, "llm", fake)
+    report = agents.analyst_agent({
+        "symbol": "AAPL", "market_data": {
+            "atr14": 1, "last_close": 100, "ema20": 99, "ema50": 98,
+            "rsi14": 55, "adx": 30, "macd_hist": 1,
+            "bb_pct_b": 0.5, "bb_bandwidth": 5, "stoch_k": 50,
+            "stoch_d": 45, "volume_ratio": 1.1,
+            "momentum_5d_pct": 1, "momentum_10d_pct": 2,
+        },
+    })["analyst_report"]
+
+    assert fake.calls == 2
+    assert report["signal"] == "HOLD"
+    assert report["reason"] == "LLM request failed"
+    assert "secret-value" not in str(report)
+    assert report["diagnostic"]["llm_status"] == "error"
+    assert report["diagnostic"]["llm_error_type"] == "RuntimeError"
+    assert report["diagnostic"]["llm_attempts"] == 2
+
+
 def test_validate_indicators_rejects_missing_and_nonfinite():
     from signals import validate_indicators
 
