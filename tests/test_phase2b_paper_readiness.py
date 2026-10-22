@@ -337,6 +337,49 @@ def test_analyst_reads_valid_llm_json_and_records_success(monkeypatch):
     assert report["diagnostic"]["market_regime"] == "UNKNOWN"
 
 
+def test_analyst_retries_invalid_json_then_parses_valid_response(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "regime_enabled": 0, "news_enabled": 0, "min_signal_score": 70,
+    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a: {
+        "score": 82, "trend": 25, "momentum": 20, "rsi": 15,
+        "bb": 8, "volume": 12, "news": 0,
+    })
+
+    class RetryLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _prompt):
+            self.calls += 1
+            content = (
+                "not valid JSON" if self.calls == 1 else
+                '{"signal":"SELL","confidence":0.82,"reason":"test response"}'
+            )
+            return type("Response", (), {"content": content})()
+
+    fake = RetryLLM()
+    monkeypatch.setattr(agents, "llm", fake)
+    report = agents.analyst_agent({
+        "symbol": "AAPL", "market_data": {
+            "atr14": 1, "last_close": 100, "ema20": 99, "ema50": 98,
+            "rsi14": 55, "adx": 30, "macd_hist": 1,
+            "bb_pct_b": 0.5, "bb_bandwidth": 5, "stoch_k": 50,
+            "stoch_d": 45, "volume_ratio": 1.1,
+            "momentum_5d_pct": 1, "momentum_10d_pct": 2,
+        },
+    })["analyst_report"]
+
+    assert fake.calls == 2
+    assert report["signal"] == "SELL"
+    assert report["confidence"] == pytest.approx(0.82)
+    assert report["diagnostic"]["llm_called"] is True
+    assert report["diagnostic"]["llm_attempts"] == 2
+    assert report["diagnostic"]["llm_status"] == "success"
+
+
 def test_hold_is_not_misreported_as_a_risk_veto(monkeypatch):
     import agents
 
