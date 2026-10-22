@@ -265,6 +265,7 @@ def test_analyst_diagnoses_score_gate_before_llm(monkeypatch):
     assert report["signal"] == "HOLD"
     assert report["diagnostic"] == {
         "stage": "signal_score", "llm_called": False, "threshold": 70,
+        "signal_score": 56, "market_regime": "UNKNOWN",
         "score_components": {"trend": 20, "momentum": 13, "rsi": 15,
                              "bb": 0, "volume": 8, "news": 0},
     }
@@ -291,6 +292,8 @@ def test_analyst_diagnoses_bear_gate_without_calling_llm(monkeypatch):
     assert report["reason"] == "BEAR market — no new longs"
     assert report["diagnostic"]["stage"] == "regime"
     assert report["diagnostic"]["llm_called"] is False
+    assert report["diagnostic"]["signal_score"] == 80
+    assert report["diagnostic"]["market_regime"] == "BEAR"
 
 
 def test_analyst_reads_valid_llm_json_and_records_success(monkeypatch):
@@ -330,6 +333,59 @@ def test_analyst_reads_valid_llm_json_and_records_success(monkeypatch):
     assert report["confidence"] == pytest.approx(0.91)
     assert report["diagnostic"]["llm_status"] == "success"
     assert report["diagnostic"]["llm_attempts"] == 1
+    assert report["diagnostic"]["signal_score"] == 82
+    assert report["diagnostic"]["market_regime"] == "UNKNOWN"
+
+
+def test_hold_is_not_misreported_as_a_risk_veto(monkeypatch):
+    import agents
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: {
+        "min_confidence": 0.65, "min_signal_score": 70,
+    })
+    report = agents.risk_manager_agent({
+        "symbol": "AAPL", "market_data": {},
+        "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+                           "signal_score": 0, "reason": "below threshold"},
+    })
+
+    assert report["risk_report"] == {
+        "approved": False, "veto": False, "reason": "analyst HOLD",
+    }
+
+
+def test_decision_log_persists_safe_analyst_diagnostics(tmp_path, monkeypatch):
+    import json
+    import decision_log
+
+    monkeypatch.setattr(decision_log, "DB", tmp_path / "decisions.db")
+    decision_log.init_db()
+    decision_log.log_decision({
+        "symbol": "AAPL",
+        "analyst_report": {
+            "signal": "HOLD", "confidence": 0.0,
+            "reason": "signal score below threshold (56 < 70)",
+            "diagnostic": {
+                "stage": "signal_score", "llm_called": False,
+                "signal_score": 56, "threshold": 70,
+                "market_regime": "BULL",
+                "score_components": {"trend": 20, "momentum": 13},
+            },
+        },
+        "risk_report": {"approved": False, "veto": False,
+                        "reason": "analyst HOLD"},
+        "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    diagnostic = json.loads(row["analyst_diagnostic"])
+    assert diagnostic["signal_score"] == 56
+    assert diagnostic["score_components"]["trend"] == 20
+    assert diagnostic["market_regime"] == "BULL"
+    assert diagnostic["llm_called"] is False
+    assert row["risk_reason"] == "analyst HOLD"
+    assert row["final_decision"] == "HOLD"
 
 
 def test_analyst_retries_invalid_llm_output_and_sanitizes_errors(monkeypatch):
