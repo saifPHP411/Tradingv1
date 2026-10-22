@@ -166,8 +166,15 @@ def _sync_positions() -> list:
             # Fall back to close only when market is open
             if market_open:
                 from broker import _emergency_close_and_verify
-                _emergency_close_and_verify(sym)
-                delete_position_state(sym)
+                closed = _emergency_close_and_verify(sym)
+
+                if closed:
+                    delete_position_state(sym)
+                else:
+                    unresolved.append(sym)
+                    set_protection_unverified(True, f'{sym}: emergency close not verified')
+                    emit_event('PROTECTION_UNVERIFIED', symbol=sym, reason='emergency close not verified')
+                    print(f'CRITICAL: {sym} may still be open; blocking new entries pending verification')
             else:
                 # Still unprotected and cannot act → block new entries + alert.
                 unresolved.append(sym)

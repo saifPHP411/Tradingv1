@@ -149,7 +149,7 @@ def _verify_stop_exists(symbol: str, expected_qty: float,
             status=QueryOrderStatus.OPEN, symbols=[symbol], limit=20
         ))
         for o in orders:
-            otype = str(o.order_type).lower() if o.order_type else ""
+            otype = str(getattr(o.order_type, "value", o.order_type)).lower() if o.order_type else ""
             if "stop" not in otype:
                 continue
             q = float(o.qty or 0)
@@ -157,7 +157,7 @@ def _verify_stop_exists(symbol: str, expected_qty: float,
                 continue
             if expected_side:
                 want = "sell" if expected_side in ("long", "buy") else "buy"
-                if str(o.side).lower() != want:
+                if str(getattr(o.side, "value", o.side)).lower() != want:
                     continue
             if expected_stop_price is not None:
                 sp = float(o.stop_price or 0)
