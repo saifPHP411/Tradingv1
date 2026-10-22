@@ -23,6 +23,15 @@ def init_db():
             final_decision TEXT, consensus_reached INTEGER,
             order_details TEXT, broker_result TEXT, market_data TEXT)""")
 
+        # Add safe, structured analyst diagnostics to existing databases.
+        # This intentionally stores only the diagnostic summary, not prompt,
+        # response payload, credentials, or full exception text.
+        decision_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(decisions)")
+        }
+        if "analyst_diagnostic" not in decision_columns:
+            conn.execute("ALTER TABLE decisions ADD COLUMN analyst_diagnostic TEXT")
+
         conn.execute("""CREATE TABLE IF NOT EXISTS equity_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
             equity REAL, open_positions INTEGER)""")
@@ -89,11 +98,13 @@ def init_db():
 def log_decision(state: dict, broker_result: dict | None):
     analyst = state.get("analyst_report") or {}
     risk = state.get("risk_report") or {}
+    diagnostic = analyst.get("diagnostic") or {}
     with _conn() as conn:
         conn.execute("""INSERT INTO decisions (timestamp, symbol, analyst_signal,
             analyst_confidence, analyst_reason, risk_approved, risk_veto,
             risk_reason, final_decision, consensus_reached, order_details,
-            broker_result, market_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            broker_result, market_data, analyst_diagnostic)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             datetime.now(timezone.utc).isoformat(), state.get("symbol"),
             analyst.get("signal"), float(analyst.get("confidence", 0)),
             analyst.get("reason", ""), 1 if risk.get("approved") else 0,
@@ -101,7 +112,8 @@ def log_decision(state: dict, broker_result: dict | None):
             state.get("final_decision"), 1 if state.get("consensus_reached") else 0,
             json.dumps(state.get("order_details"), ensure_ascii=False) if state.get("order_details") else None,
             json.dumps(broker_result, ensure_ascii=False) if broker_result else None,
-            json.dumps(state.get("market_data"), ensure_ascii=False, default=str)))
+            json.dumps(state.get("market_data"), ensure_ascii=False, default=str),
+            json.dumps(diagnostic, ensure_ascii=False, default=str)))
         conn.commit()
 
 

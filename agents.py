@@ -28,7 +28,11 @@ def analyst_agent(state: TradingState) -> dict:
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
                                "reason": "no valid indicators", "signal_score": 0,
-                               "diagnostic": {"stage": "input", "llm_called": False}},
+                               "regime": "UNKNOWN",
+                               "diagnostic": {"stage": "input", "llm_called": False,
+                                              "signal_score": 0,
+                                              "score_components": {},
+                                              "market_regime": "UNKNOWN"}},
             "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة (LLM not called)"],
         }
 
@@ -48,6 +52,8 @@ def analyst_agent(state: TradingState) -> dict:
                                "regime": regime_name,
                                "diagnostic": {"stage": "signal_score", "llm_called": False,
                                               "threshold": settings["min_signal_score"],
+                                              "signal_score": sig["score"],
+                                              "market_regime": regime_name,
                                               "score_components": score_parts}},
             "logs": [f"المحلل[{symbol}]: HOLD — {reason}; components={score_parts}; "
                      f"regime={regime_name}; LLM not called"],
@@ -61,6 +67,8 @@ def analyst_agent(state: TradingState) -> dict:
                                "regime": regime_name,
                                "diagnostic": {"stage": "regime", "llm_called": False,
                                               "threshold": settings["min_signal_score"],
+                                              "signal_score": sig["score"],
+                                              "market_regime": regime_name,
                                               "score_components": score_parts}},
             "logs": [f"المحلل[{symbol}]: HOLD — {reason}; score={sig['score']}; "
                      f"LLM not called"],
@@ -124,6 +132,8 @@ def analyst_agent(state: TradingState) -> dict:
     report["agent"] = "analyst"
     report["diagnostic"] = {"stage": "llm", "llm_called": True,
                             "threshold": settings["min_signal_score"],
+                            "signal_score": sig["score"],
+                            "market_regime": regime_name,
                             "score_components": score_parts,
                             "llm_attempts": llm_attempts,
                             "llm_status": llm_status}
@@ -146,13 +156,15 @@ def risk_manager_agent(state: TradingState) -> dict:
     signal_score = analyst.get("signal_score", 0)
     regime_name = analyst.get("regime", "UNKNOWN")
 
+    # HOLD is a completed analyst decision. Do not label it as a risk veto
+    # merely because its confidence is zero; that obscures the actual gate.
+    if signal == "HOLD":
+        return {"risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
+                "logs": [f"مدير المخاطر[{symbol}]: HOLD — analyst returned HOLD"]}
     if confidence < settings["min_confidence"]:
         return _veto(symbol, f"confidence {confidence:.2f} < {settings['min_confidence']}")
     if signal_score < settings["min_signal_score"]:
         return _veto(symbol, f"score {signal_score} < {settings['min_signal_score']}")
-    if signal == "HOLD":
-        return {"risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
-                "logs": [f"مدير المخاطر[{symbol}]: HOLD"]}
 
     atr = data.get("atr14", 0)
     last = data.get("last_close", 0)
