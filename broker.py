@@ -469,7 +469,7 @@ def move_broker_stop(symbol: str, new_stop_price: float,
                 status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50)):
             if str(o.id) == new_stop["stop_order_id"]:
                 continue
-            otype = str(o.order_type).lower() if o.order_type else ""
+            otype = str(getattr(o.order_type, "value", o.order_type)).lower() if o.order_type else ""
             if "stop" in otype:
                 try:
                     client.cancel_order_by_id(o.id)
