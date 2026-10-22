@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Backtest generated artifacts
+backtest_cache/
+backtest_reports/
+backtest_results.db
+decisions.db
+graph_checkpoints.db
+trading_memory.db
+
+.env
+.venv/
+venv/

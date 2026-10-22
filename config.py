@@ -65,6 +65,16 @@ FEES_PER_SHARE = 0.0
 ENTRY_SLIPPAGE_BPS = 5
 EXIT_SLIPPAGE_BPS = 5
 
+# ============ Execution ============
+# Bars after which an open position is force-closed ("MAX_HOLD").
+# 60 daily bars ≈ 3 trading months. Overridable per run (CLI / walk-forward).
+MAX_HOLD_BARS = 60
+
+# ============ Strategy direction ============
+# Strategy is LONG-only by design. The execution engine is SHORT-capable;
+# set ENABLE_SHORT=1 (env) or pass settings["enable_short"]=1 to exercise it.
+ENABLE_SHORT = 1 if os.getenv("ENABLE_SHORT", "0").strip() in ("1", "true", "True") else 0
+
 # ============ LLM Exit Sensitivity ============
 MIN_HOLD_MINUTES = 30
 MIN_LOSS_TO_CLOSE_PCT = 1.5

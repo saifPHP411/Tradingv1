@@ -7,18 +7,67 @@ from pathlib import Path
 CACHE_DIR = Path(os.getenv("BACKTEST_CACHE_DIR", "backtest_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Canonical OHLCV form shared by the live cache and fresh downloads.
+
+    - Keep only the OHLCV columns.
+    - Drop duplicated timestamps (keep first).
+    - Sort ascending by timestamp.
+    - Convert the index to naive UTC so bar timestamps compare consistently
+      with the naive timestamps produced by walk-forward window boundaries.
+      yfinance returns tz-aware (exchange-local) timestamps; leaving them
+      tz-aware makes naive comparisons raise TypeError.
+    - Drop rows with missing values.
+    - Drop rows whose OHLC prices are non-positive or internally inconsistent
+      (High < Low, or a price outside [Low, High]). Such bars would corrupt
+      stop/target and gap logic.
+    """
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"missing OHLCV columns: {missing}")
+
+    out = df[REQUIRED_COLUMNS].copy()
+    out = out[~out.index.duplicated(keep="first")]
+    out = out.sort_index()
+
+    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
+        out.index = out.index.tz_convert("UTC").tz_localize(None)
+
+    out = out.dropna()
+
+    o, h, l, c = (out[k].astype(float) for k in ("Open", "High", "Low", "Close"))
+    valid = (
+        (o > 0) & (h > 0) & (l > 0) & (c > 0)
+        & (h >= l)
+        & (h >= o) & (h >= c)
+        & (l <= o) & (l <= c)
+    )
+    out = out[valid]
+    return out
+
 
 def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame | None:
     """
-    Load OHLCV with caching. Returns DataFrame indexed by timestamp.
+    Load OHLCV with caching. Returns a DataFrame indexed by naive UTC timestamps.
     Columns: Open, High, Low, Close, Volume
+
+    Data is normalized and validated on BOTH the cache-read path and the
+    download path, so a cache written by an older version cannot reintroduce
+    timezone/ordering/duplicate-timestamp issues.
     """
     cache_key = f"{symbol}_{start}_{end}_{interval}.parquet"
     cache_path = CACHE_DIR / cache_key
 
     if cache_path.exists():
         try:
-            return pd.read_parquet(cache_path)
+            cached = pd.read_parquet(cache_path)
+            normalized = _normalize(cached)
+            if not normalized.empty:
+                return normalized
         except Exception:
             pass
 
@@ -29,10 +78,10 @@ def load_ohlcv(symbol: str, start: str, end: str, interval: str = "1d") -> pd.Da
         if df is None or df.empty:
             return None
 
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df = df[~df.index.duplicated(keep="first")]
-        df = df.sort_index()
-        df = df.dropna()
+        df = _normalize(df)
+        if df.empty:
+            print(f"⚠️ data[{symbol}]: no valid OHLCV rows after validation")
+            return None
 
         try:
             df.to_parquet(cache_path)

@@ -10,9 +10,25 @@ from backtest.walkforward import (
 )
 from backtest.storage import save_run
 from backtest.monte_carlo import run_monte_carlo
+from settings import get_all_settings
 
 
-def run_single(symbol: str, start: str, end: str, initial: float):
+def _engine_settings(max_hold_bars=None, enable_short=None):
+    """Load persisted engine settings and apply CLI overrides.
+
+    Everything the engine reads must come from here so a CLI flag can never
+    be silently ignored by a missing settings key.
+    """
+    s = get_all_settings()
+    if max_hold_bars is not None:
+        s["max_hold_bars"] = int(max_hold_bars)
+    if enable_short is not None:
+        s["enable_short"] = int(enable_short)
+    return s
+
+
+def run_single(symbol: str, start: str, end: str, initial: float,
+               settings=None, max_hold_bars=None):
     print(f"🔄 Loading {symbol} from {start} to {end}...")
     df = load_ohlcv(symbol, start, end)
     if df is None or len(df) < 70:
@@ -20,7 +36,8 @@ def run_single(symbol: str, start: str, end: str, initial: float):
         return None
     spy_df = get_spy_for_period(start, end)
     print(f"✓ {len(df)} bars loaded")
-    result = simulate(symbol, df, spy_df, start_equity=initial)
+    result = simulate(symbol, df, spy_df, start_equity=initial,
+                      settings=settings, max_hold_bars=max_hold_bars)
     metrics = calculate_metrics(result["equity_curve"], result["trades"], initial)
     print_summary(result, metrics)
     path = save_report(result, metrics, f"single_{symbol}")
@@ -37,14 +54,16 @@ def run_single(symbol: str, start: str, end: str, initial: float):
     return result, metrics
 
 
-def run_multi(symbols: list[str], start: str, end: str, initial: float):
+def run_multi(symbols: list[str], start: str, end: str, initial: float,
+              settings=None, max_hold_bars=None):
     """Legacy per-symbol mode (each symbol gets its own starting cash)."""
     all_metrics = []
     for sym in symbols:
         print(f"\n{'='*60}")
         print(f"Testing {sym}")
         print(f"{'='*60}")
-        out = run_single(sym, start, end, initial)
+        out = run_single(sym, start, end, initial,
+                         settings=settings, max_hold_bars=max_hold_bars)
         if out:
             all_metrics.append((sym, out[1]))
     print(f"\n\n{'='*60}")
@@ -60,7 +79,8 @@ def run_multi(symbols: list[str], start: str, end: str, initial: float):
               f"{m.get('win_rate_pct', 0):>7.1f}%")
 
 
-def run_portfolio(symbols: list[str], start: str, end: str, initial: float):
+def run_portfolio(symbols: list[str], start: str, end: str, initial: float,
+                  settings=None, max_hold_bars=None):
     """TRUE portfolio backtest (shared cash, equity, exposure)."""
     print(f"🔄 Loading {len(symbols)} symbols from {start} to {end}...")
     data = load_multi(symbols, start, end)
@@ -69,7 +89,8 @@ def run_portfolio(symbols: list[str], start: str, end: str, initial: float):
         return
     spy = get_spy_for_period(start, end)
     print(f"✓ {len(data)} symbols loaded")
-    result = simulate_portfolio(data, spy, start_equity=initial)
+    result = simulate_portfolio(data, spy, start_equity=initial,
+                                settings=settings, max_hold_bars=max_hold_bars)
     metrics = calculate_metrics(result["equity_curve"], result["trades"], initial)
     print_portfolio_summary(list(data.keys()), result, metrics)
     path = save_report(result, metrics, "portfolio")
@@ -96,7 +117,16 @@ def main():
     parser.add_argument("--walkforward", action="store_true")
     parser.add_argument("--train-months", type=int, default=12)
     parser.add_argument("--test-months", type=int, default=3)
+    parser.add_argument("--max-hold-bars", type=int, default=None,
+                        help="Force-close after N bars (default: settings)")
+    parser.add_argument("--enable-short", type=int, choices=[0, 1], default=None,
+                        help="Enable SHORT execution (default: settings)")
     args = parser.parse_args()
+
+    settings = _engine_settings(
+        max_hold_bars=args.max_hold_bars,
+        enable_short=args.enable_short,
+    )
 
     if args.walkforward:
         if args.portfolio:
@@ -107,11 +137,15 @@ def main():
             results = walk_forward_portfolio(
                 syms, args.start, args.end,
                 args.train_months, args.test_months,
+                initial_equity=args.initial,
+                max_hold_bars=args.max_hold_bars, settings=settings,
             )
         else:
             results = walk_forward(
                 args.symbol, args.start, args.end,
                 args.train_months, args.test_months,
+                initial_equity=args.initial,
+                max_hold_bars=args.max_hold_bars, settings=settings,
             )
         agg = aggregate_walkforward(results)
         print("\n" + "=" * 60)
@@ -126,14 +160,17 @@ def main():
         if not syms:
             print("❌ --portfolio requires --symbols")
             return
-        run_portfolio(syms, args.start, args.end, args.initial)
+        run_portfolio(syms, args.start, args.end, args.initial,
+                      settings=settings, max_hold_bars=args.max_hold_bars)
         return
 
     if args.symbols:
         syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        run_multi(syms, args.start, args.end, args.initial)
+        run_multi(syms, args.start, args.end, args.initial,
+                  settings=settings, max_hold_bars=args.max_hold_bars)
     else:
-        run_single(args.symbol, args.start, args.end, args.initial)
+        run_single(args.symbol, args.start, args.end, args.initial,
+                   settings=settings, max_hold_bars=args.max_hold_bars)
 
 
 if __name__ == "__main__":

@@ -13,19 +13,41 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
     eq = pd.DataFrame(equity_curve)
     eq["time"] = pd.to_datetime(eq["time"])
     eq = eq.set_index("time").sort_index()
-    values = eq["equity"].values
+    values = eq["equity"].values.astype(float)
+    values = values[np.isfinite(values)]
+    if len(values) < 2:
+        return {"error": "no data"}
 
-    returns = np.diff(values) / values[:-1]
+    equity_ruined = bool(np.any(values <= 0.0))
+
+    prev = values[:-1]
+    safe_prev = np.where(prev > 0, prev, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        returns = np.diff(values) / safe_prev
     returns = returns[np.isfinite(returns)]
-    total_return_pct = (values[-1] / initial_equity - 1) * 100
+
+    # A cash-secured account cannot lose more than 100% of its capital, so
+    # floor the terminal equity at zero when computing return-based metrics.
+    final_equity = max(float(values[-1]), 0.0)
+    total_return_pct = ((final_equity / initial_equity - 1) * 100
+                        if initial_equity > 0 else 0.0)
 
     n_periods = len(values)
     years = max(n_periods / periods_per_year, 1 / periods_per_year)
-    cagr = ((values[-1] / initial_equity) ** (1 / years) - 1) * 100 if initial_equity > 0 else 0
+    if initial_equity > 0 and final_equity > 0:
+        cagr = ((final_equity / initial_equity) ** (1 / years) - 1) * 100
+    elif initial_equity > 0:
+        cagr = -100.0  # complete loss
+    else:
+        cagr = 0.0
 
     running_max = np.maximum.accumulate(values)
-    drawdowns = (values - running_max) / running_max
-    max_dd = drawdowns.min() * 100
+    denom = np.where(running_max > 0, running_max, 1.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drawdowns = (values - running_max) / denom
+    drawdowns = drawdowns[np.isfinite(drawdowns)]
+    max_dd = float(drawdowns.min()) * 100 if len(drawdowns) else 0.0
+    max_dd = max(max_dd, -100.0)
 
     if len(returns) > 1 and np.std(returns) > 0:
         sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(periods_per_year)
@@ -42,13 +64,15 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
 
     if not trades:
         return {
-            "total_return_pct": round(total_return_pct, 2),
-            "cagr_pct": round(cagr, 2),
-            "max_drawdown_pct": round(max_dd, 2),
-            "sharpe": round(sharpe, 2),
-            "sortino": round(sortino, 2),
-            "calmar": round(calmar, 2),
+            "total_return_pct": round(float(total_return_pct), 2),
+            "cagr_pct": round(float(cagr), 2),
+            "max_drawdown_pct": round(float(max_dd), 2),
+            "sharpe": round(float(sharpe), 2),
+            "sortino": round(float(sortino), 2),
+            "calmar": round(float(calmar), 2),
             "num_trades": 0,
+            "equity_ruined": equity_ruined,
+            "final_equity": round(final_equity, 2),
         }
 
     pnls = [t["net_pnl"] for t in trades]
@@ -87,12 +111,12 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
     avg_hold = np.mean([t.get("bars_held", 0) for t in trades]) if trades else 0
 
     return {
-        "total_return_pct": round(total_return_pct, 2),
-        "cagr_pct": round(cagr, 2),
-        "max_drawdown_pct": round(max_dd, 2),
-        "sharpe": round(sharpe, 2),
-        "sortino": round(sortino, 2),
-        "calmar": round(calmar, 2),
+        "total_return_pct": round(float(total_return_pct), 2),
+        "cagr_pct": round(float(cagr), 2),
+        "max_drawdown_pct": round(float(max_dd), 2),
+        "sharpe": round(float(sharpe), 2),
+        "sortino": round(float(sortino), 2),
+        "calmar": round(float(calmar), 2),
         "num_trades": len(trades),
         "win_rate_pct": round(win_rate, 2),
         "avg_win": round(float(avg_win), 2),
@@ -108,5 +132,6 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
         "avg_hold_bars": round(float(avg_hold), 1),
         "total_fees": round(float(total_fees), 2),
         "total_slippage": round(float(total_slip), 2),
-        "final_equity": round(float(values[-1]), 2),
-        }
+        "final_equity": round(final_equity, 2),
+        "equity_ruined": equity_ruined,
+    }

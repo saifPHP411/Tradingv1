@@ -393,13 +393,29 @@ def _bar_row(df, ts):
         return None
 
 
+def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a shallow copy of df with a naive-UTC DatetimeIndex.
+
+    tz-aware indices (yfinance) would otherwise raise TypeError when compared
+    with naive window boundaries. Non-datetime indices are returned unchanged.
+    """
+    if df is None:
+        return None
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        out = df.copy()
+        out.index = idx.tz_convert("UTC").tz_localize(None)
+        return out
+    return df
+
+
 # ============ Main Portfolio Simulation ============
 def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                        spy_df: pd.DataFrame | None,
                        start_equity: float = 10000.0,
                        settings: dict | None = None,
                        trading_start_ts=None,
-                       max_hold_bars: int = 60) -> dict:
+                       max_hold_bars: int | None = None) -> dict:
     """
     Bar-driven portfolio backtest.
 
@@ -409,15 +425,28 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         If set, no signals are queued before this timestamp. Indicator
         warmup still uses all earlier bars (no lookahead), but no trades
         are opened during warmup. Used by walk-forward OOS windows.
-    max_hold_bars : int
-        Force-close a position after this many bars. Defaults to 60.
+    max_hold_bars : int, optional
+        Force-close a position after this many bars. If None, uses
+        settings["max_hold_bars"] (default 60).
     """
     if settings is None:
         settings = get_all_settings()
 
+    if max_hold_bars is None:
+        max_hold_bars = int(settings.get("max_hold_bars", 60))
+    max_hold_bars = int(max_hold_bars)
+    if max_hold_bars < 1:
+        raise ValueError(f"max_hold_bars must be >= 1, got {max_hold_bars}")
+
     if not BACKTEST_NEWS_AVAILABLE:
         print("ℹ️ backtest: historical news unavailable — scoring with "
               "news={'available': False} (deterministic, no lookahead).")
+
+    # Normalize any tz-aware index to naive UTC so bar timestamps compare
+    # consistently with naive window boundaries and never raise TypeError.
+    # The caller's DataFrames are not mutated.
+    symbols_data = {sym: _naive_index(df) for sym, df in symbols_data.items()}
+    spy_df = _naive_index(spy_df) if spy_df is not None else None
 
     # Normalize trading_start_ts to a naive UTC Timestamp or None.
     if trading_start_ts is not None:
@@ -430,6 +459,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     cursors = {sym: 0 for sym in symbols_data}
     pending = {sym: None for sym in symbols_data}
     last_prices: dict[str, float] = {}
+    # Prices known at the CURRENT bar's open = the last completed bar's close.
+    # Execution-time risk gates must use these, not this bar's close, or the
+    # gate would react to information the market had not yet revealed.
+    gate_prices: dict[str, float] = {}
     last_ts = all_times[-1] if all_times else None
     enable_short = bool(int(settings.get("enable_short", 0) or 0))
 
@@ -456,7 +489,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             # triggered cooldown, or a daily-loss lock may have started.
             # Without this recheck, pending entries bypass max_open_positions,
             # max_trades_per_day, daily_loss, and cooldown.
-            gate_ok, _ = state.can_trade(ts.isoformat(), last_prices)
+            # gate_prices (prior bar's close) is used so the recheck does not
+            # consume this bar's close before it has happened.
+            gate_ok, _ = state.can_trade(ts.isoformat(), gate_prices)
             if not gate_ok:
                 pending[sym] = None
                 continue
@@ -493,7 +528,7 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 continue
 
             exp_ok, _ = validate_portfolio_exposure(
-                state.equity(last_prices), state.positions,
+                state.equity(gate_prices), state.positions,
                 entry_notional, settings["max_portfolio_exposure_pct"],
             )
             if not exp_ok:
@@ -580,6 +615,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                         new_stop = pos.lowest_price + (rps * settings["trailing_distance_r"])
                         if new_stop < pos.stop and new_stop > close:
                             pos.stop = normalize_price_for_symbol(sym, new_stop)
+
+        # Bar is complete: its close is the last price known before the next
+        # bar's open, so it becomes the gate reference for the next iteration.
+        gate_prices = dict(last_prices)
 
         # ---- 3) Generate signals (executed next bar)
         # Skip during warmup: indicators still use all earlier bars, but no
@@ -713,10 +752,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
 
 
 def simulate(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
-             start_equity: float = 10000.0, max_hold_bars: int = 60,
-             trading_start_ts=None) -> dict:
+             start_equity: float = 10000.0, max_hold_bars: int | None = None,
+             trading_start_ts=None, settings: dict | None = None) -> dict:
     r = simulate_portfolio(
-        {symbol: df}, spy_df, start_equity,
+        {symbol: df}, spy_df, start_equity, settings=settings,
         trading_start_ts=trading_start_ts,
         max_hold_bars=max_hold_bars,
     )
