@@ -24,6 +24,13 @@ def calculate_metrics(equity_curve: list, trades: list, initial_equity: float,
       not ``inf``.
     - ``max_drawdown_pct`` is floored at -100%.
     - ``equity_ruined`` is true if ANY curve value is <= 0, not only the last.
+    - Annualization uses the number of observations (``len(equity_curve)``)
+      divided by ``periods_per_year``, NOT the wall-clock span of the curve.
+      Two curves covering the same calendar period therefore report different
+      CAGR/Sharpe if they have different sampling densities (e.g. 12 monthly
+      points vs 3 yearly points over 2 years). Correct only when the curve is
+      uniformly sampled at the ``periods_per_year`` cadence; all in-repo callers
+      pass daily bars with the default 252, where the two agree.
     """
     if not equity_curve or len(equity_curve) < 2:
         return {"error": "no data"}
