@@ -4,7 +4,13 @@ langchain-ollama
 langmem
 yfinance
 finnhub-python
-pandas
+# pandas 3.x deprecates the ``inplace`` keyword (PDEP-8). yfinance still uses
+# ``inplace=True`` in ~29 call sites, so pandas 3 floods the logs with a
+# Pandas4Warning on every market-data fetch. yfinance declares only
+# ``pandas>=1.3.0`` (no upper bound), so pip would otherwise pull pandas 3.
+# Cap below 3 until yfinance drops ``inplace``; pandas 2.3.x is the newest
+# release without the deprecation.
+pandas>=2.2,<3
 numpy
 alpaca-py
 python-dotenv

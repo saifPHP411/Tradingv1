@@ -291,7 +291,7 @@ class PortfolioState:
                 now = self._parse_ts(now_iso)
                 if now is None:
                     return False, "cooldown_unparseable"
-                self.cooldown_until = (now + pd.Timedelta(minutes=mins)).isoformat()
+                self.cooldown_until = (now + pd.Timedelta(mins, "m")).isoformat()
                 return False, "cooldown"
         if self.trades_today >= s["max_trades_per_day"]:
             return False, "max_trades_per_day"
@@ -406,7 +406,7 @@ class PortfolioState:
                     self.cooldown_until = None
                 elif self.cooldown_until is None:
                     try:
-                        self.cooldown_until = (pd.Timestamp(ts) + pd.Timedelta(minutes=mins)).isoformat()
+                        self.cooldown_until = (pd.Timestamp(ts) + pd.Timedelta(mins, "m")).isoformat()
                     except Exception:
                         self.cooldown_until = None
                 print(f"🛑 cooldown: {self.consecutive_losses} consecutive losses "
