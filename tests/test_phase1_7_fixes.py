@@ -146,6 +146,86 @@ def test_malformed_metrics_entry_records_reason():
     assert "malformed" in reason
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+def test_non_finite_num_trades_does_not_crash(bad):
+    """
+    ``int(float("inf"))`` raises ``OverflowError``, which is NOT a ``ValueError``.
+    A non-finite trade count on an otherwise valid window must be treated as 0
+    rather than aborting the whole aggregation.
+    """
+    agg = aggregate_walkforward([
+        {"window": "inf-trades",
+         "metrics": {"num_trades": bad, "total_return_pct": 5.0}},
+        _VALID,
+    ])
+    # The junk count contributes nothing; the valid window is untouched.
+    assert agg["total_trades"] == 3
+    assert agg["cumulative_return_pct"] == pytest.approx(15.5, abs=0.01)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+def test_non_finite_num_trades_on_invalid_window_counts_zero(bad):
+    """A non-finite count on a non-finite-return window must not crash the
+    invalid tally either (the same conversion happens on that path)."""
+    agg = aggregate_walkforward([
+        {"window": "bad",
+         "metrics": {"num_trades": bad, "total_return_pct": float("nan")}},
+        _VALID,
+    ])
+    assert agg["num_invalid_windows"] == 1
+    assert agg["total_trades"] == 3
+    assert agg["total_trades_invalid_windows"] == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+def test_non_finite_num_trades_on_clamped_window_counts_zero(bad):
+    """The clamped (< -100%) branch also converts num_trades; it must not crash
+    on a non-finite count."""
+    agg = aggregate_walkforward([
+        {"window": "clamped",
+         "metrics": {"num_trades": bad, "total_return_pct": -150.0}},
+        _VALID,
+    ])
+    assert agg["num_invalid_windows"] == 1
+    assert agg["total_trades"] == 3
+    assert agg["total_trades_invalid_windows"] == 0
+    # The clamped window compounds at -100% (product forced to 0); the valid
+    # window's +10% then leaves the cumulative at -100%.
+    assert agg["cumulative_return_pct"] == pytest.approx(-100.0, abs=0.01)
+
+
+def test_unbounded_int_total_return_is_invalid_not_crash():
+    """
+    ``float(10**400)`` raises ``OverflowError``. An unbounded integer return is
+    not a usable number, so it must be treated as a non-finite (invalid) window
+    instead of crashing aggregation.
+    """
+    agg = aggregate_walkforward([
+        {"window": "huge", "metrics": {"num_trades": 1,
+                                       "total_return_pct": 10 ** 400}},
+        _VALID,
+    ])
+    assert agg["num_invalid_windows"] == 1
+    assert agg["num_valid_windows"] == 1
+    # The invalid window contributes no trades and no return.
+    assert agg["total_trades"] == 3
+    assert agg["cumulative_return_pct"] == pytest.approx(10.0, abs=0.01)
+    assert "non-finite" in agg["invalid_windows"][0]["reason"]
+
+
+def test_unbounded_int_sharpe_does_not_crash():
+    """A junk (unbounded-int) sharpe must fall back to 0.0, not raise."""
+    agg = aggregate_walkforward([
+        {"window": "huge-sharpe",
+         "metrics": {"num_trades": 1, "total_return_pct": 5.0,
+                     "sharpe": 10 ** 400}},
+        _VALID,
+    ])
+    # sharpe 10**400 -> 0.0; the valid window's 1.0 -> mean 0.5
+    assert agg["avg_sharpe"] == pytest.approx(0.5, abs=0.01)
+    assert agg["cumulative_return_pct"] == pytest.approx(15.5, abs=0.01)
+
+
 # ============================================================================
 # 2) Engine-level post-rounding rejection branch
 # ============================================================================

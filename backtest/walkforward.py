@@ -255,8 +255,13 @@ def aggregate_walkforward(results: list[dict]) -> dict:
       - ``total_return_pct == -100%`` is valid and means a ruined account.
 
     A non-numeric ``num_trades`` on an invalid window is treated as 0 rather
-    than crashing the ``total_trades_invalid_windows`` tally. Invalid windows
-    are reported in ``invalid_windows`` (never dropped silently), and
+    than crashing the ``total_trades_invalid_windows`` tally. A non-finite
+    (``inf``/``-inf``) or otherwise unconvertible count is treated the same way:
+    ``int(float("inf"))`` raises ``OverflowError``, so it is caught alongside
+    ``TypeError``/``ValueError``. An unbounded integer ``total_return_pct`` (whose
+    ``float()`` also raises ``OverflowError``) is treated as non-finite, i.e. an
+    invalid window. Invalid windows are reported in ``invalid_windows`` (never
+    dropped silently), and
     ``num_invalid_windows`` / ``total_trades_invalid_windows`` are surfaced so
     the exclusion is visible rather than implied.
     """
@@ -268,12 +273,17 @@ def aggregate_walkforward(results: list[dict]) -> dict:
         return r.get("window", idx) if isinstance(r, Mapping) else idx
 
     def _trades_of(m) -> int:
-        """Trades attributed to a window; non-numeric counts as 0."""
+        """Trades attributed to a window; a junk count is treated as 0.
+
+        ``int(float("inf"))`` raises ``OverflowError`` (not ``ValueError``), and
+        an unbounded Python int raises ``OverflowError`` too, so both must be
+        caught here or a malformed count still crashes aggregation.
+        """
         if not isinstance(m, Mapping):
             return 0
         try:
             return int(m.get("num_trades", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     total_trades = 0
@@ -297,7 +307,9 @@ def aggregate_walkforward(results: list[dict]) -> dict:
         raw_ret = m.get("total_return_pct", None)
         try:
             ret = float(raw_ret)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: an unbounded Python int return is not a usable
+            # number; treat it as a non-finite (invalid) window like NaN/inf.
             ret = float("nan")
 
         if not math.isfinite(ret):
@@ -330,7 +342,7 @@ def aggregate_walkforward(results: list[dict]) -> dict:
             sharpe = m.get("sharpe", 0)
             try:
                 sharpe = float(sharpe)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 sharpe = 0.0
             all_sharpes.append(sharpe if math.isfinite(sharpe) else 0.0)
         compounded *= (1.0 + ret / 100.0)
