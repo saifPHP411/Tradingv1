@@ -1,3 +1,4 @@
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -275,4 +276,76 @@ def api_protection_status():
     return {
         "protection_unverified": get_protection_unverified(),
         "reason": get_protection_unverified_reason(),
+    }
+
+
+# ============ Pipeline diagnostics (READ-ONLY) ============
+# /api/status returning 200 only proves the web app is up; it says nothing about
+# whether the decision pipeline actually produced valid market data. This
+# endpoint reports the most recent decision per symbol and classifies its HOLD
+# reason, so an operator can tell a provider/contract failure ("invalid data")
+# apart from a legitimate gate (analyst score, regime, risk veto).
+#
+# It is strictly read-only: it never invokes the graph, the controller, the
+# monitor or the broker, and it submits no order.
+@app.get("/api/diagnostics")
+def api_diagnostics(limit: int = 50):
+    # Clamp the row window: this is a diagnostic view, not an export.
+    rows = recent_decisions(max(1, min(int(limit), 200)))
+
+    by_symbol: dict = {}
+    for row in rows:                      # rows are newest-first
+        sym = row.get("symbol")
+        if sym and sym not in by_symbol:
+            by_symbol[sym] = row
+
+    latest = []
+    for sym, row in sorted(by_symbol.items()):
+        raw = row.get("analyst_diagnostic")
+        diagnostic: dict = {}
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    diagnostic = loaded
+            except (TypeError, ValueError):
+                # A corrupt diagnostic blob must degrade to "unknown", not 500.
+                diagnostic = {}
+
+        stage = diagnostic.get("stage")
+        analyst_signal = row.get("analyst_signal")
+        if stage == "input":
+            hold_reason = "invalid_data"
+        elif stage == "signal_score":
+            hold_reason = "below_threshold"
+        elif stage == "regime":
+            hold_reason = "regime"
+        elif analyst_signal == "HOLD":
+            hold_reason = "analyst_or_risk_gate"
+        else:
+            hold_reason = "executed_or_veto"
+
+        latest.append({
+            "symbol": sym,
+            "timestamp": row.get("timestamp"),
+            "final_decision": row.get("final_decision"),
+            "analyst_signal": analyst_signal,
+            "analyst_reason": row.get("analyst_reason"),
+            "diagnostic_stage": stage,
+            "signal_score": diagnostic.get("signal_score"),
+            "threshold": diagnostic.get("threshold"),
+            "market_regime": diagnostic.get("market_regime"),
+            "llm_called": diagnostic.get("llm_called"),
+            "data_valid": stage != "input",
+            "hold_reason": hold_reason,
+        })
+
+    return {
+        "note": ("read-only pipeline diagnostics; does not start the controller "
+                 "or submit orders"),
+        "controller_running": controller.is_running(),
+        "monitor_running": monitor.is_running(),
+        "is_dry_run": is_dry_run(),
+        "symbols_configured": get_symbols(),
+        "latest_by_symbol": latest,
     }
