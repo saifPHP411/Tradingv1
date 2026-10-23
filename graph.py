@@ -5,7 +5,7 @@ from pathlib import Path
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from state import TradingState
+from state import TradingState, CYCLE_BOUNDARY
 from agents import analyst_agent, risk_manager_agent, portfolio_manager_agent
 from memory_layer import get_similar_experiences
 
@@ -18,9 +18,24 @@ _conn = sqlite3.connect(_db_path, check_same_thread=False)
 checkpointer = SqliteSaver(_conn)
 checkpointer.setup()
 
+# NOTE (known limitation, measured): the checkpointer persists every node write
+# per thread and is never pruned, so a long-lived per-symbol thread grows by a
+# fixed number of rows each cycle (measured: 6 checkpoint rows / 24 write rows
+# per cycle) regardless of the ``logs`` reducer. That is disk growth, not a
+# correctness problem: each cycle's decision state is rebuilt from the caller's
+# full input, and durable audit history lives in decision_log, not here. Pruning
+# the thread per cycle (``checkpointer.delete_thread``) would bound it but
+# changes checkpoint-restore semantics, so it is deliberately left as a separate,
+# explicitly-authorized change rather than folded into this fix.
+
+
 def enrich_with_memory(state: TradingState) -> dict:
     context = get_similar_experiences(state)
-    return {"memory_context": context, "logs": ["الذاكرة: تم استرجاع السياق"]}
+    # Entry node of every cycle: the leading CYCLE_BOUNDARY resets the
+    # append-only ``logs`` transcript so this cycle never replays a previous
+    # cycle's evidence (see state._merge_cycle_logs).
+    return {"memory_context": context,
+            "logs": [CYCLE_BOUNDARY, "الذاكرة: تم استرجاع السياق"]}
 
 builder = StateGraph(TradingState)
 builder.add_node("memory_enrich", enrich_with_memory)

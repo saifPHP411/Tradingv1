@@ -312,7 +312,11 @@ def portfolio_manager_agent(state: TradingState) -> dict:
     symbol = state.get("symbol", "?")
     if risk.get("veto") or not risk.get("approved"):
         decision = "VETO" if risk.get("veto") else "HOLD"
-        return {"final_decision": decision, "consensus_reached": False,
+        # Explicitly clear order_details: the checkpointer persists this node's
+        # return, so a prior cycle's order would otherwise survive into a
+        # non-executing decision if the caller omitted the key (see RC-4).
+        return {"final_decision": decision, "order_details": None,
+                "consensus_reached": False,
                 "logs": [f"مدير المحفظة[{symbol}]: {decision}"]}
 
     signal = state["analyst_report"].get("signal", "HOLD")
