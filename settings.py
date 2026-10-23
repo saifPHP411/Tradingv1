@@ -26,10 +26,15 @@ from config import (
     EXIT_LLM_INTERVAL_SECONDS as C_EXIT_LLM,
     ALLOW_EXTENDED_HOURS as C_ALLOW_EXT,
     CYCLE_INTERVAL_MINUTES as C_CYCLE,
+    FEES_PER_SHARE as C_FEES_PER_SHARE,
+    ENTRY_SLIPPAGE_BPS as C_ENTRY_SLIPPAGE,
+    EXIT_SLIPPAGE_BPS as C_EXIT_SLIPPAGE,
+    MAX_HOLD_BARS as C_MAX_HOLD,
+    ENABLE_SHORT as C_ENABLE_SHORT,
     get_trading_mode,
 )
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 _VERSION_KEY = "settings_version"
 
 # All defaults come from config. This is the single source of truth.
@@ -56,6 +61,11 @@ DEFAULTS = {
     "exit_llm_interval_seconds": str(C_EXIT_LLM),
     "allow_extended_hours": "true" if C_ALLOW_EXT else "false",
     "cycle_interval_minutes": str(C_CYCLE),
+    "fees_per_share": str(C_FEES_PER_SHARE),
+    "entry_slippage_bps": str(C_ENTRY_SLIPPAGE),
+    "exit_slippage_bps": str(C_EXIT_SLIPPAGE),
+    "max_hold_bars": str(C_MAX_HOLD),
+    "enable_short": str(C_ENABLE_SHORT),
     "symbols": json.dumps(C_SYMBOLS),
     "trading_capital": "0",
     "regime_enabled": "1",
@@ -82,6 +92,16 @@ def _migrate_if_needed():
     If persistent settings came from SETTINGS_VERSION < 2, overwrite
     every risk-critical key with the new config defaults and drop legacy keys.
     This prevents old DB values from silently overriding new risk model.
+
+    Migration semantics (intentional, tested in tests/test_phase1_6_remediation.py):
+      - The risk-critical keys listed below are FORCED back to the current
+        config defaults on a version bump, so an operator-tuned value is
+        deliberately discarded when the risk model changes. The keys that are
+        NOT in that list (max_open_positions, max_trades_per_day,
+        max_daily_loss_pct) are preserved.
+      - Legacy percentage keys are blanked so the monitor cannot read them.
+      - The migration is idempotent: once the stored version equals
+        SETTINGS_VERSION, only missing defaults are filled.
     """
     raw = get_trading_state(_VERSION_KEY)
     current = int(raw) if raw and raw.isdigit() else 1
@@ -140,12 +160,17 @@ def get_all_settings() -> dict:
         "exit_llm_interval_seconds": int(get_setting("exit_llm_interval_seconds")),
         "allow_extended_hours": get_setting("allow_extended_hours") == "true",
         "cycle_interval_minutes": int(get_setting("cycle_interval_minutes")),
+        "fees_per_share": float(get_setting("fees_per_share")),
+        "entry_slippage_bps": float(get_setting("entry_slippage_bps")),
+        "exit_slippage_bps": float(get_setting("exit_slippage_bps")),
+        "max_hold_bars": int(get_setting("max_hold_bars")),
+        "enable_short": int(get_setting("enable_short")),
         "symbols": json.loads(get_setting("symbols")),
         "trading_capital": float(get_setting("trading_capital")),
         "regime_enabled": int(get_setting("regime_enabled")),
         "news_enabled": int(get_setting("news_enabled")),
         # explicit flags
-        "dry_run": get_trading_mode() != "LIVE",
+        "dry_run": is_dry_run(),
         "trading_mode": get_trading_mode(),
         "settings_version": SETTINGS_VERSION,
     }
@@ -165,7 +190,32 @@ def update_settings(payload: dict):
 
 
 def is_dry_run() -> bool:
-    return get_trading_mode() != "LIVE"
+    """True only when the process must never submit a broker order.
+
+    BACKTEST is the only dry-run mode. PAPER targets Alpaca's paper endpoint
+    and is allowed to submit (gated by safety + risk checks); LIVE is allowed
+    only when the explicit live safeguards are satisfied.
+    """
+    return get_trading_mode() == "BACKTEST"
+
+
+def is_paper() -> bool:
+    """True when orders (if any) go to Alpaca's PAPER endpoint."""
+    return get_trading_mode() == "PAPER"
+
+
+def is_live() -> bool:
+    """True only under the explicit live authorization safeguards."""
+    return get_trading_mode() == "LIVE"
+
+
+def broker_submission_allowed() -> bool:
+    """Whether this process may ever call the broker to submit an order.
+
+    BACKTEST must never submit. PAPER and LIVE may submit, but only after the
+    safety and risk gates in broker.execute_order approve the order.
+    """
+    return get_trading_mode() in ("PAPER", "LIVE")
 
 
 def set_dry_run(v: bool):

@@ -55,6 +55,25 @@ Execution realism:
 Strategy vs execution:
     - Strategy is LONG-only by design (enable_short defaults to 0).
     - Execution engine is LONG and SHORT capable.
+
+Live-only settings (NOT applied by this backtester):
+    Several keys in the shared settings dict exist for the live/paper
+    monitor and agents and have NO backtest equivalent. They are accepted
+    (so run_backtest.py does not crash) but deliberately ignored here:
+      - min_confidence, llm_exit_min_confidence: LLM confidence gates.
+      - min_hold_minutes, min_loss_to_close_pct: live exit-agent noise
+        filters (the backtest exit model is stop/target/trailing/max_hold).
+      - min_stop_move_pct: minimum trailing-stop move; the backtest trails
+        on every bar that satisfies the activation rule.
+      - allow_extended_hours, cycle_interval_minutes, exit_check_seconds,
+        exit_llm_interval_seconds: live session/polling cadence.
+      - trading_capital: live sizing override.
+    regime_enabled/news_enabled exist in settings, but the backtest always
+    computes regime from SPY (no news is used: historical news is
+    unavailable and using it would risk lookahead). Do not add future news
+    or LLM predictions to historical backtests.
+    This means backtest and live results are NOT expected to match exactly;
+    this engine models the mechanical risk/exit rules, not the LLM overlay.
 """
 from __future__ import annotations
 
@@ -278,15 +297,38 @@ class PortfolioState:
             return False, "max_trades_per_day"
         if len(self.positions) >= s["max_open_positions"]:
             return False, "max_open_positions"
-        if self.daily_start_equity > 0:
-            eq = self.equity(prices)
-            daily_pnl = (eq - self.daily_start_equity) / self.daily_start_equity
-            if daily_pnl <= -s["max_daily_loss_pct"]:
-                return False, "daily_loss"
+        # Fail closed on an already-ruined account. A non-positive daily start
+        # equity means the account had no capital to protect at the start of
+        # the session, so the daily-loss ratio is undefined. Previously the
+        # check was skipped and new entries were allowed. This gate only blocks
+        # NEW entries; position management/exits are driven separately in the
+        # bar loop and are unaffected.
+        if self.daily_start_equity <= 0:
+            return False, "ruined_account"
+        eq = self.equity(prices)
+        daily_pnl = (eq - self.daily_start_equity) / self.daily_start_equity
+        if daily_pnl <= -s["max_daily_loss_pct"]:
+            return False, "daily_loss"
         return True, "ok"
 
     def can_open(self, entry_notional: float, entry_fees: float,
-                 side: str = "long") -> tuple[bool, str]:
+                 side: str = "long",
+                 equity: float | None = None) -> tuple[bool, str]:
+        """
+        Capital check for a new position.
+
+        ``equity`` (optional) is the marked-to-market portfolio equity at the
+        decision point. When supplied and non-positive, no new position may be
+        opened: a cash-secured account that has been wiped out (or driven
+        negative by a short loss) must not take on fresh risk even if
+        available_cash still looks positive. Callers that omit ``equity`` keep
+        the legacy cash-only behaviour.
+        """
+        if equity is not None and equity <= 0:
+            return False, (
+                f"non_positive_equity (equity={equity:.2f}; "
+                f"available={self.available_cash:.2f})"
+            )
         available = self.available_cash
         required = entry_notional + entry_fees
         if available < required:
@@ -393,13 +435,42 @@ def _bar_row(df, ts):
         return None
 
 
+def _naive_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a chronologically ordered frame with a naive-UTC DatetimeIndex.
+
+    tz-aware indices (yfinance) would otherwise raise TypeError when compared
+    with naive window boundaries. Non-datetime indices are returned unchanged.
+    Sorting here also protects direct callers of ``simulate_portfolio`` that
+    bypass ``backtest.data._normalize``: indicator windows must contain only
+    bars at or before the timestamp being evaluated. Duplicate timestamps are
+    dropped (first kept) for the same reason, so ``df.loc[ts]`` returns one bar.
+    """
+    if df is None:
+        return None
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+        out = df.copy()
+        out.index = idx.tz_convert("UTC").tz_localize(None)
+    else:
+        out = df
+    if not out.index.is_monotonic_increasing:
+        out = out.sort_index(kind="stable")
+    # Drop duplicate timestamps (keep the first) so ``df.loc[ts]`` yields a
+    # scalar bar instead of a Series. Same policy as ``backtest.data._normalize``;
+    # the stable sort above preserves original order among equal keys, so the
+    # kept "first" row is the one _normalize would have kept too.
+    if not out.index.is_unique:
+        out = out[~out.index.duplicated(keep="first")]
+    return out
+
+
 # ============ Main Portfolio Simulation ============
 def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                        spy_df: pd.DataFrame | None,
                        start_equity: float = 10000.0,
                        settings: dict | None = None,
                        trading_start_ts=None,
-                       max_hold_bars: int = 60) -> dict:
+                       max_hold_bars: int | None = None) -> dict:
     """
     Bar-driven portfolio backtest.
 
@@ -409,15 +480,28 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         If set, no signals are queued before this timestamp. Indicator
         warmup still uses all earlier bars (no lookahead), but no trades
         are opened during warmup. Used by walk-forward OOS windows.
-    max_hold_bars : int
-        Force-close a position after this many bars. Defaults to 60.
+    max_hold_bars : int, optional
+        Force-close a position after this many bars. If None, uses
+        settings["max_hold_bars"] (default 60).
     """
     if settings is None:
         settings = get_all_settings()
 
+    if max_hold_bars is None:
+        max_hold_bars = int(settings.get("max_hold_bars", 60))
+    max_hold_bars = int(max_hold_bars)
+    if max_hold_bars < 1:
+        raise ValueError(f"max_hold_bars must be >= 1, got {max_hold_bars}")
+
     if not BACKTEST_NEWS_AVAILABLE:
         print("ℹ️ backtest: historical news unavailable — scoring with "
               "news={'available': False} (deterministic, no lookahead).")
+
+    # Normalize any tz-aware index to naive UTC so bar timestamps compare
+    # consistently with naive window boundaries and never raise TypeError.
+    # The caller's DataFrames are not mutated.
+    symbols_data = {sym: _naive_index(df) for sym, df in symbols_data.items()}
+    spy_df = _naive_index(spy_df) if spy_df is not None else None
 
     # Normalize trading_start_ts to a naive UTC Timestamp or None.
     if trading_start_ts is not None:
@@ -429,7 +513,14 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     all_times = sorted({ts for df in symbols_data.values() for ts in df.index})
     cursors = {sym: 0 for sym in symbols_data}
     pending = {sym: None for sym in symbols_data}
+    # Entries rejected for a non-positive derived stop/target. Exposed in the
+    # result so a malformed gap is observable instead of silently skipped.
+    rejections: list[dict] = []
     last_prices: dict[str, float] = {}
+    # Prices known at the CURRENT bar's open = the last completed bar's close.
+    # Execution-time risk gates must use these, not this bar's close, or the
+    # gate would react to information the market had not yet revealed.
+    gate_prices: dict[str, float] = {}
     last_ts = all_times[-1] if all_times else None
     enable_short = bool(int(settings.get("enable_short", 0) or 0))
 
@@ -456,7 +547,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
             # triggered cooldown, or a daily-loss lock may have started.
             # Without this recheck, pending entries bypass max_open_positions,
             # max_trades_per_day, daily_loss, and cooldown.
-            gate_ok, _ = state.can_trade(ts.isoformat(), last_prices)
+            # gate_prices (prior bar's close) is used so the recheck does not
+            # consume this bar's close before it has happened.
+            gate_ok, _ = state.can_trade(ts.isoformat(), gate_prices)
             if not gate_ok:
                 pending[sym] = None
                 continue
@@ -481,19 +574,54 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 target_price = fill_price - p["target_dist"]
                 side = SHORT
 
+            # A bar can gap far enough that the derived stop or target is zero
+            # or negative. Such a price is not a valid protection level, and
+            # normalize_price_for_symbol() would raise ValueError and abort the
+            # whole backtest. Reject this one entry and keep simulating; never
+            # clamp a nonsensical level to an arbitrary positive number.
+            if stop_price <= 0 or target_price <= 0:
+                rejections.append({
+                    "symbol": sym, "time": ts, "reason": "invalid_stop_or_target",
+                    "fill_price": round(fill_price, 6),
+                    "stop_price": round(stop_price, 6),
+                    "target_price": round(target_price, 6),
+                })
+                print(f"⚠️ backtest: {sym} entry rejected at {ts} — "
+                      f"non-positive stop/target (stop={stop_price:.4f}, "
+                      f"target={target_price:.4f}, fill={fill_price:.4f})")
+                pending[sym] = None
+                continue
+
             stop_price = normalize_price_for_symbol(sym, stop_price)
             target_price = normalize_price_for_symbol(sym, target_price)
+            # Tick rounding can collapse a tiny positive level to zero; that is
+            # equally invalid, so reject it rather than open an unprotected
+            # position.
+            if stop_price <= 0 or target_price <= 0:
+                rejections.append({
+                    "symbol": sym, "time": ts,
+                    "reason": "invalid_stop_or_target_after_rounding",
+                    "fill_price": round(fill_price, 6),
+                    "stop_price": round(stop_price, 6),
+                    "target_price": round(target_price, 6),
+                })
+                print(f"⚠️ backtest: {sym} entry rejected at {ts} — "
+                      f"stop/target rounded to non-positive "
+                      f"(stop={stop_price:.4f}, target={target_price:.4f})")
+                pending[sym] = None
+                continue
             qty = p["qty"]
             entry_notional = qty * fill_price
             entry_fees = qty * settings["fees_per_share"]
 
-            ok, _ = state.can_open(entry_notional, entry_fees, side)
+            ok, _ = state.can_open(entry_notional, entry_fees, side,
+                                   equity=state.equity(gate_prices))
             if not ok:
                 pending[sym] = None
                 continue
 
             exp_ok, _ = validate_portfolio_exposure(
-                state.equity(last_prices), state.positions,
+                state.equity(gate_prices), state.positions,
                 entry_notional, settings["max_portfolio_exposure_pct"],
             )
             if not exp_ok:
@@ -580,6 +708,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                         new_stop = pos.lowest_price + (rps * settings["trailing_distance_r"])
                         if new_stop < pos.stop and new_stop > close:
                             pos.stop = normalize_price_for_symbol(sym, new_stop)
+
+        # Bar is complete: its close is the last price known before the next
+        # bar's open, so it becomes the gate reference for the next iteration.
+        gate_prices = dict(last_prices)
 
         # ---- 3) Generate signals (executed next bar)
         # Skip during warmup: indicators still use all earlier bars, but no
@@ -709,14 +841,15 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         "equity_curve": state.equity_curve,
         "final_positions": len(state.positions),
         "total_fees_paid": round(state.fees_paid, 2),
+        "rejections": rejections,
     }
 
 
 def simulate(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
-             start_equity: float = 10000.0, max_hold_bars: int = 60,
-             trading_start_ts=None) -> dict:
+             start_equity: float = 10000.0, max_hold_bars: int | None = None,
+             trading_start_ts=None, settings: dict | None = None) -> dict:
     r = simulate_portfolio(
-        {symbol: df}, spy_df, start_equity,
+        {symbol: df}, spy_df, start_equity, settings=settings,
         trading_start_ts=trading_start_ts,
         max_hold_bars=max_hold_bars,
     )

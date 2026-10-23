@@ -18,14 +18,25 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
 # ============ Trading Mode — SINGLE SOURCE ============
 # BACKTEST: no broker calls (used by backtester/engine)
-# PAPER:    Alpaca Paper Trading
+# PAPER:    Alpaca Paper Trading — targets the paper endpoint, CAN submit
 # LIVE:     requires TRADING_MODE=live + ENABLE_LIVE_TRADING=true + confirmation
+#
+# Unknown/typo values fail SAFE to PAPER (never LIVE).
 TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()
 ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 LIVE_TRADING_CONFIRMATION = os.getenv("LIVE_TRADING_CONFIRMATION", "")
 
+_KNOWN_MODES = ("backtest", "paper", "live")
+
 def get_trading_mode() -> str:
-    """The ONLY function the project should use to know trading mode."""
+    """The ONLY function the project should use to know trading mode.
+
+    Resolution order:
+      - "backtest"                 → BACKTEST (no broker orders, ever)
+      - "live" + live safeguards   → LIVE
+      - "live" without safeguards  → PAPER (fail safe)
+      - "paper" or anything else   → PAPER (unknown values never select LIVE)
+    """
     if TRADING_MODE == "backtest":
         return "BACKTEST"
     live_ok = (
@@ -36,6 +47,9 @@ def get_trading_mode() -> str:
     return "LIVE" if live_ok else "PAPER"
 
 ALPACA_PAPER = get_trading_mode() != "LIVE"
+if TRADING_MODE not in _KNOWN_MODES:
+    print(f"⚠️ config: unknown TRADING_MODE={TRADING_MODE!r} — "
+          f"failing safe to {get_trading_mode()}")
 if get_trading_mode() == "LIVE":
     print("🚨 WARNING: LIVE TRADING IS ENABLED — REAL MONEY AT RISK 🚨")
 
@@ -65,6 +79,16 @@ FEES_PER_SHARE = 0.0
 ENTRY_SLIPPAGE_BPS = 5
 EXIT_SLIPPAGE_BPS = 5
 
+# ============ Execution ============
+# Bars after which an open position is force-closed ("MAX_HOLD").
+# 60 daily bars ≈ 3 trading months. Overridable per run (CLI / walk-forward).
+MAX_HOLD_BARS = 60
+
+# ============ Strategy direction ============
+# Strategy is LONG-only by design. The execution engine is SHORT-capable;
+# set ENABLE_SHORT=1 (env) or pass settings["enable_short"]=1 to exercise it.
+ENABLE_SHORT = 1 if os.getenv("ENABLE_SHORT", "0").strip() in ("1", "true", "True") else 0
+
 # ============ LLM Exit Sensitivity ============
 MIN_HOLD_MINUTES = 30
 MIN_LOSS_TO_CLOSE_PCT = 1.5
@@ -91,4 +115,7 @@ ACCOUNT_EQUITY_DEFAULT = 10000
 
 # ============ Legacy aliases — DO NOT USE IN NEW CODE ============
 ONLY_MARKET_HOURS = True
-DRY_RUN = get_trading_mode() == "PAPER"
+# DRY_RUN means "never submit a broker order" — true ONLY for BACKTEST.
+# PAPER targets the paper endpoint and is allowed to submit. Use
+# settings.is_dry_run() / is_paper() / is_live() instead of this constant.
+DRY_RUN = get_trading_mode() == "BACKTEST"

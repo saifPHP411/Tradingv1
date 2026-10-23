@@ -129,28 +129,127 @@ def test_aggregate_handles_negative_returns():
     assert agg["cumulative_return_pct"] == pytest.approx(-1.0, abs=0.01)
 
 
-# ---- max_hold_bars respected by simulate() ----
+# ---- max_hold_bars respected deterministically ----
 
-def test_simulate_respects_max_hold_bars():
-    n = 200
-    closes = [100.0] * n  # flat; only exits will be MAX_HOLD or EOD
-    df = _df_from_closes = pd.DataFrame({
-        "Open": closes, "High": closes, "Low": closes, "Close": closes,
-        "Volume": [1_000_000] * n,
-    }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+def _max_hold_df():
+    """
+    Rising trend for the first 61 bars (so a LONG signal fires at index 60),
+    then a flat market with a +/-0.1% range.
 
-    # Force a signal by overriding the score check indirectly — use a strong uptrend.
+    The stop distance is ATR * 2.5, which on this series is far larger than
+    the flat range, so neither STOP nor TARGET can ever be touched after
+    entry. The only possible exit is MAX_HOLD (or END_OF_DATA if the data
+    ends first). This isolates the max_hold_bars rule.
+    """
+    rise = list(100 + np.arange(61) * 0.5)
+    flat = [rise[-1]] * 20
+    closes = rise + flat
+    n = len(closes)
     idx = pd.date_range("2024-01-01", periods=n, freq="D")
-    rising = 100 + np.arange(n) * 0.5
-    df_rise = pd.DataFrame({
-        "Open": rising, "High": rising * 1.02, "Low": rising * 0.98,
-        "Close": rising, "Volume": [1_000_000] * n,
-    }, index=idx)
+    return pd.DataFrame({
+        "Open": closes, "High": [c * 1.001 for c in closes],
+        "Low": [c * 0.999 for c in closes], "Close": closes,
+        "Volume": [1_000_000] * n,
+    }, index=idx), idx
 
-    result = simulate(
-        "AAA", df_rise, None, start_equity=100_000,
-        max_hold_bars=5,
+
+def test_max_hold_bars_exits_at_exactly_5_bars():
+    """
+    With max_hold_bars=5 and neither STOP nor TARGET reachable, the position
+    MUST exit with reason MAX_HOLD after exactly 5 bars.
+
+    END_OF_DATA is explicitly rejected as a substitute: the data continues
+    for 15 bars past the exit, so an END_OF_DATA exit here would mean the
+    rule was not applied.
+    """
+    df, idx = _max_hold_df()
+    result = simulate_portfolio(
+        {"AAA": df}, None, start_equity=100_000,
+        settings=_settings(), max_hold_bars=5,
     )
-    # If any trade lasted longer than 5 bars, the wrapper ignored max_hold_bars.
+
+    assert result["trades"], "expected at least one trade"
+    first = result["trades"][0]
+
+    assert first["exit_reason"] == "MAX_HOLD", (
+        f"expected MAX_HOLD, got {first['exit_reason']}"
+    )
+    assert first["bars_held"] == 5, f"expected 5 bars, got {first['bars_held']}"
+
+    # Deterministic entry/exit timing: signal on bar 60, entry on bar 61
+    # (next open), exit on the 5th bar held = bar 65.
+    assert first["entry_time"] == idx[61]
+    assert first["exit_time"] == idx[65]
+
+    # No trade may ever exit on END_OF_DATA while MAX_HOLD is binding.
     for t in result["trades"]:
-        assert t["bars_held"] <= 5 or t["exit_reason"] == "END_OF_DATA"
+        assert t["exit_reason"] != "END_OF_DATA"
+
+
+def test_max_hold_bars_scales_with_setting():
+    """bars_held must track max_hold_bars, proving the setting is honoured."""
+    df, idx = _max_hold_df()
+    for limit in (2, 3, 5, 8):
+        result = simulate_portfolio(
+            {"AAA": df}, None, start_equity=100_000,
+            settings=_settings(), max_hold_bars=limit,
+        )
+        assert result["trades"], f"no trades for max_hold_bars={limit}"
+        t = result["trades"][0]
+        assert t["exit_reason"] == "MAX_HOLD"
+        assert t["bars_held"] == limit
+        # Entry bar counts as bars_held == 1, so the exit lands on
+        # idx[61 + limit - 1].
+        assert t["exit_time"] == idx[61 + limit - 1]
+
+
+def test_no_binding_exit_can_reach_end_of_data():
+    """
+    A position with no binding exit condition (huge max_hold_bars, no
+    stop/target touch) must legitimately exit with END_OF_DATA.
+    """
+    df, idx = _max_hold_df()
+    result = simulate_portfolio(
+        {"AAA": df}, None, start_equity=100_000,
+        settings=_settings(), max_hold_bars=10_000,
+    )
+    assert result["trades"], "expected at least one trade"
+    assert result["trades"][-1]["exit_reason"] == "END_OF_DATA"
+    assert result["final_positions"] == 0
+
+
+def test_max_hold_bars_defaults_to_settings_when_not_passed():
+    """Omitting max_hold_bars must use settings['max_hold_bars']."""
+    df, idx = _max_hold_df()
+    result = simulate_portfolio(
+        {"AAA": df}, None, start_equity=100_000,
+        settings=_settings(max_hold_bars=3),
+    )
+    assert result["trades"]
+    assert result["trades"][0]["exit_reason"] == "MAX_HOLD"
+    assert result["trades"][0]["bars_held"] == 3
+
+
+def test_max_hold_bars_rejects_non_positive():
+    df, _ = _max_hold_df()
+    with pytest.raises(ValueError):
+        simulate_portfolio({"AAA": df}, None, start_equity=100_000,
+                           settings=_settings(), max_hold_bars=0)
+
+
+# ---- engine reads the same settings dict the CLI produces ----
+
+def test_simulate_with_real_settings_dict_does_not_raise():
+    """
+    Regression: settings.get_all_settings() used to omit fees/slippage keys,
+    so run_backtest.py crashed with KeyError the moment a trade opened.
+    """
+    from settings import get_all_settings
+    df, _ = _max_hold_df()
+    s = get_all_settings()
+    s["min_signal_score"] = 30
+    s["max_open_positions"] = 1
+    result = simulate_portfolio({"AAA": df}, None, start_equity=100_000,
+                                settings=s, max_hold_bars=5)
+    assert result["trades"], "engine produced no trades with real settings"
+

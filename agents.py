@@ -4,10 +4,13 @@ from settings import get_all_settings
 from state import TradingState
 from signals import compute_signal_score
 from safety import get_account_snapshot
-from risk_engine import check_portfolio_exposure
+from risk_engine import check_portfolio_exposure, get_committed_exposure_value
 from regime import get_market_regime
 from news import get_news_sentiment
-from risk_utils import validate_risk_plan, normalize_price_for_symbol
+from risk_utils import (
+    validate_risk_plan, normalize_price_for_symbol,
+    whole_share_qty, can_protect_with_stop,
+)
 import json, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
@@ -24,30 +27,51 @@ def analyst_agent(state: TradingState) -> dict:
     if not data or "atr14" not in data:
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": "no valid indicators", "signal_score": 0},
-            "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة"],
+                               "reason": "no valid indicators", "signal_score": 0,
+                               "regime": "UNKNOWN",
+                               "diagnostic": {"stage": "input", "llm_called": False,
+                                              "signal_score": 0,
+                                              "score_components": {},
+                                              "market_regime": "UNKNOWN"}},
+            "logs": [f"المحلل[{symbol}]: HOLD — بيانات غير صالحة (LLM not called)"],
         }
 
     settings = get_all_settings()
     regime = get_market_regime() if settings["regime_enabled"] else None
     news = get_news_sentiment(symbol) if settings["news_enabled"] else None
     sig = compute_signal_score(data, regime, news)
+    score_parts = {key: sig.get(key, 0) for key in
+                   ("trend", "momentum", "rsi", "bb", "volume", "news")}
+    regime_name = regime["regime"] if regime else "UNKNOWN"
 
     if sig["score"] < settings["min_signal_score"]:
+        reason = f"signal score below threshold ({sig['score']} < {settings['min_signal_score']})"
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": f"score={sig['score']} < {settings['min_signal_score']}",
-                               "signal_score": sig["score"]},
-            "logs": [f"المحلل[{symbol}]: HOLD — score {sig['score']} < {settings['min_signal_score']}"],
+                               "reason": reason, "signal_score": sig["score"],
+                               "regime": regime_name,
+                               "diagnostic": {"stage": "signal_score", "llm_called": False,
+                                              "threshold": settings["min_signal_score"],
+                                              "signal_score": sig["score"],
+                                              "market_regime": regime_name,
+                                              "score_components": score_parts}},
+            "logs": [f"المحلل[{symbol}]: HOLD — {reason}; components={score_parts}; "
+                     f"regime={regime_name}; LLM not called"],
         }
 
-    regime_name = regime["regime"] if regime else "UNKNOWN"
     if regime_name == "BEAR":
+        reason = "BEAR market — no new longs"
         return {
             "analyst_report": {"signal": "HOLD", "confidence": 0.0,
-                               "reason": "BEAR market — no new longs",
-                               "signal_score": sig["score"]},
-            "logs": [f"المحلل[{symbol}]: HOLD — سوق هابط (BEAR)"],
+                               "reason": reason, "signal_score": sig["score"],
+                               "regime": regime_name,
+                               "diagnostic": {"stage": "regime", "llm_called": False,
+                                              "threshold": settings["min_signal_score"],
+                                              "signal_score": sig["score"],
+                                              "market_regime": regime_name,
+                                              "score_components": score_parts}},
+            "logs": [f"المحلل[{symbol}]: HOLD — {reason}; score={sig['score']}; "
+                     f"LLM not called"],
         }
 
     memory = state.get("memory_context", "")
@@ -83,19 +107,38 @@ def analyst_agent(state: TradingState) -> dict:
 أجب JSON فقط: {{"signal":"BUY"|"SELL"|"HOLD","confidence":0-1,"reason":"سطر واحد"}}"""
 
     report = {"signal": "HOLD", "confidence": 0.0, "reason": "LLM invalid"}
+    llm_attempts = 0
+    llm_status = "invalid_response"
+    llm_error_type = None
     for attempt in range(2):
+        llm_attempts += 1
         try:
             suffix = "\n\nJSON فقط." if attempt else ""
             resp = llm.invoke(prompt + suffix)
             report = _parse_llm_json(resp.content)
             if report.get("signal") in ("BUY", "SELL", "HOLD") and report.get("confidence", 0) > 0:
+                llm_status = "success"
                 break
         except Exception as e:
-            report = {"signal": "HOLD", "confidence": 0.0, "reason": f"LLM err: {e}"}
+            # Do not copy exception text into reports/logs: HTTP clients may
+            # include URLs, headers, or other credential-bearing details.
+            llm_status = "error"
+            llm_error_type = type(e).__name__
+            report = {"signal": "HOLD", "confidence": 0.0,
+                      "reason": "LLM request failed"}
 
     report["signal_score"] = sig["score"]
     report["regime"] = regime_name
     report["agent"] = "analyst"
+    report["diagnostic"] = {"stage": "llm", "llm_called": True,
+                            "threshold": settings["min_signal_score"],
+                            "signal_score": sig["score"],
+                            "market_regime": regime_name,
+                            "score_components": score_parts,
+                            "llm_attempts": llm_attempts,
+                            "llm_status": llm_status}
+    if llm_error_type:
+        report["diagnostic"]["llm_error_type"] = llm_error_type
     log = (f"المحلل[{symbol}]: {report.get('signal')} "
            f"conf={report.get('confidence', 0):.2f} "
            f"score={sig['score']} regime={regime_name}")
@@ -113,13 +156,15 @@ def risk_manager_agent(state: TradingState) -> dict:
     signal_score = analyst.get("signal_score", 0)
     regime_name = analyst.get("regime", "UNKNOWN")
 
+    # HOLD is a completed analyst decision. Do not label it as a risk veto
+    # merely because its confidence is zero; that obscures the actual gate.
+    if signal == "HOLD":
+        return {"risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
+                "logs": [f"مدير المخاطر[{symbol}]: HOLD — analyst returned HOLD"]}
     if confidence < settings["min_confidence"]:
         return _veto(symbol, f"confidence {confidence:.2f} < {settings['min_confidence']}")
     if signal_score < settings["min_signal_score"]:
         return _veto(symbol, f"score {signal_score} < {settings['min_signal_score']}")
-    if signal == "HOLD":
-        return {"risk_report": {"approved": False, "veto": False, "reason": "HOLD"},
-                "logs": [f"مدير المخاطر[{symbol}]: HOLD"]}
 
     atr = data.get("atr14", 0)
     last = data.get("last_close", 0)
@@ -136,13 +181,37 @@ def risk_manager_agent(state: TradingState) -> dict:
     if not snap.get("available"):
         return _veto(symbol, f"account data unavailable ({snap.get('reason')})")
 
-    equity = snap.get("equity", 0) or 0
-    buying_power = snap.get("buying_power", 0) or 0
+    acct_equity = snap.get("equity", 0) or 0
+    acct_buying_power = snap.get("buying_power", 0) or 0
 
+    # ---- Risk budget ----
+    # trading_capital > 0 is a HARD test budget. It caps sizing, per-trade risk
+    # and the total committed exposure this process will take, regardless of the
+    # (possibly very large) virtual account equity/buying power. It is a cap on
+    # capital at risk, NOT a synthetic balance substituted for real broker data:
+    # the real account numbers remain an additional, never-relaxed limit
+    # (equity = min(budget, account equity), buying_power likewise).
+    #
+    # Semantics (deterministic, no P&L drift):
+    #   budget            = trading_capital  (a hard exposure cap, constant)
+    #   committed         = market value of currently open positions
+    #   remaining buying  = max(budget - committed, 0)
+    #   per-trade risk    = min(budget, account equity) * max_risk_per_trade * mult
+    # Realized/unrealized P&L never RAISES the budget. Aggregate drawdown is
+    # caught by the daily-loss gate, which is also measured against this budget.
     trading_capital = settings.get("trading_capital", 0) or 0
     if trading_capital > 0:
-        equity = min(equity, trading_capital)
-        buying_power = min(buying_power, trading_capital)
+        committed = get_committed_exposure_value()
+        if committed is None:
+            # Cannot prove remaining budget → fail closed.
+            return _veto(symbol, "open exposure unknown — budget cannot be enforced")
+        remaining = max(trading_capital - committed, 0.0)
+        equity = min(trading_capital, acct_equity) if acct_equity > 0 else trading_capital
+        buying_power = min(remaining, acct_buying_power) \
+            if acct_buying_power > 0 else remaining
+    else:
+        equity = acct_equity
+        buying_power = acct_buying_power
 
     if equity <= 0:
         return _veto(symbol, "equity <= 0")
@@ -171,13 +240,25 @@ def risk_manager_agent(state: TradingState) -> dict:
         stop_price = last + stop_distance
         take_profit = last - target_distance
 
-    pos_size = risk_amount / stop_distance
-    if pos_size <= 0:
+    raw_qty = risk_amount / stop_distance
+    if raw_qty <= 0:
         return _veto(symbol, "position size <= 0")
 
     max_notional = equity * settings["max_position_pct"]
-    if pos_size * last > max_notional:
-        pos_size = max_notional / last
+    if raw_qty * last > max_notional:
+        raw_qty = max_notional / last
+
+    # Whole-share policy: a protective stop requires whole shares at Alpaca.
+    # Floor to whole shares; if the budget cannot fund even one whole share
+    # (with a valid stop) we SKIP the trade rather than fractional-size it or
+    # raise the risk budget.
+    pos_size = whole_share_qty(raw_qty)
+    ok_prot, why_prot = can_protect_with_stop(
+        pos_size, last, stop_price, "buy" if signal == "BUY" else "sell")
+    if not ok_prot:
+        return _veto(symbol, f"cannot protect: {why_prot} "
+                             f"(budget {trading_capital or equity:.2f}, "
+                             f"risk/size {raw_qty:.4f})")
 
     estimated_cost = pos_size * last
     if estimated_cost > buying_power:
@@ -190,7 +271,6 @@ def risk_manager_agent(state: TradingState) -> dict:
         if not exp_ok:
             return _veto(symbol, f"exposure: {exp_reason}")
 
-    pos_size = round(pos_size, 4)
     actual_risk = pos_size * stop_distance
     if actual_risk > risk_amount * 1.05:
         return _veto(symbol, f"actual risk {actual_risk:.2f} > limit {risk_amount:.2f}")
