@@ -658,6 +658,169 @@ def _extract_text(response: dict) -> str:
 # --------------------------------------------------------------------------
 
 
+def call_model(symbol: str, market_data: dict | None,
+               settings: dict | None = None,
+               *, _transport=None, _prompt_builder=None, _validator=None) -> dict:
+    """Perform the model call and return a full, auditable outcome.
+
+    This is the low-level sibling of :func:`get_market_context`. It exists so a
+    caller that needs the exact request bytes (for hashing and for an
+    append-only audit trail) can obtain them without duplicating the transport,
+    retry, budget or parsing logic.
+
+    ``_prompt_builder`` and ``_validator`` override the default advisory prompt
+    and reply validator. They let a caller with a different (e.g. closed, no
+    free text) contract reuse this transport/retry/budget machinery unchanged.
+
+    It NEVER raises. The returned dict always has ``available``; on failure
+    ``available`` is False and ``reason`` explains why. Extra keys:
+
+        ``body_bytes``      exact request payload that was (or would be) sent
+        ``raw_text``        text extracted from the reply, before JSON parsing
+        ``parsed``          validator output, or None
+        ``http_status``     status code seen, or None
+        ``attempts``        number of transport attempts made
+        ``latency_ms``      wall time spent in the transport calls
+        ``api_key_present`` whether a key was configured (the key itself is
+                            NEVER included)
+    """
+    started = time.monotonic()
+    build = _prompt_builder or build_prompt
+    validate = _validator or validate_context_payload
+
+    def _out(result: dict) -> dict:
+        result.setdefault("body_bytes", b"")
+        result.setdefault("raw_text", "")
+        result.setdefault("parsed", None)
+        result.setdefault("http_status", None)
+        result.setdefault("attempts", 0)
+        result.setdefault("api_key_present", False)
+        result.setdefault("latency_ms", 0)
+        return result
+
+    try:
+        cfg = _cfg(settings)
+    except Exception:  # _cfg is already safe; this is defence in depth
+        cfg = {"api_key": "", "enabled": False, "model": DEFAULT_MODEL,
+               "timeout": DEFAULT_TIMEOUT_SECONDS,
+               "max_per_minute": DEFAULT_MAX_CALLS_PER_MINUTE,
+               "max_per_day": DEFAULT_MAX_CALLS_PER_DAY,
+               "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+               "thinking_level": DEFAULT_THINKING_LEVEL}
+    model = cfg["model"]
+    key_present = bool(cfg["api_key"])
+
+    def _fail(reason: str, *, enabled: bool, extra: dict | None = None) -> dict:
+        out = _unavailable(reason, enabled=enabled, model=model)
+        out["api_key_present"] = key_present
+        out["latency_ms"] = int((time.monotonic() - started) * 1000)
+        if extra:
+            out.update(extra)
+        return _out(out)
+
+    try:
+        if not cfg["enabled"]:
+            return _fail("disabled", enabled=False)
+        if not cfg["api_key"]:
+            return _fail("no_api_key", enabled=True)
+
+        features = sanitize_market_features(market_data)
+        if not features:
+            return _fail("no_market_features", enabled=True)
+
+        _BUDGET.configure(cfg["max_per_minute"], cfg["max_per_day"])
+        allowed, why = _BUDGET.check()
+        if not allowed:
+            return _fail(why, enabled=True)
+
+        prompt = build(symbol, features)
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": _build_generation_config(cfg),
+        }).encode("utf-8")
+        url = f"{_API_BASE}/{model}:generateContent?key={cfg['api_key']}"
+
+        transport = _transport or _post_generate_content
+        deadline = time.monotonic() + cfg["timeout"]
+        response = None
+        attempt = 0          # transport invocations made
+        retries = 0          # retries granted so far
+        last_status = None
+        while True:
+            # Budget is consumed per attempt so a retry is counted too.
+            allowed, why = _BUDGET.check()
+            if not allowed:
+                return _fail(why, enabled=True,
+                             extra={"body_bytes": body, "attempts": attempt,
+                                    "http_status": last_status})
+            _BUDGET.consume()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return _fail("request_failed:TimeoutError", enabled=True,
+                             extra={"body_bytes": body, "attempts": attempt,
+                                    "http_status": last_status})
+            attempt += 1
+            try:
+                response = transport(url, body, min(cfg["timeout"], remaining))
+                break
+            except Exception as exc:  # network, timeout, HTTP error, bad JSON
+                last_status = _http_status(exc)
+                retryable = _is_retryable(exc)
+                remaining = deadline - time.monotonic()
+                delay = (_retry_delay(exc, remaining)
+                         if retryable and retries < _MAX_RETRIES else None)
+                if delay is None:
+                    return _fail(f"request_failed:{type(exc).__name__}",
+                                 enabled=True,
+                                 extra={"body_bytes": body, "attempts": attempt,
+                                        "http_status": last_status})
+                retries += 1
+                time.sleep(delay)
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+        text = _extract_text(response)
+        if not text:
+            return _fail("empty_response", enabled=True,
+                         extra={"body_bytes": body, "attempts": attempt,
+                                "http_status": 200, "latency_ms": latency_ms})
+
+        parsed = _extract_json_object(text)
+        if parsed is None:
+            return _fail("unparseable_response", enabled=True,
+                         extra={"body_bytes": body, "raw_text": text,
+                                "attempts": attempt, "http_status": 200,
+                                "latency_ms": latency_ms})
+
+        validated = validate(parsed)
+        if validated is None:
+            return _fail("schema_rejected", enabled=True,
+                         extra={"body_bytes": body, "raw_text": text,
+                                "attempts": attempt, "http_status": 200,
+                                "latency_ms": latency_ms})
+
+        out = _ok(bias=validated.get("bias", "NEUTRAL"),
+                  confidence=validated.get("confidence", 0.0),
+                  risk_level=validated.get("risk_level", "MEDIUM"),
+                  rationale=validated.get("rationale", ""),
+                  model=model)
+        out.update({
+            "body_bytes": body,
+            "raw_text": text,
+            "parsed": validated,
+            "http_status": 200,
+            "attempts": attempt,
+            "latency_ms": latency_ms,
+            "api_key_present": True,
+        })
+        return out
+    except Exception as exc:  # absolute fail-safe: never break the caller
+        out = _unavailable(f"internal_error:{type(exc).__name__}",
+                           enabled=cfg["enabled"], model=model)
+        out["api_key_present"] = key_present
+        out["latency_ms"] = int((time.monotonic() - started) * 1000)
+        return _out(out)
+
+
 def get_market_context(symbol: str, market_data: dict | None,
                        settings: dict | None = None,
                        *, _transport=None) -> dict:
@@ -676,84 +839,9 @@ def get_market_context(symbol: str, market_data: dict | None,
         ``advisory_only`` and ``affects_trading``. On any failure,
         ``available`` is False and ``affects_trading`` stays False.
     """
-    try:
-        cfg = _cfg(settings)
-    except Exception:  # _cfg is already safe; this is defence in depth
-        cfg = {"api_key": "", "enabled": False, "model": DEFAULT_MODEL,
-               "timeout": DEFAULT_TIMEOUT_SECONDS,
-               "max_per_minute": DEFAULT_MAX_CALLS_PER_MINUTE,
-               "max_per_day": DEFAULT_MAX_CALLS_PER_DAY}
-    model = cfg["model"]
-
-    try:
-        if not cfg["enabled"]:
-            return _unavailable("disabled", enabled=False, model=model)
-        if not cfg["api_key"]:
-            return _unavailable("no_api_key", enabled=True, model=model)
-
-        features = sanitize_market_features(market_data)
-        if not features:
-            return _unavailable("no_market_features", enabled=True, model=model)
-
-        _BUDGET.configure(cfg["max_per_minute"], cfg["max_per_day"])
-        allowed, why = _BUDGET.check()
-        if not allowed:
-            return _unavailable(why, enabled=True, model=model)
-
-        prompt = build_prompt(symbol, features)
-        body = json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": _build_generation_config(cfg),
-        }).encode("utf-8")
-        url = f"{_API_BASE}/{model}:generateContent?key={cfg['api_key']}"
-
-        transport = _transport or _post_generate_content
-        deadline = time.monotonic() + cfg["timeout"]
-        response = None
-        attempt = 0
-        while True:
-            # Budget is consumed per attempt so a retry is counted too.
-            allowed, why = _BUDGET.check()
-            if not allowed:
-                return _unavailable(why, enabled=True, model=model)
-            _BUDGET.consume()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return _unavailable("request_failed:TimeoutError",
-                                    enabled=True, model=model)
-            try:
-                response = transport(url, body, min(cfg["timeout"], remaining))
-                break
-            except Exception as exc:  # network, timeout, HTTP error, bad JSON
-                retryable = _is_retryable(exc)
-                remaining = deadline - time.monotonic()
-                delay = (_retry_delay(exc, remaining)
-                         if retryable and attempt < _MAX_RETRIES else None)
-                if delay is None:
-                    return _unavailable(
-                        f"request_failed:{type(exc).__name__}",
-                        enabled=True, model=model)
-                attempt += 1
-                time.sleep(delay)
-
-        text = _extract_text(response)
-        if not text:
-            return _unavailable("empty_response", enabled=True, model=model)
-
-        parsed = _extract_json_object(text)
-        if parsed is None:
-            return _unavailable("unparseable_response", enabled=True,
-                                model=model)
-
-        validated = validate_context_payload(parsed)
-        if validated is None:
-            return _unavailable("schema_rejected", enabled=True, model=model)
-
-        return _ok(bias=validated["bias"],
-                   confidence=validated["confidence"],
-                   risk_level=validated["risk_level"],
-                   rationale=validated["rationale"],
-                   model=model)
-    except Exception as exc:  # absolute fail-safe: never break the caller
-        return _unavailable(f"internal_error:{type(exc).__name__}",
-                            enabled=cfg["enabled"], model=model)
+    outcome = call_model(symbol, market_data, settings, _transport=_transport)
+    # Strip the audit-only keys so the public shape is unchanged.
+    return {k: v for k, v in outcome.items()
+            if k not in ("body_bytes", "raw_text", "http_status",
+                         "attempts", "latency_ms", "api_key_present",
+                         "parsed")}
