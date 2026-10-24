@@ -83,6 +83,12 @@ def print_summary(result: dict, metrics: dict):
     print(f"Avg Hold: {metrics.get('avg_hold_bars', 0):.1f} bars")
     print(f"Fees: ${metrics.get('total_fees', 0):.2f}")
     print(f"Slippage: ${metrics.get('total_slippage', 0):.2f}")
+    # Short financing is not modelled. Say so on every report rather than
+    # letting a reader assume a short result is fully costed.
+    print(f"Short borrow: {result.get('short_borrow_cost_mode', 'NOT_MODELED')}"
+          " (not included in the figures above)")
+    print(f"Cost model: v{result.get('cost_model_version', '?')}"
+          f", regulatory rounding: {result.get('regulatory_rounding', 'NONE')}")
     _print_rejections(result)
     print(f"{'='*60}\n")
 

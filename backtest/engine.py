@@ -90,6 +90,24 @@ from risk_utils import (
     normalize_price_for_symbol, compute_position_size,
     validate_portfolio_exposure, normalize_slippage,
 )
+import execution_costs as ec
+
+
+def _resolve_run_costs(settings: dict) -> tuple[dict, str]:
+    """Cost inputs and rounding mode for one run.
+
+    The three legacy keys are read directly, so a missing one still fails loud
+    exactly as before. The transaction-aware components default to zero, and
+    ``cost_model_strict`` turns a missing or malformed configuration into a
+    ``CostConfigurationError`` instead of a silent zero.
+    """
+    merged = dict(settings)
+    merged.update({
+        "fees_per_share": settings["fees_per_share"],
+        "entry_slippage_bps": settings["entry_slippage_bps"],
+        "exit_slippage_bps": settings["exit_slippage_bps"],
+    })
+    return ec.resolve_engine_costs(merged)
 
 
 # ---------------------------------------------------------------- News
@@ -487,6 +505,11 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
     if settings is None:
         settings = get_all_settings()
 
+    # Resolve the cost model once per run. With cost_model_strict unset this is
+    # the legacy zero-default behaviour; when set, a malformed cost config
+    # raises instead of silently charging nothing.
+    cost_inputs, cost_rounding = _resolve_run_costs(settings)
+
     if max_hold_bars is None:
         max_hold_bars = int(settings.get("max_hold_bars", 60))
     max_hold_bars = int(max_hold_bars)
@@ -612,7 +635,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 continue
             qty = p["qty"]
             entry_notional = qty * fill_price
-            entry_fees = qty * settings["fees_per_share"]
+            # Entry side: a long entry is a BUY, a short entry is a SELL. The
+            # side is explicit so sell-only fees can never be charged on a buy.
+            entry_fees = ec.side_fee(qty, fill_price, p["side"] == "buy",
+                                     cost_inputs, rounding=cost_rounding)
 
             ok, _ = state.can_open(entry_notional, entry_fees, side,
                                    equity=state.equity(gate_prices))
@@ -681,7 +707,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
                 exit_slip = normalize_slippage(
                     exit_price, settings["exit_slippage_bps"], is_buy_exit)
                 final_exit = exit_price + exit_slip
-                exit_fees = pos.qty * settings["fees_per_share"]
+                # Exit side: closing a short is a BUY, closing a long is a SELL.
+                exit_fees = ec.side_fee(pos.qty, final_exit, is_buy_exit,
+                                        cost_inputs, rounding=cost_rounding)
                 state.close_position(
                     sym, final_exit, exit_fees,
                     abs(exit_slip) * pos.qty, exit_reason, ts, last_prices,
@@ -808,7 +836,9 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         exit_slip = normalize_slippage(
             final_close, settings["exit_slippage_bps"], is_buy_exit)
         final_exit = final_close + exit_slip
-        exit_fees = pos.qty * settings["fees_per_share"]
+        # Exit side: closing a short is a BUY, closing a long is a SELL.
+        exit_fees = ec.side_fee(pos.qty, final_exit, is_buy_exit,
+                                cost_inputs, rounding=cost_rounding)
         last_prices[sym] = final_close
         state.close_position(
             sym, final_exit, exit_fees,
@@ -841,6 +871,10 @@ def simulate_portfolio(symbols_data: dict[str, pd.DataFrame],
         "equity_curve": state.equity_curve,
         "final_positions": len(state.positions),
         "total_fees_paid": round(state.fees_paid, 2),
+        "cost_model_version": ec.COST_MODEL_VERSION,
+        "short_borrow_cost_mode": ec.SHORT_BORROW_COST_MODE,
+        "cost_inputs": ec.canonical_cost_model(cost_inputs),
+        "regulatory_rounding": cost_rounding,
         "rejections": rejections,
     }
 

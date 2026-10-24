@@ -196,6 +196,23 @@ def _install_finnhub():
     mod.Client = Client
 
 
+def _guard_gemini_network():
+    """Make the advisory AI layer fail closed in tests.
+
+    The real transport is replaced so that no test, anywhere in the suite, can
+    reach the Gemini API. Tests that need a reply inject their own transport.
+    """
+    try:
+        import market_context as _mc
+    except Exception:
+        return
+
+    def _blocked(*a, **k):
+        raise AssertionError("test attempted a real Gemini network call")
+
+    _mc._post_generate_content = _blocked
+
+
 def _install_fastapi():
     if _installed("fastapi"):
         return
@@ -266,6 +283,7 @@ _install_langchain_ollama()
 _install_langgraph()
 _install_langmem()
 _install_finnhub()
+_guard_gemini_network()
 _install_fastapi()
 _install_apscheduler()
 

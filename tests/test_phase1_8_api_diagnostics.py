@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-pytest.importorskip("fastapi", reason="requires FastAPI")
+pytest.importorskip("fastapi.testclient", reason="requires the real FastAPI")
 from fastapi.testclient import TestClient
 
 

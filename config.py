@@ -16,6 +16,13 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
+# ============ Gemini AI market context (OPTIONAL, ADVISORY, OFF BY DEFAULT) ============
+# The API key is read from the environment only; it is never stored in code.
+# The feature is disabled unless explicitly enabled here AND a key is present.
+# It is advisory-only and is NOT wired into strategy/execution/risk.
+AI_CONTEXT_ENABLED = os.getenv("AI_CONTEXT_ENABLED", "false").lower() == "true"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
 # ============ Trading Mode — SINGLE SOURCE ============
 # BACKTEST: no broker calls (used by backtester/engine)
 # PAPER:    Alpaca Paper Trading — targets the paper endpoint, CAN submit
@@ -75,9 +82,39 @@ MIN_CONFIDENCE = 0.70
 MIN_SIGNAL_SCORE = 70
 
 # ============ Fees / Slippage (configurable; backtest uses these) ============
+# The three legacy inputs. Values are deliberately unchanged.
 FEES_PER_SHARE = 0.0
 ENTRY_SLIPPAGE_BPS = 5
 EXIT_SLIPPAGE_BPS = 5
+
+# ---- Transaction-aware fee components -------------------------------------
+# Every rate below is an UNCONFIRMED PLACEHOLDER. Each is 0.0, so the default
+# configuration reproduces the legacy cost exactly. The operator must confirm
+# the official rates, the rounding rule and the account eligibility before any
+# campaign; until then these must not be treated as Alpaca's real fees.
+#
+#   SEC_FEE_RATE        STATUS: PENDING_USER_DECISION. Sell-only, charged on
+#                       the sell notional (rate x trade value).
+#   TAF_FEE_PER_SHARE   STATUS: PENDING_USER_DECISION. Sell-only, per share.
+#   TAF_MAX_PER_TRADE   STATUS: PENDING_USER_DECISION. Sell-only cap; <= 0
+#                       means uncapped.
+#   CAT_FEE_PER_SHARE   STATUS: PENDING_USER_DECISION. Both sides, per
+#                       executed share.
+SEC_FEE_RATE = 0.0
+TAF_FEE_PER_SHARE = 0.0
+TAF_MAX_PER_TRADE = 0.0
+CAT_FEE_PER_SHARE = 0.0
+
+# "NONE" keeps legacy arithmetic; "UP_TO_CENT" rounds each regulatory fee up
+# to the nearest cent, as the official schedule describes. STATUS:
+# PENDING_USER_DECISION.
+REGULATORY_ROUNDING = "NONE"
+
+# When true, a campaign-mode cost resolution that is missing or malformed
+# fails closed instead of silently charging zero. Legacy/backtest runs keep
+# the documented zero defaults. STATUS: PENDING_USER_DECISION (off by default
+# so no existing behaviour changes).
+COST_MODEL_STRICT = False
 
 # ============ Execution ============
 # Bars after which an open position is force-closed ("MAX_HOLD").
