@@ -327,7 +327,9 @@ def test_veto_applied_is_never_configurable(log):
 def _write_three(log):
     runner = _runner(log, lambda u, b, t: _reply(GOOD))
     for i in range(3):
-        _observe(runner, decision_ts=f"2026-11-0{i + 1}T15:59:00Z")
+        ts = f"2026-11-0{i + 1}T15:59:00Z"
+        _observe(runner, decision_ts=ts, feature_asof_ts=ts,
+                 execution_ts=f"2026-11-0{i + 1}T16:00:00Z")
     return log
 
 

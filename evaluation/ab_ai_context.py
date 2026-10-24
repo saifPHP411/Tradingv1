@@ -90,6 +90,20 @@ def ai_gate_decision(ind: dict) -> str:
 STAND_IN_IS_REDUNDANT_WITH_ENGINE = True
 
 
+def _exit_fill(price: float, is_buy_exit: bool, bps: float) -> float:
+    """Exit fill for the simplified replay, delegating to execution_costs.
+
+    Exposed so a contract test can compare this replay's exit fill against the
+    engine's without running a whole backtest. It must never be optimistic.
+    """
+    from execution_costs import exit_fill_price
+    return exit_fill_price(price, is_buy_exit, {
+        "fees_per_share": 0.0,
+        "entry_slippage_bps": 0.0,
+        "exit_slippage_bps": bps,
+    })
+
+
 # --------------------------------------------------------------------------
 # A/B replay over identical bars
 # --------------------------------------------------------------------------
@@ -108,12 +122,22 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
     Costs use the settings' fees_per_share and slippage bps.
     """
     from signals import compute_signal_score
-    from risk_utils import normalize_slippage
+    from execution_costs import (
+        entry_fill_price as _entry_fill_impl,
+        exit_fill_price as _exit_fill_impl,
+        round_trip_fee as _round_trip_fee,
+    )
 
     settings = get_all_settings()
     fees = float(settings.get("fees_per_share", 0.0))
     slip_in = float(settings.get("entry_slippage_bps", 0.0))
     slip_out = float(settings.get("exit_slippage_bps", 0.0))
+    # The canonical cost inputs. This replay must charge the SAME round-trip
+    # cost as backtest/engine.py, so the fill arithmetic is delegated to
+    # execution_costs rather than re-derived here.
+    cost_inputs = {"fees_per_share": fees,
+                   "entry_slippage_bps": slip_in,
+                   "exit_slippage_bps": slip_out}
     max_hold = int(settings.get("max_hold_bars", 60))
     min_score = int(settings.get("min_signal_score", 30))
     stop_mult = float(settings.get("stop_atr_multiplier", 2.5))
@@ -164,7 +188,7 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
             i += 1
             continue
 
-        fill_in = entry_px + normalize_slippage(entry_px, slip_in, is_buy=True)
+        fill_in = _entry_fill_impl(entry_px, True, cost_inputs)
         stop_px = fill_in - stop_dist
         target_px = fill_in + target_dist
 
@@ -187,9 +211,9 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
                 break
             j += 1
 
-        fill_out = exit_px - normalize_slippage(exit_px, slip_out, is_buy=False)
+        fill_out = _exit_fill_impl(exit_px, False, cost_inputs)
         gross = (fill_out - fill_in) * qty
-        cost = fees * qty * 2
+        cost = _round_trip_fee(qty, cost_inputs)
         net = gross - cost
 
         equity += net

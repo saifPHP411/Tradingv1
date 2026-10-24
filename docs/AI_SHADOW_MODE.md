@@ -108,6 +108,9 @@ or delete path.
   "prompt_hash": "c93e...",
   "request_body_hash": "51af...",
   "config_snapshot_hash": "8de0...",
+  "cost_inputs": {"fees_per_share": 0.0, "entry_slippage_bps": 5.0,
+                  "exit_slippage_bps": 5.0},
+  "short_borrow_cost_mode": "NOT_MODELED",
   "git_sha": "05b4f749274aa7136e6b7cc75727e65968cceda2",
   "request_ts": "2026-11-03T15:59:02Z",
   "response_ts": "2026-11-03T15:59:04Z",
@@ -143,12 +146,23 @@ key string does not appear anywhere in the log file.
 | `feature_hash` | the sanitized feature vector | prove which inputs were used |
 | `prompt_hash` | the exact prompt text | prove the prompt was not changed |
 | `request_body_hash` | the exact request bytes | prove what was sent |
-| `config_snapshot_hash` | model, `C_MIN`, thinking level, token cap, schema | prove the campaign ran under one frozen config |
+| `config_snapshot_hash` | model, `C_MIN`, thinking level, token cap, schema, **cost inputs, short-borrow mode** | prove the campaign ran under one frozen config |
 | `entry_hash` / `prev_hash` | the whole entry, chained | tamper detection |
 
 `config_snapshot_hash` covers the model, `C_MIN`, the thinking level, the
-output-token cap, the schema version, the prompt schema and the required
-fields. If any of these change, the hash changes.
+output-token cap, the schema version, the prompt schema, the required fields,
+the three execution-cost inputs (fees per share, entry and exit slippage) and
+the short-borrow mode. If any of these change, the hash changes. Costs are
+included because two runs with different costs are different experiments even
+when the model and prompt are identical.
+
+### Causal ordering is enforced, not merely recorded
+
+`observe()` requires `feature_asof_ts <= decision_ts <= execution_ts`. A
+violation raises `ShadowOrderingError` (a `ValueError` subclass) **before** any
+model call or log write, so no non-causal record can exist. Timestamps are
+never clamped or substituted: a bad timestamp is a failure, not a
+normalisation.
 
 ### Hash chain
 

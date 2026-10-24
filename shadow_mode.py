@@ -43,6 +43,7 @@ import time
 from pathlib import Path
 
 import market_context as mc
+import execution_costs as ec
 
 # --------------------------------------------------------------------------
 # Pre-registered constants (frozen; do NOT tune after a campaign starts)
@@ -54,6 +55,16 @@ C_MIN = 0.80
 
 # The only schema version accepted in the first release.
 SCHEMA_VERSION = 1
+
+# Causal-ordering violations are raised, never silently repaired. The
+# exception is a ValueError subclass so a caller that already catches
+# ValueError keeps working.
+ORDERING_VIOLATION_PREFIX = "shadow_ordering_violation"
+
+
+class ShadowOrderingError(ValueError):
+    """Raised when timestamps are not causal. Never repaired, only rejected."""
+
 
 # Closed enums. A reply containing anything else is rejected outright.
 TREND_QUALITY_VALUES = (
@@ -145,12 +156,28 @@ def request_body_hash(body: bytes) -> str:
 
 
 def config_snapshot_hash(*, model: str, c_min: float, thinking_level: str,
-                         max_output_tokens: int, schema_version: int) -> str:
+                         max_output_tokens: int, schema_version: int,
+                         cost_inputs: dict | None = None,
+                         short_borrow_cost_mode: str | None = None) -> str:
     """Hash of everything that must stay frozen for the campaign.
 
     If any of these change, the hash changes, so a later reviewer can prove the
     campaign ran under one configuration.
+
+    ``cost_inputs`` covers the execution-cost inputs that change what a round
+    trip costs (fees per share, entry and exit slippage). They belong here
+    because two runs with different costs are different experiments even when
+    the model, prompt and ``C_MIN`` are identical. Passing None yields the
+    neutral defaults, so an old record with no costs still hashes.
+
+    ``short_borrow_cost_mode`` records whether short financing was modelled.
+    It is part of the snapshot so a campaign cannot quietly claim a cost basis
+    it did not use.
     """
+    costs = ec.canonical_cost_inputs(cost_inputs)
+    borrow = (short_borrow_cost_mode
+              if short_borrow_cost_mode is not None
+              else ec.SHORT_BORROW_COST_MODE)
     return sha256_hex({
         "model": model,
         "c_min": c_min,
@@ -159,7 +186,42 @@ def config_snapshot_hash(*, model: str, c_min: float, thinking_level: str,
         "schema_version": schema_version,
         "prompt_schema": PROMPT_SCHEMA,
         "required_fields": list(REQUIRED_FIELDS),
+        "cost_inputs": costs,
+        "short_borrow_cost_mode": borrow,
     })
+
+
+def _require_ordered(*, feature_asof_ts, decision_ts, execution_ts) -> None:
+    """Enforce ``feature_asof_ts <= decision_ts <= execution_ts``.
+
+    Raises :class:`ShadowOrderingError` on violation. Nothing is repaired: no
+    min/max, no clamping, no substitution. A non-causal observation must not
+    be written at all, because a record that looks authoritative while
+    describing future data is worse than no record.
+
+    A ``None`` bound is treated as "not supplied" and is skipped. A bound that
+    IS supplied must be mutually comparable, else that is itself a violation.
+    """
+    checks = (
+        ("feature_asof_ts", feature_asof_ts, "decision_ts", decision_ts),
+        ("decision_ts", decision_ts, "execution_ts", execution_ts),
+    )
+    for a_name, a_val, b_name, b_val in checks:
+        if a_val is None or b_val is None:
+            continue
+        try:
+            violates = a_val > b_val
+        except TypeError as exc:
+            raise ShadowOrderingError(
+                f"{ORDERING_VIOLATION_PREFIX}: {a_name} and {b_name} are not "
+                f"comparable ({type(a_val).__name__} vs {type(b_val).__name__})"
+            ) from exc
+        if violates:
+            raise ShadowOrderingError(
+                f"{ORDERING_VIOLATION_PREFIX}: {a_name}={a_val!r} is after "
+                f"{b_name}={b_val!r}; a causal observation requires "
+                f"{a_name} <= {b_name}"
+            )
 
 
 def git_sha(repo_dir: str | os.PathLike | None = None) -> str:
@@ -395,7 +457,7 @@ class ShadowRunner:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ",
                              time.gmtime(self._clock()))
 
-    def _config_hash(self, cfg: dict) -> str:
+    def _config_hash(self, cfg: dict, settings: dict | None = None) -> str:
         return config_snapshot_hash(
             model=cfg.get("model", mc.DEFAULT_MODEL),
             c_min=C_MIN,
@@ -403,34 +465,83 @@ class ShadowRunner:
             max_output_tokens=cfg.get("max_output_tokens",
                                       mc.DEFAULT_MAX_OUTPUT_TOKENS),
             schema_version=SCHEMA_VERSION,
+            cost_inputs=ec.resolve_cost_inputs(settings),
+            short_borrow_cost_mode=ec.SHORT_BORROW_COST_MODE,
         )
 
     def _rebuild_features(self, market_data, feature_asof_ts) -> dict:
-        """Re-derive the feature vector from source data, if available.
+        """Re-derive the feature vector from an INDEPENDENT source.
 
-        When a ``feature_source`` callable is supplied it must return the
-        indicator dict for the given timestamp, computed from OHLCV that ends
-        at or before ``feature_asof_ts``. Its result must match the vector that
-        was sent; the mismatch flag makes any leakage visible in the record.
+        Contract for ``feature_source``
+            A callable ``feature_source(feature_asof_ts) -> mapping`` that
+            returns the *raw* indicator mapping available up to and including
+            ``feature_asof_ts`` — that is, derived from OHLCV whose last bar is
+            at or before that timestamp. It must NOT be handed, or return, the
+            engine's ready-made indicator dict: re-hashing the engine's own
+            output would prove nothing about causality.
+
+            The mapping is passed through the same allow-list sanitizer as the
+            sent vector, then hashed. ``matches`` is True only when the rebuilt
+            hash equals the sent hash.
+
+        A mismatch, an exception, or a missing source is recorded as such. It
+        is never hidden and never silently upgraded to a match.
         """
-        if self._feature_source is None or feature_asof_ts is None:
-            return {"available": False, "matches": None, "rebuilt_hash": ""}
+        sent = mc.sanitize_market_features(market_data)
+        sent_hash = feature_hash(sent)
+        base = {"available": False, "matches": None, "rebuilt_hash": "",
+                "source": "none"}
+        if self._feature_source is None:
+            return base
+        if feature_asof_ts is None:
+            return {**base, "error": "missing_feature_asof_ts"}
         try:
-            rebuilt = mc.sanitize_market_features(
-                self._feature_source(feature_asof_ts))
+            rebuilt_raw = self._feature_source(feature_asof_ts)
         except Exception as exc:
-            return {"available": False, "matches": None,
-                    "rebuilt_hash": "", "error": type(exc).__name__}
-        return {"available": True, "rebuilt_hash": feature_hash(rebuilt)}
+            return {**base, "source": "injected",
+                    "error": f"{type(exc).__name__}"}
+        if not isinstance(rebuilt_raw, dict):
+            return {**base, "source": "injected",
+                    "error": f"non_mapping:{type(rebuilt_raw).__name__}"}
+        rebuilt = mc.sanitize_market_features(rebuilt_raw)
+        rebuilt_hash = feature_hash(rebuilt)
+        out = {
+            "available": True,
+            "source": "injected",
+            "rebuilt_hash": rebuilt_hash,
+            "matches": rebuilt_hash == sent_hash,
+        }
+        if not out["matches"]:
+            # Record WHICH fields differ, so a leak is diagnosable and not
+            # merely flagged.
+            differing = sorted(
+                key for key in set(sent) | set(rebuilt)
+                if sent.get(key) != rebuilt.get(key))
+            out["differing_fields"] = differing
+            out["sent_hash"] = sent_hash
+        return out
 
     def observe(self, *, symbol: str, market_data: dict,
                 decision_ts, feature_asof_ts=None, execution_ts=None,
                 settings: dict | None = None,
                 engine_context: dict | None = None) -> dict:
-        """Make one advisory call and append an audit record. Never raises.
+        """Make one advisory call and append an audit record.
 
-        Returns the record. The caller is expected to ignore it.
+        Raises :class:`ShadowOrderingError` when the supplied timestamps are
+        not causal (``feature_asof_ts <= decision_ts <= execution_ts``). The
+        check runs before anything else, so a non-causal call makes no network
+        request and writes no record. Timestamps are never repaired.
+
+        Apart from that ordering violation, never raises: any other failure is
+        recorded in the returned record. The caller is expected to ignore the
+        record.
         """
+        # Fail closed BEFORE any call or write. A record that looks valid
+        # while describing future data is worse than no record at all.
+        _require_ordered(feature_asof_ts=feature_asof_ts,
+                         decision_ts=decision_ts,
+                         execution_ts=execution_ts)
+
         request_ts = self._now_iso()
         features = mc.sanitize_market_features(market_data)
 
@@ -494,7 +605,10 @@ class ShadowRunner:
             "model": cfg.get("model", mc.DEFAULT_MODEL),
             "prompt_hash": prompt_hash(prompt),
             "request_body_hash": request_body_hash(body),
-            "config_snapshot_hash": self._config_hash(cfg),
+            "config_snapshot_hash": self._config_hash(cfg, settings),
+            "cost_inputs": ec.canonical_cost_inputs(
+                ec.resolve_cost_inputs(settings)),
+            "short_borrow_cost_mode": ec.SHORT_BORROW_COST_MODE,
             "git_sha": self._git_sha,
             "request_ts": request_ts,
             "response_ts": self._now_iso(),

@@ -1,10 +1,51 @@
 # AI Campaign Preflight Audit
 
-Status: **audit only**. No campaign has been started. No live Gemini call has
-been made. No cost, threshold, `C_MIN` or strategy value has been changed.
+Status: **audit + hardening**. No campaign has been started. No live Gemini
+call has been made. No cost, threshold, `C_MIN` or strategy value has been
+changed.
 
 Audit base: branch `review/m4-m5-m7-followup`, commit
 `beb779ea3fe89a3697c5193a48212c629604bdb6`.
+
+## 0. Hardening status (this pass)
+
+Four gaps found by the first audit have been closed. One remains by design.
+
+| Blocker | Status | What changed |
+|---|---|---|
+| **B1** cost model not campaign-realistic | **BLOCKED** (by design) | Not touched. `FEES_PER_SHARE` is still `0.0`. Requires an explicit decision |
+| **B2** costs outside `config_snapshot_hash` | **FIXED** | The hash now covers fees, both slippage legs and the short-borrow mode; the record also stores the cost inputs it used |
+| **B3** ordering recorded, not enforced | **FIXED** | `observe()` now raises `ShadowOrderingError` before any call or write |
+| **B4** no `feature_source` contract | **FIXED** | Contract documented and tested; a mismatching rebuild is flagged *and* diagnosed |
+| **B7** no short borrow cost | **DOCUMENTED** | `short_borrow_cost_mode = "NOT_MODELED"` is recorded in every entry and in the hash. No borrow cost added |
+| **B8** two different cost models | **FIXED** | A shared `execution_costs` module; the replay now delegates to it. A real sign bug was found and corrected |
+
+### The B8 bug, precisely
+
+`normalize_slippage` returns a **negative** number for a sell. The engine did
+the right thing:
+
+```
+engine long exit:   exit_price + normalize_slippage(..., is_buy=False)   -> pays
+```
+
+The simplified replay did not:
+
+```
+replay long exit:   exit_px    - normalize_slippage(..., is_buy=False)   -> gains
+```
+
+Subtracting a negative *added* money, so the replay was optimistic by
+`2 x bps` on every round trip. Measured end to end on the audit fixture:
+
+| Replay | Final equity |
+|---|---|
+| old formula | 10574.92 |
+| shared cost model | 10549.64 |
+| **overstatement removed** | **$25.28** |
+
+The engine's own numbers are unchanged (`10273.35`, 8 trades); only the
+replay moved, toward the engine's convention. No cost value was altered.
 
 ## 1. Current status
 
@@ -52,20 +93,20 @@ documentation.
 | 3 | `trades(A) == trades(C)` trade-for-trade | **PASS** | Identical fingerprint (symbol, entry/exit time, entry/exit price, pnl); 8 trades, non-vacuous |
 | 4 | `end_equity(A) == end_equity(C)` | **PASS** | `10273.35 == 10273.35`; equity curves identical too |
 | 5 | Feature vector excludes engine-derived values | **PASS** | Sanitizer output is exactly the 8-field allow-list; `regime`, `size_multiplier`, `equity`, `future_close` all dropped |
-| 6 | `feature_asof_ts` does not exceed `decision_ts` | **PARTIAL** | Ordering is **recorded and asserted in tests, but not enforced by the module**. See blocker B3 |
+| 6 | `feature_asof_ts` does not exceed `decision_ts` | **PASS** | Enforced in `observe()`: a violation raises `ShadowOrderingError` before any call or write. Was PARTIAL; see B3 |
 | 7 | `feature_hash` reconstructible as-of | **PASS** | Rebuild from OHLCV truncated at `feature_asof_ts` produces an identical hash |
 | 8 | `prompt_hash` / model / config hashes reproducible | **PASS** | Deterministic across repeats; `config_snapshot_hash` changes when any frozen input changes; key-order independent |
 | 9 | `raw_response` contains no API key or secrets | **PASS** | Configured key string absent from the log; no `AIza` / private-key patterns; `raw_response` stored verbatim |
 | 10 | Hash chain detects tampering | **PASS** | Edit, delete, reorder and forged insertion each detected; restored file verifies |
 | 11 | No network call in the tests | **PASS** | Transports always injected; `socket.create_connection`/`getaddrinfo` counted 0 calls during `observe()` |
 
-### Note on row 6
+### Note on row 6 (now resolved)
 
-The module records the three timestamps but does not reject an entry whose
-`feature_asof_ts` is later than `decision_ts`. A caller passing a future
-timestamp would produce a record that looks authoritative while describing
-non-causal data. The test suite asserts ordering only for the values the test
-itself supplies, so this is a real gap, not a formality.
+The module used to record the three timestamps without rejecting an entry
+whose `feature_asof_ts` was later than `decision_ts`. That gap is closed:
+`observe()` now enforces `feature_asof_ts <= decision_ts <= execution_ts` and
+raises before making a call or writing a record. Timestamps are never clamped,
+substituted or normalised.
 
 ## 4. Cost-model audit
 
@@ -248,18 +289,62 @@ deliberate omission.
 
 | # | Blocker | Why it blocks | Suggested resolution (needs approval) |
 |---|---|---|---|
-| B1 | Cost model is not campaign-realistic (`FEES_PER_SHARE = 0.0`) | Understates per-trade cost, which flatters any filter that removes trades | Set the per-share fee deliberately; freeze it |
-| B2 | Costs are outside `config_snapshot_hash` | A campaign could run under different costs with the same config hash | Record cost values in the campaign manifest; consider adding them to the hash |
-| B3 | Timestamp ordering is recorded, not enforced | A non-causal record could be written and look valid | Add an ordering guard in `observe()`, or enforce it in the runner |
-| B4 | No `feature_source` wired | The independent reconstruction check is unavailable | Provide a causal OHLCV-prefix source in the runner |
-| B5 | No campaign runner | Nothing can start a run | Build it only after B1-B4 and the freeze list are agreed |
+| B1 | Cost model is not campaign-realistic (`FEES_PER_SHARE = 0.0`) | Understates per-trade cost, which flatters any filter that removes trades | Set the per-share fee deliberately; freeze it. **Still open — no value chosen** |
+| B2 | ~~Costs are outside `config_snapshot_hash`~~ | — | **FIXED.** The hash now covers fees, both slippage legs and the short-borrow mode; each record also stores its cost inputs |
+| B3 | ~~Timestamp ordering is recorded, not enforced~~ | — | **FIXED.** `observe()` raises `ShadowOrderingError` before any call or write |
+| B4 | ~~No `feature_source` wired~~ | — | **CONTRACT FIXED.** Documented and tested; mismatch is flagged and diagnosed. A real source is still the runner's job (B5) |
+| B5 | No campaign runner | Nothing can start a run | Build it only after B1 and the freeze list are agreed |
 | B6 | Live-API facts unverified | Whether the model accepts `thinkingConfig`, and whether 1024 tokens suffices, is unknown | One manual, watched smoke call before the campaign |
-| B7 | Short borrow cost not modelled | Short results are optimistic by an unquantified amount | State as a limitation, or model it |
-| B8 | Backtester and live/paper cost models differ | A backtest-derived result may not transfer | Document; do not silently equate them |
+| B7 | Short borrow cost not modelled | Short results are optimistic by an unquantified amount | **DOCUMENTED, not modelled.** Every record carries `short_borrow_cost_mode = "NOT_MODELED"`. See the long-only proposal below |
+| B8 | ~~Backtester and live/paper cost models differ~~ | — | **FIXED for the two code paths that exist.** A shared `execution_costs` module; the replay delegates to it. The live/paper path still applies no cost of its own (B8b) |
+| B8b | The live/paper path applies no cost model at all | A forward result is whatever the broker charges, not what the backtest assumed | Out of scope for this pass; must be documented, never silently equated with the backtest |
 | B9 | Symbol set, window `T0`, primary metric not chosen | No pre-registration is possible yet | Decide and freeze before the run |
 | B10 | `C_MIN`, prompt, model not frozen | Post-hoc tuning would invalidate the result | Freeze all three in one recorded step |
 
-## 10. Checklist before the first live Gemini run
+## 10. B7 — short borrow cost, and the long-only proposal
+
+No borrow cost was added. `execution_costs.SHORT_BORROW_COST_MODE` is
+`"NOT_MODELED"`, and every Shadow record and the `config_snapshot_hash` carry
+that value, so a campaign cannot present short results as fully realistic.
+
+**Proposal only — not frozen, not implemented.** The cleanest first campaign is
+**long-only**, for three reasons:
+
+1. Borrow cost is unmodelled, so short P&L is optimistic by an unknown amount.
+2. Borrow availability and recall risk are not representable in this engine.
+3. A long-only campaign has one fewer unquantified assumption, which makes the
+   veto analysis easier to trust.
+
+This is a recommendation for a decision, not a decision. If shorts are kept,
+the campaign report must state the omission explicitly and must not quote short
+results as though financing were included.
+
+## 11. B8 — the shared cost contract
+
+`execution_costs.py` is now the single place the cost inputs are named and the
+fill arithmetic is implemented:
+
+| Function | Meaning |
+|---|---|
+| `COST_SETTING_KEYS` | the three inputs the engine actually consumes |
+| `resolve_cost_inputs(settings)` | extract them safely; never raises |
+| `canonical_cost_inputs(...)` | the canonical, sorted form that gets hashed |
+| `entry_fill_price(price, is_buy, inputs)` | entry fill |
+| `exit_fill_price(price, is_buy_exit, inputs)` | exit fill |
+| `entry_fee` / `exit_fee` / `round_trip_fee` | fees per leg and both legs |
+| `is_short_borrow_modeled()` | always False today |
+
+The engine is **not** modified. It keeps its inline calls, and a contract test
+asserts those inline calls equal the helpers, so any future drift fails a test
+rather than silently changing results.
+
+`evaluation/ab_ai_context.py` now imports the helpers instead of re-deriving
+them, which is what removed the exit-slippage sign bug.
+
+A future campaign can therefore use the backtester's cost model by construction:
+there is now one definition of it.
+
+## 12. Checklist before the first live Gemini run
 
 Every item must be true, and the outcome recorded, before any live call.
 
@@ -272,7 +357,8 @@ Every item must be true, and the outcome recorded, before any live call.
 - [ ] Symbol set frozen
 - [ ] Evaluation window `T0` frozen, chosen to post-date model training
 - [ ] Primary metric pre-registered (one metric, not a shopping list)
-- [ ] Cost values frozen and recorded next to `config_snapshot_hash`
+- [ ] Cost values frozen; `config_snapshot_hash` covers them (done)
+- [ ] Short/long decision recorded, with `short_borrow_cost_mode` acknowledged
 
 **Costs**
 
@@ -282,8 +368,8 @@ Every item must be true, and the outcome recorded, before any live call.
 
 **Correctness**
 
-- [ ] Timestamp ordering enforced, not merely recorded (B3)
-- [ ] `feature_source` supplied and proven to match on a sample (B4)
+- [x] Timestamp ordering enforced, not merely recorded (B3 — done)
+- [ ] `feature_source` supplied and proven to match on a sample (B4 contract done; source pending)
 - [ ] `A == C` re-demonstrated on the real symbol set and window
 - [ ] Hash chain verified over the whole run
 - [ ] API key confirmed absent from every log line
@@ -303,11 +389,19 @@ Every item must be true, and the outcome recorded, before any live call.
 - [ ] Rollback plan agreed
 - [ ] Explicit go/no-go sign-off recorded
 
-## 11. What this audit did not do
+## 13. What this pass did not do
 
 - No live Gemini call, no network request, no API key.
-- No campaign started, no campaign runner created.
-- No change to `C_MIN`, any threshold, any cost value, or any strategy rule.
+- No campaign started, no campaign runner created, no scheduler, no automatic
+  veto, no automatic A/B deployment.
+- No change to `C_MIN` (`0.80`), any threshold, any cost value, or any
+  strategy, signal or execution rule.
 - No change to `backtest/engine.py`, `signals.py`, `risk_engine.py`,
-  `broker.py` or any strategy/execution/risk file.
+  `broker.py`, `agents.py`, `monitor.py`, `run_backtest.py`, `config.py`,
+  `app.py`, `settings.py`, `state.py`, `regime.py`, `risk_utils.py`,
+  `decision_log.py`, `backtest/metrics.py`, `backtest/monte_carlo.py` or
+  `backtest/walkforward.py` — all byte-identical.
+- No borrow cost added; no new fee value chosen.
+- No change to the model, prompt, schema, thinking configuration or
+  `maxOutputTokens`.
 - No push, merge, PR or deploy.
