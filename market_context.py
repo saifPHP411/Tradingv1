@@ -82,11 +82,56 @@ _FIELD_ALIASES = {
 
 _MAX_RATIONALE_CHARS = 280
 
+# --------------------------------------------------------------------------
+# Generation config (see docs/AI_MARKET_CONTEXT.md, section "Generation config")
+#
+# Google's docs state that ``maxOutputTokens`` is a HARD cutoff that includes
+# thought tokens: "If the model hits this limit while reasoning, it stops
+# generating with status 'incomplete' and returns truncated or empty output
+# (while still billing for any thinking tokens generated)."
+#
+# ``gemini-3.5-flash-lite`` has thinking ON by default (level ``minimal``), so
+# the reasoning budget and the answer budget share this single ceiling. The
+# previous value (256) left little room for a complete JSON answer, so the
+# request now sets an explicit, minimal thinking level and a larger ceiling.
+#
+# These values are a considered default, not a measured optimum: raising the
+# ceiling or lowering thinking is NOT assumed to improve quality. Tuning them
+# requires a live call (see "Requires live verification" in the docs).
+# --------------------------------------------------------------------------
+
+# Answer budget. Must comfortably exceed the JSON schema's max length
+# (``_MAX_RATIONALE_CHARS`` = 280 chars, so < ~120 tokens) plus thought tokens.
+DEFAULT_MAX_OUTPUT_TOKENS = 1024
+_MIN_MAX_OUTPUT_TOKENS = 256
+_MAX_MAX_OUTPUT_TOKENS = 8192
+
+# Thinking level sent as ``generationConfig.thinkingConfig.thinkingLevel``.
+# Empty string omits the field entirely (for models/endpoints that reject it).
+DEFAULT_THINKING_LEVEL = "minimal"
+_ALLOWED_THINKING_LEVELS = ("minimal", "low", "medium", "high")
+
 # Hard caps so a malformed or hostile value can never produce an absurd
 # timeout or an unbounded budget. Values outside these ranges are clamped.
 _MAX_TIMEOUT_SECONDS = 120.0
 _MAX_CALLS_PER_MINUTE = 600
 _MAX_CALLS_PER_DAY = 100_000
+
+# --------------------------------------------------------------------------
+# Retry policy (M5)
+#
+# At most ONE retry, and only for transient server-side statuses. 4xx client
+# errors (bad key, malformed request, model not found) are never retried — they
+# cannot succeed on a repeat and would only waste the call budget.
+#
+# Each attempt consumes the local budget, and the retry never sleeps past the
+# total deadline, so retrying cannot create an unbounded loop or exceed the
+# per-call budget.
+# --------------------------------------------------------------------------
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_MAX_RETRIES = 1
+_DEFAULT_RETRY_DELAY_SECONDS = 1.0
+_MAX_RETRY_AFTER_SECONDS = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +333,40 @@ def _ok(*, bias: str, confidence: float, risk_level: str, rationale: str,
 # --------------------------------------------------------------------------
 
 
+def _safe_thinking_level(value, default: str = DEFAULT_THINKING_LEVEL) -> str:
+    """Coerce a thinking level, never raising.
+
+    Accepts only the documented levels. An unknown value (including the empty
+    string) yields ``default``. ``""`` is returned only when the caller
+    explicitly asked to omit the field.
+    """
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text == "":
+            return ""
+        if text in _ALLOWED_THINKING_LEVELS:
+            return text
+    return default
+
+
+def _build_generation_config(cfg: dict) -> dict:
+    """Build the ``generationConfig`` for a request.
+
+    The answer ceiling and the thinking level are set separately, per Google's
+    guidance: ``maxOutputTokens`` is a hard cutoff that also covers thought
+    tokens, while ``thinkingLevel`` controls reasoning depth. Omitting
+    ``thinkingLevel`` (empty string) leaves the model default in place.
+    """
+    gen: dict = {
+        "temperature": 0.0,
+        "maxOutputTokens": cfg["max_output_tokens"],
+    }
+    level = cfg.get("thinking_level", DEFAULT_THINKING_LEVEL)
+    if level:
+        gen["thinkingConfig"] = {"thinkingLevel": level}
+    return gen
+
+
 def _cfg(settings: dict | None = None) -> dict:
     """Resolve configuration from env (key) and optional settings dict.
 
@@ -300,6 +379,9 @@ def _cfg(settings: dict | None = None) -> dict:
     raw_flag = s.get("ai_context_enabled")
     if raw_flag is None:
         raw_flag = os.getenv("AI_CONTEXT_ENABLED", "")
+    raw_level = os.getenv("GEMINI_THINKING_LEVEL")
+    if raw_level is None:
+        raw_level = DEFAULT_THINKING_LEVEL
     return {
         "api_key": os.getenv("GEMINI_API_KEY", "") or "",
         "enabled": _safe_flag(raw_flag, default=False),
@@ -314,6 +396,11 @@ def _cfg(settings: dict | None = None) -> dict:
         "max_per_day": _safe_int(os.getenv("GEMINI_MAX_CALLS_PER_DAY", ""),
                                  DEFAULT_MAX_CALLS_PER_DAY,
                                  minimum=1, maximum=_MAX_CALLS_PER_DAY),
+        "max_output_tokens": _safe_int(
+            os.getenv("GEMINI_MAX_OUTPUT_TOKENS", ""),
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            minimum=_MIN_MAX_OUTPUT_TOKENS, maximum=_MAX_MAX_OUTPUT_TOKENS),
+        "thinking_level": _safe_thinking_level(raw_level),
     }
 
 
@@ -489,6 +576,70 @@ def _post_generate_content(url: str, body: bytes, timeout: float) -> dict:
     return parsed
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """Return the HTTP status carried by an exception, or None."""
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        return status
+    # Some wrappers expose a ``response`` with ``status_code``.
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Parse a Retry-After header (seconds form) from an HTTP error, or None."""
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        # HTTP-date form is deliberately ignored: we cap at a few seconds
+        # anyway, so a parsed date would rarely be actionable.
+        return None
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """True only for transient failures that a single retry could fix.
+
+    Client errors (4xx other than 429) are never retryable: a bad key, a
+    malformed request or an unknown model cannot succeed on a repeat.
+    """
+    status = _http_status(exc)
+    if status is not None:
+        return status in _RETRYABLE_STATUS
+    # No HTTP status: a timeout or connection-level failure is transient.
+    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+
+def _retry_delay(exc: BaseException, remaining: float) -> float | None:
+    """Seconds to wait before the single retry, or None to give up.
+
+    ``remaining`` is the time left in the total deadline. The delay respects
+    Retry-After when present, is capped, and is skipped (returns 0.0) when the
+    deadline cannot accommodate it.
+    """
+    if remaining <= 0:
+        return None
+    after = _retry_after_seconds(exc)
+    if after is None:
+        delay = _DEFAULT_RETRY_DELAY_SECONDS
+    else:
+        delay = min(after, _MAX_RETRY_AFTER_SECONDS)
+    delay = min(delay, _MAX_RETRY_AFTER_SECONDS)
+    if delay >= remaining:
+        # No time to wait and still issue the retry within the deadline.
+        return None
+    return delay
+
+
 def _extract_text(response: dict) -> str:
     """Pull candidate text out of a generateContent response, or ''."""
     try:
@@ -552,17 +703,38 @@ def get_market_context(symbol: str, market_data: dict | None,
         prompt = build_prompt(symbol, features)
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 256},
+            "generationConfig": _build_generation_config(cfg),
         }).encode("utf-8")
         url = f"{_API_BASE}/{model}:generateContent?key={cfg['api_key']}"
 
-        _BUDGET.consume()
         transport = _transport or _post_generate_content
-        try:
-            response = transport(url, body, cfg["timeout"])
-        except Exception as exc:  # network, timeout, HTTP error, bad JSON
-            return _unavailable(f"request_failed:{type(exc).__name__}",
-                                enabled=True, model=model)
+        deadline = time.monotonic() + cfg["timeout"]
+        response = None
+        attempt = 0
+        while True:
+            # Budget is consumed per attempt so a retry is counted too.
+            allowed, why = _BUDGET.check()
+            if not allowed:
+                return _unavailable(why, enabled=True, model=model)
+            _BUDGET.consume()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return _unavailable("request_failed:TimeoutError",
+                                    enabled=True, model=model)
+            try:
+                response = transport(url, body, min(cfg["timeout"], remaining))
+                break
+            except Exception as exc:  # network, timeout, HTTP error, bad JSON
+                retryable = _is_retryable(exc)
+                remaining = deadline - time.monotonic()
+                delay = (_retry_delay(exc, remaining)
+                         if retryable and attempt < _MAX_RETRIES else None)
+                if delay is None:
+                    return _unavailable(
+                        f"request_failed:{type(exc).__name__}",
+                        enabled=True, model=model)
+                attempt += 1
+                time.sleep(delay)
 
         text = _extract_text(response)
         if not text:

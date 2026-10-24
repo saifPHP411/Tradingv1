@@ -1,37 +1,45 @@
 """
 Experimental A/B evaluation: baseline strategy vs an AI-conditioned variant.
 
-PURPOSE
-    Measure, on identical data / periods / costs, whether gating entries on the
-    advisory AI context would have changed outcomes — and by how much.
+TWO MODES — read this before trusting any number
+    This driver can run the comparison in two different ways, and they do NOT
+    have the same evidential weight.
 
-IMPORTANT LIMITATIONS (read before trusting any number)
-    The strategy's own execution engine deliberately refuses to consume LLM
-    output in historical backtests, because the model is trained on data that
-    postdates the simulated period (see the header of ``backtest/engine.py``).
-    A genuine, leak-free historical replay of an LLM overlay is therefore not
-    possible with this codebase.
+    1. ``run_engine_experiment`` (PREFERRED, mode="engine")
+       Runs BOTH arms through the real strategy engine
+       (``backtest.engine.simulate_portfolio``), unchanged. The only difference
+       between the arms is the entry gate, injected at run time by wrapping
+       ``compute_signal_score`` — the engine source is not modified. This keeps
+       cooldown, regime gating, position sizing, exit rules, capital
+       management and costs identical by construction, so the comparison is
+       fair. Its weakness: the engine's own entry rule ALREADY requires
+       ``close > ema20 > ema50 and adx > 25`` (``strong_uptrend``), which is
+       exactly the condition the stand-in gate tests. A gate built on that
+       condition is therefore REDUNDANT and cannot change results; it is a
+       plumbing/leak test, not evidence of alpha.
 
-    To keep the experiment honest and leak-free, this driver does NOT call any
-    live API for history. Instead it builds a *deterministic stand-in* for the
-    AI layer using only information available at the decision bar (a simple
-    trend rule over trailing indicators). That stand-in is:
+    2. ``run_experiment`` / ``run_arm`` (LEGACY, mode="simplified")
+       A simplified re-implementation of entry and exit. It does NOT model the
+       engine's cooldown, consecutive-loss guard, regime gate (BEAR blocks
+       longs), multi-symbol capital sharing or the ``strong_uptrend`` filter.
+       It is a rough approximation and its numbers MUST NOT be described as
+       "the strategy". Treat its output as exploratory only.
 
-      - strictly causal (no future data), so it cannot leak;
-      - reproducible (fixed seed, no network);
-      - transparent (the rule is in ``ai_gate_decision``).
-
-    The result is a *mechanism* test: "if an advisor with this behaviour
-    existed, how would the gate change the numbers?" It is NOT evidence that
-    the real Gemini model improves performance. Any claim that the real model
-    helps requires a separate, forward-only paper evaluation.
+WHY NOT A LIVE LLM REPLAY
+    The engine deliberately refuses to consume LLM output in historical
+    backtests, because the model is trained on data that postdates the
+    simulated period. A leak-free historical replay of a real LLM overlay is
+    therefore not possible with this codebase; it needs a forward-only paper
+    evaluation. Both modes here use a deterministic, causal stand-in, so they
+    measure the GATE MECHANISM, not Gemini's alpha.
 
 WHAT IS HELD CONSTANT
     Same symbols, same date range, same costs (fees/slippage), same seed, same
-    exit rules. The ONLY difference between arms is the entry gate.
+    exit rules. In engine mode this is guaranteed by the engine itself.
 
 USAGE
-    python -m evaluation.ab_ai_context --symbols AAPL,MSFT --start ... --end ...
+    python -m evaluation.ab_ai_context --mode engine --symbols AAPL,MSFT \\
+        --start 2023-01-02 --end 2024-08-30
 """
 from __future__ import annotations
 
@@ -49,6 +57,8 @@ from settings import get_all_settings  # noqa: E402
 
 # Imported for documentation/contract only: the driver never calls the live API.
 import market_context  # noqa: E402,F401  (documents the contract only)
+
+import backtest.engine as engine_mod  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -70,6 +80,14 @@ def ai_gate_decision(ind: dict) -> str:
     aligned = (ind["last_close"] > ind["ema20"] > ind["ema50"])
     trending = ind["adx"] > 25
     return "allow" if (aligned and trending) else "block"
+
+
+# The engine's own entry rule (backtest/engine.py) already requires
+# ``close > ema20 > ema50 and adx > 25``. The stand-in above tests the same
+# condition, so it can never change which entries the engine takes. This is
+# recorded here so a reader is not misled into reading the engine-mode delta
+# as evidence of alpha.
+STAND_IN_IS_REDUNDANT_WITH_ENGINE = True
 
 
 # --------------------------------------------------------------------------
@@ -200,12 +218,108 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
     return metrics
 
 
-def run_experiment(symbols: list[str], start: str, end: str,
-                   initial: float = 10000.0) -> dict:
-    """Run baseline and AI-gated arms on identical data. No network for AI."""
+def run_engine_arm(symbols_data: dict, spy_df, initial: float,
+                   gate: str) -> dict:
+    """Run ONE arm through the REAL engine, gating entries when gate == "ai".
+
+    The engine source is not modified. The gate is applied by temporarily
+    wrapping ``backtest.engine.compute_signal_score`` so that a blocked entry
+    scores below any threshold; the wrapper is always restored.
+
+    Because the engine decides everything else (cooldown, regime gate, sizing,
+    exits, capital, costs), both arms are identical except for the gate.
+
+    Returns the engine's own result dict plus a ``blocked_entries`` count.
+    """
+    if gate not in ("none", "ai"):
+        raise ValueError(f"gate must be 'none' or 'ai', got {gate!r}")
+
+    original = engine_mod.compute_signal_score
+    blocked = {"n": 0}
+
+    if gate == "ai":
+        def _gated(ind, regime, **kwargs):
+            result = original(ind, regime, **kwargs)
+            if ai_gate_decision(ind) == "block":
+                blocked["n"] += 1
+                result = dict(result)
+                # Below any plausible threshold: the engine's own
+                # ``score >= min_signal_score`` check then rejects the entry.
+                result["score"] = -1.0
+            return result
+        engine_mod.compute_signal_score = _gated
+
+    try:
+        result = engine_mod.simulate_portfolio(
+            symbols_data, spy_df, start_equity=initial,
+            settings=get_all_settings())
+    finally:
+        engine_mod.compute_signal_score = original
+
+    result = dict(result)
+    result["blocked_entries"] = blocked["n"]
+    return result
+
+
+def _engine_arm_metrics(result: dict) -> dict:
+    """Reduce an engine result to the metrics ``compare`` needs."""
+    curve = result.get("equity_curve") or []
+    trades = result.get("trades") or []
+    initial = float(result.get("start_equity", 10000.0))
+    metrics = calculate_metrics(curve, trades, initial)
+    metrics["blocked_entries"] = result.get("blocked_entries", 0)
+    metrics["end_equity"] = result.get("end_equity")
+    return metrics
+
+
+def run_engine_experiment(symbols: list[str], start: str, end: str,
+                          initial: float = 10000.0) -> dict:
+    """Fair A/B through the real engine. No network, no LLM call.
+
+    Both arms share one ``simulate_portfolio`` run each on identical data,
+    settings and costs; the only difference is the entry gate.
+    """
     data = load_multi(symbols, start, end)
     spy = get_spy_for_period(start, end)
-    out = {"start": start, "end": end, "symbols": list(data.keys()), "arms": {}}
+    out = {"mode": "engine", "start": start, "end": end,
+           "symbols": list(data.keys()), "arms": {}}
+    for gate in ("none", "ai"):
+        result = run_engine_arm(data, spy, initial, gate)
+        metrics = _engine_arm_metrics(result)
+        out["arms"][gate] = {
+            "metrics": metrics,
+            "num_trades": len(result.get("trades") or []),
+            "end_equity": result.get("end_equity"),
+            "blocked_entries": result.get("blocked_entries", 0),
+        }
+    return out
+
+
+def compare_engine(result: dict) -> dict:
+    """Delta between the AI-gated and baseline arms of an engine run."""
+    a = result["arms"]["none"]
+    b = result["arms"]["ai"]
+    return {
+        "delta_total_return_pct": round(
+            b["metrics"].get("total_return_pct", 0.0)
+            - a["metrics"].get("total_return_pct", 0.0), 4),
+        "delta_num_trades": b["num_trades"] - a["num_trades"],
+        "delta_max_drawdown_pct": round(
+            b["metrics"].get("max_drawdown_pct", 0.0)
+            - a["metrics"].get("max_drawdown_pct", 0.0), 4),
+        "ai_blocked_entries": b["blocked_entries"],
+        "baseline_trades": a["num_trades"],
+        "ai_trades": b["num_trades"],
+    }
+
+
+def run_experiment(symbols: list[str], start: str, end: str,
+                   initial: float = 10000.0) -> dict:
+    """LEGACY simplified arms (approximate; see module docstring)."""
+    data = load_multi(symbols, start, end)
+    spy = get_spy_for_period(start, end)
+    out = {"mode": "simplified", "start": start, "end": end,
+           "symbols": list(data.keys()), "arms": {}}
     for gate in ("none", "ai"):
         per_symbol = {}
         for sym, df in data.items():
@@ -261,6 +375,9 @@ def compare(result: dict) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description="A/B: baseline vs AI-gated entries")
+    p.add_argument("--mode", choices=("engine", "simplified"), default="engine",
+                   help="engine = real strategy engine (fair, preferred); "
+                        "simplified = legacy approximate replay")
     p.add_argument("--symbols", default="AAPL,MSFT")
     p.add_argument("--start", default="2023-01-02")
     p.add_argument("--end", default="2024-08-30")
@@ -269,26 +386,51 @@ def main():
     args = p.parse_args()
 
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    res = run_experiment(syms, args.start, args.end, args.initial)
-    res["comparison"] = compare(res)
-
     print("=" * 78)
     print("A/B EXPERIMENT (deterministic causal stand-in, NOT a live AI call)")
-    print(f"period {args.start}..{args.end}  symbols={res['symbols']}")
+    print(f"period {args.start}..{args.end}  symbols={syms}  mode={args.mode}")
     print("=" * 78)
-    for arm in ("none", "ai"):
-        a = res["arms"][arm]["aggregate"]
-        label = "baseline" if arm == "none" else "ai-gated"
-        print(f"{label:>9}: mean_ret={a['mean_return_pct']:+7.2f}%  "
-              f"trades={a['total_trades']:3d}  win={a['mean_win_rate_pct']:5.1f}%  "
-              f"worstDD={a['worst_drawdown_pct']:6.2f}%  "
-              f"blocked={a['total_blocked_entries']}")
-    c = res["comparison"]
-    print("-" * 78)
-    print(f"delta: mean_ret={c['delta_mean_return_pct']:+.2f}pp  "
-          f"trades={c['delta_total_trades']:+d}  "
-          f"win={c['delta_mean_win_rate_pct']:+.1f}pp  "
-          f"worstDD={c['delta_worst_drawdown_pct']:+.2f}pp")
+
+    if args.mode == "engine":
+        res = run_engine_experiment(syms, args.start, args.end, args.initial)
+        res["comparison"] = compare_engine(res)
+        for arm in ("none", "ai"):
+            a = res["arms"][arm]
+            label = "baseline" if arm == "none" else "ai-gated"
+            print(f"{label:>9}: ret={a['metrics'].get('total_return_pct', 0.0):+7.2f}%  "
+                  f"trades={a['num_trades']:3d}  end_eq={a['end_equity']}  "
+                  f"blocked={a['blocked_entries']}")
+        c = res["comparison"]
+        print("-" * 78)
+        print(f"delta: ret={c['delta_total_return_pct']:+.2f}pp  "
+              f"trades={c['delta_num_trades']:+d}  "
+              f"maxDD={c['delta_max_drawdown_pct']:+.2f}pp")
+        print("\nNOTE: this ran the REAL engine for both arms (cooldown, regime,"
+              "\nsizing, exits and costs are identical by construction). The "
+              "stand-in gate\nhowever duplicates the engine's own strong_uptrend "
+              "filter, so a zero delta\nhere is EXPECTED and is a plumbing check, "
+              "not evidence of alpha.")
+    else:
+        res = run_experiment(syms, args.start, args.end, args.initial)
+        res["comparison"] = compare(res)
+        for arm in ("none", "ai"):
+            a = res["arms"][arm]["aggregate"]
+            label = "baseline" if arm == "none" else "ai-gated"
+            print(f"{label:>9}: mean_ret={a['mean_return_pct']:+7.2f}%  "
+                  f"trades={a['total_trades']:3d}  win={a['mean_win_rate_pct']:5.1f}%  "
+                  f"worstDD={a['worst_drawdown_pct']:6.2f}%  "
+                  f"blocked={a['total_blocked_entries']}")
+        c = res["comparison"]
+        print("-" * 78)
+        print(f"delta: mean_ret={c['delta_mean_return_pct']:+.2f}pp  "
+              f"trades={c['delta_total_trades']:+d}  "
+              f"win={c['delta_mean_win_rate_pct']:+.1f}pp  "
+              f"worstDD={c['delta_worst_drawdown_pct']:+.2f}pp")
+        print("\nWARNING: 'simplified' mode is an APPROXIMATE replay. It does "
+              "not model\ncooldown, regime gating, position sizing or the "
+              "engine's strong_uptrend\nfilter. Treat these numbers as "
+              "exploratory only — not as the strategy.")
+
     print("\nNOTE: the stand-in is causal but is NOT the Gemini model. This "
           "measures the gate mechanism, not real AI alpha.")
 
