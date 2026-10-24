@@ -414,3 +414,72 @@ def test_print_monte_carlo_never_raises_on_error_payload(payload, capsys):
 
     run_backtest._print_monte_carlo(payload)   # must not raise KeyError
     assert f"skipped: {payload['error']}" in capsys.readouterr().out
+
+
+# ============================================================================
+# 5) Top-level container contract
+# ============================================================================
+
+@pytest.mark.parametrize("bad", [5, 1.5, True, 10**400])
+def test_non_collection_results_is_rejected_with_a_clear_error(bad):
+    """A truthy non-collection top-level argument is a caller error.
+
+    The invalid-window policy covers the *entries* of ``results``; the
+    container itself is the caller's contract. Before this guard, ``5`` raised
+    the incidental ``TypeError: 'int' object is not iterable`` from
+    ``enumerate``. It must now be an explicit, typed rejection naming the type,
+    not an opaque iteration error.
+    """
+    with pytest.raises(ValueError) as ei:
+        aggregate_walkforward(bad)
+    msg = str(ei.value)
+    assert "expects a sized iterable collection" in msg
+    assert type(bad).__name__ in msg
+
+
+def test_one_shot_iterator_is_rejected_not_silently_mis_measured():
+    """A generator cannot satisfy ``len(results)``, so it is rejected clearly.
+
+    The function reports ``num_windows`` via ``len``; a one-shot iterator would
+    either crash on ``len`` or be silently consumed. Rejecting it keeps the
+    container contract explicit instead of raising a confusing ``TypeError``.
+    """
+    gen = (w for w in [{"metrics": {"total_return_pct": 1.0}}])
+    with pytest.raises(ValueError) as ei:
+        aggregate_walkforward(gen)
+    assert "generator" in str(ei.value)
+
+
+@pytest.mark.parametrize("falsy", [[], None, {}, (), 0, "", 0.0, False])
+def test_falsy_results_still_yields_no_windows(falsy):
+    """A falsy top-level value keeps the documented empty-result contract."""
+    assert aggregate_walkforward(falsy) == {"error": "no windows"}
+
+
+def test_collection_container_types_are_still_accepted():
+    """The guard must not reject valid sized, iterable containers of windows."""
+    win = {"window": "ok",
+           "metrics": {"num_trades": 3, "total_return_pct": 10.0, "sharpe": 1.0}}
+
+    as_tuple = aggregate_walkforward((win,))
+    assert as_tuple["num_valid_windows"] == 1
+    assert as_tuple["total_trades"] == 3
+    assert as_tuple["cumulative_return_pct"] == pytest.approx(10.0, abs=0.01)
+
+    as_list = aggregate_walkforward([win])
+    assert as_list["num_windows"] == 1
+    assert as_list["num_valid_windows"] == 1
+
+
+def test_container_guard_does_not_change_entry_level_policy():
+    """Malformed entries still follow the invalid-window policy, not the guard.
+
+    A truthy string is iterable, so it must NOT trip the container guard; its
+    characters are malformed *entries* and contribute nothing.
+    """
+    agg = aggregate_walkforward("x")
+    assert agg["num_windows"] == 1
+    assert agg["num_valid_windows"] == 0
+    assert agg["num_invalid_windows"] == 1
+    assert agg["total_trades"] == 0
+    assert agg["cumulative_return_pct"] == 0.0

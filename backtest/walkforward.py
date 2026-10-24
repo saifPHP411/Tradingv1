@@ -18,7 +18,7 @@ Aggregate:
         cum = Π(1 + r_i / 100); cumulative = (cum - 1) * 100
     It is NOT the arithmetic sum.
 """
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import math
@@ -264,9 +264,23 @@ def aggregate_walkforward(results: list[dict]) -> dict:
     dropped silently), and
     ``num_invalid_windows`` / ``total_trades_invalid_windows`` are surfaced so
     the exclusion is visible rather than implied.
+
+    The invalid-window policy above applies to the *entries* of ``results``.
+    The container itself is the caller's contract: ``results`` must be a sized,
+    iterable collection of window entries (a list, as every caller passes). A
+    falsy value (``[]``, ``None``, ``{}``, ``()``) yields the documented
+    ``{"error": "no windows"}``; a truthy value that is not a collection — a
+    non-iterable such as ``5``, or a one-shot iterator such as a generator that
+    cannot be measured by ``len`` — is a caller error and is rejected with a
+    clear ``ValueError`` instead of the incidental ``TypeError`` that
+    ``enumerate`` / ``len`` used to raise.
     """
     if not results:
         return {"error": "no windows"}
+    if not isinstance(results, Collection):
+        raise ValueError(
+            "aggregate_walkforward expects a sized iterable collection of "
+            f"window result dicts, got {type(results).__name__}")
     import numpy as np
 
     def _window_label(r, idx):
