@@ -31,6 +31,12 @@ def init_db():
         }
         if "analyst_diagnostic" not in decision_columns:
             conn.execute("ALTER TABLE decisions ADD COLUMN analyst_diagnostic TEXT")
+        # Store the technical signal score alongside the LLM confidence. They
+        # are different quantities; keeping both as columns lets the API and UI
+        # show them separately instead of burying the score in the diagnostic
+        # JSON. NULL means "not measured" (e.g. no valid indicators).
+        if "analyst_signal_score" not in decision_columns:
+            conn.execute("ALTER TABLE decisions ADD COLUMN analyst_signal_score REAL")
 
         conn.execute("""CREATE TABLE IF NOT EXISTS equity_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
@@ -95,25 +101,57 @@ def init_db():
 
 
 # ============ Decisions ============
+def _confidence_for_storage(value):
+    """Return a float for storage, or ``None`` (SQL NULL) when not measured.
+
+    A missing or unusable confidence is stored as NULL, not 0.0, so historical
+    and future rows can distinguish "not measured" from a real measured zero.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / +-inf
+        return None
+    return f
+
+
+def _score_for_storage(value):
+    """Return a numeric signal score for storage, or ``None`` (SQL NULL)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def log_decision(state: dict, broker_result: dict | None):
     analyst = state.get("analyst_report") or {}
     risk = state.get("risk_report") or {}
     diagnostic = analyst.get("diagnostic") or {}
+    signal_score = analyst.get("signal_score")
+    if signal_score is None:
+        signal_score = diagnostic.get("signal_score")
     with _conn() as conn:
         conn.execute("""INSERT INTO decisions (timestamp, symbol, analyst_signal,
             analyst_confidence, analyst_reason, risk_approved, risk_veto,
             risk_reason, final_decision, consensus_reached, order_details,
-            broker_result, market_data, analyst_diagnostic)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            broker_result, market_data, analyst_diagnostic, analyst_signal_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             datetime.now(timezone.utc).isoformat(), state.get("symbol"),
-            analyst.get("signal"), float(analyst.get("confidence", 0)),
+            analyst.get("signal"),
+            _confidence_for_storage(analyst.get("confidence")),
             analyst.get("reason", ""), 1 if risk.get("approved") else 0,
             1 if risk.get("veto") else 0, risk.get("reason", ""),
             state.get("final_decision"), 1 if state.get("consensus_reached") else 0,
             json.dumps(state.get("order_details"), ensure_ascii=False) if state.get("order_details") else None,
             json.dumps(broker_result, ensure_ascii=False) if broker_result else None,
             json.dumps(state.get("market_data"), ensure_ascii=False, default=str),
-            json.dumps(diagnostic, ensure_ascii=False, default=str)))
+            json.dumps(diagnostic, ensure_ascii=False, default=str),
+            _score_for_storage(signal_score)))
         conn.commit()
 
 
@@ -125,12 +163,75 @@ def log_equity(equity: float, open_positions: int):
         conn.commit()
 
 
+def _annotate_decision_row(row: dict) -> dict:
+    """Add derived confidence/score fields to a raw decisions row.
+
+    Existing keys are never renamed or retyped, so current clients keep working.
+    The derived keys make the "measured" vs "not measured" distinction explicit
+    for the API and UI:
+
+    ``analyst_confidence_source`` is one of:
+      * ``"placeholder"`` -- a gate decided before the LLM ran, proven by
+        ``analyst_diagnostic.llm_called`` being ``False``. No measurement
+        exists, whether the legacy row stored 0.0 or the fixed code stored NULL;
+      * ``"measured"``    -- the LLM was consulted and supplied a number
+        (0.0 is then a real reading, not a default);
+      * ``"unavailable"`` -- no measurement exists and no gate explains it
+        (e.g. the LLM was called but gave no number, or a legacy NULL);
+      * ``"unknown"``     -- a legacy numeric value with no ``llm_called``
+        evidence either way. Such rows are NOT assumed unavailable.
+
+    ``analyst_confidence_display`` is the number to show, or ``None`` when the
+    value must not be presented as a measurement. A missing value is never
+    displayed as 0.
+    """
+    conf = row.get("analyst_confidence")
+    diagnostic = None
+    raw_diag = row.get("analyst_diagnostic")
+    if isinstance(raw_diag, str) and raw_diag:
+        try:
+            diagnostic = json.loads(raw_diag)
+        except (ValueError, TypeError):
+            diagnostic = None
+    elif isinstance(raw_diag, dict):
+        diagnostic = raw_diag
+
+    llm_called = diagnostic.get("llm_called") if isinstance(diagnostic, dict) else None
+
+    # The evidence decides first: a gate that ran before the LLM explains the
+    # absence of a measurement regardless of what value was stored.
+    if llm_called is False:
+        source = "placeholder"
+    elif llm_called is True:
+        source = "measured" if conf is not None else "unavailable"
+    else:
+        source = "unknown" if conf is not None else "unavailable"
+
+    score = row.get("analyst_signal_score")
+    if score is None and isinstance(diagnostic, dict):
+        score = diagnostic.get("signal_score")
+
+    gate_stage = None
+    if llm_called is False and isinstance(diagnostic, dict):
+        gate_stage = diagnostic.get("stage")
+
+    annotated = dict(row)
+    annotated["analyst_confidence_source"] = source
+    annotated["analyst_confidence_available"] = source in ("measured", "unknown")
+    annotated["analyst_confidence_display"] = (
+        conf if source in ("measured", "unknown") else None)
+    annotated["analyst_signal_score"] = score
+    annotated["analyst_llm_called"] = llm_called
+    annotated["analyst_gate_stage"] = gate_stage
+    return annotated
+
+
 def recent_decisions(limit: int = 50) -> list:
     with _conn() as conn:
         rows = conn.execute(
             "SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_annotate_decision_row(dict(r)) for r in rows]
 
 
 def equity_history(limit: int = 200) -> list:

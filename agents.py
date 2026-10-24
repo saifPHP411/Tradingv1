@@ -11,7 +11,7 @@ from risk_utils import (
     validate_risk_plan, normalize_price_for_symbol,
     whole_share_qty, can_protect_with_stop,
 )
-import json, re
+import json, math, re
 
 _llm_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
 llm = ChatOllama(
@@ -20,13 +20,32 @@ llm = ChatOllama(
 )
 
 
+def _as_confidence(value):
+    """Coerce a confidence to a float in [0, 1], or ``None`` if not measured.
+
+    ``None`` means "no measured confidence" (the LLM was never consulted, or it
+    did not return a usable number). It is deliberately distinct from ``0.0``,
+    which is a real, measured value meaning "no confidence". Conflating the two
+    is what made the dashboard show a placeholder 0% as if it were a reading.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return max(0.0, min(1.0, f))
+
+
 def analyst_agent(state: TradingState) -> dict:
     symbol = state["symbol"]
     data = state.get("market_data") or {}
 
     if not data or "atr14" not in data:
         return {
-            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+            "analyst_report": {"signal": "HOLD", "confidence": None,
                                "reason": "no valid indicators", "signal_score": 0,
                                "regime": "UNKNOWN",
                                "diagnostic": {"stage": "input", "llm_called": False,
@@ -47,7 +66,7 @@ def analyst_agent(state: TradingState) -> dict:
     if sig["score"] < settings["min_signal_score"]:
         reason = f"signal score below threshold ({sig['score']} < {settings['min_signal_score']})"
         return {
-            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+            "analyst_report": {"signal": "HOLD", "confidence": None,
                                "reason": reason, "signal_score": sig["score"],
                                "regime": regime_name,
                                "diagnostic": {"stage": "signal_score", "llm_called": False,
@@ -62,7 +81,7 @@ def analyst_agent(state: TradingState) -> dict:
     if regime_name == "BEAR":
         reason = "BEAR market — no new longs"
         return {
-            "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+            "analyst_report": {"signal": "HOLD", "confidence": None,
                                "reason": reason, "signal_score": sig["score"],
                                "regime": regime_name,
                                "diagnostic": {"stage": "regime", "llm_called": False,
@@ -106,7 +125,7 @@ def analyst_agent(state: TradingState) -> dict:
 
 أجب JSON فقط: {{"signal":"BUY"|"SELL"|"HOLD","confidence":0-1,"reason":"سطر واحد"}}"""
 
-    report = {"signal": "HOLD", "confidence": 0.0, "reason": "LLM invalid"}
+    report = {"signal": "HOLD", "confidence": None, "reason": "LLM invalid"}
     llm_attempts = 0
     llm_status = "invalid_response"
     llm_error_type = None
@@ -115,34 +134,63 @@ def analyst_agent(state: TradingState) -> dict:
         try:
             suffix = "\n\nJSON فقط." if attempt else ""
             resp = llm.invoke(prompt + suffix)
-            report = _parse_llm_json(resp.content)
-            if report.get("signal") in ("BUY", "SELL", "HOLD") and report.get("confidence", 0) > 0:
+            parsed = _parse_llm_json(resp.content)
+            if parsed is not None:
+                # A well-formed reply is accepted even at confidence 0.0: zero
+                # is a valid, measured answer ("no confidence"). Only a reply we
+                # could not parse is retried. Accepting the reply does NOT admit
+                # a trade -- the risk gates and the confidence gate downstream
+                # still run, so BUY/SELL at 0.0 confidence is still vetoed.
+                report = parsed
                 llm_status = "success"
                 break
+            report = {"signal": "HOLD", "confidence": None,
+                      "reason": "invalid JSON"}
         except Exception as e:
             # Do not copy exception text into reports/logs: HTTP clients may
             # include URLs, headers, or other credential-bearing details.
             llm_status = "error"
             llm_error_type = type(e).__name__
-            report = {"signal": "HOLD", "confidence": 0.0,
+            report = {"signal": "HOLD", "confidence": None,
                       "reason": "LLM request failed"}
 
     report["signal_score"] = sig["score"]
     report["regime"] = regime_name
     report["agent"] = "analyst"
+    conf = report.get("confidence")
     report["diagnostic"] = {"stage": "llm", "llm_called": True,
                             "threshold": settings["min_signal_score"],
                             "signal_score": sig["score"],
                             "market_regime": regime_name,
                             "score_components": score_parts,
                             "llm_attempts": llm_attempts,
-                            "llm_status": llm_status}
+                            "llm_status": llm_status,
+                            "confidence_available": conf is not None}
     if llm_error_type:
         report["diagnostic"]["llm_error_type"] = llm_error_type
+    conf_text = f"{conf:.2f}" if conf is not None else "n/a"
     log = (f"المحلل[{symbol}]: {report.get('signal')} "
-           f"conf={report.get('confidence', 0):.2f} "
+           f"conf={conf_text} "
            f"score={sig['score']} regime={regime_name}")
     return {"analyst_report": report, "logs": [log]}
+
+
+def _coerce_confidence_for_gate(value):
+    """Return a float for the risk gate, or ``None`` when it is not a number.
+
+    Unlike the reporting helper this does not clamp to [0, 1] and does not
+    invent a default: a non-numeric confidence yields ``None`` so the gate can
+    fail closed with a clear reason instead of raising on a bad cast.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
 
 
 def risk_manager_agent(state: TradingState) -> dict:
@@ -152,7 +200,7 @@ def risk_manager_agent(state: TradingState) -> dict:
     settings = get_all_settings()
 
     signal = analyst.get("signal", "HOLD")
-    confidence = float(analyst.get("confidence", 0))
+    confidence = _coerce_confidence_for_gate(analyst.get("confidence"))
     signal_score = analyst.get("signal_score", 0)
     regime_name = analyst.get("regime", "UNKNOWN")
 
@@ -161,6 +209,11 @@ def risk_manager_agent(state: TradingState) -> dict:
     if signal == "HOLD":
         return {"risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
                 "logs": [f"مدير المخاطر[{symbol}]: HOLD — analyst returned HOLD"]}
+    # A missing confidence (the LLM was never consulted, or did not supply a
+    # usable number) must fail closed for an actionable signal. It is not
+    # treated as 0.0 for comparison purposes -- it simply cannot pass the gate.
+    if confidence is None:
+        return _veto(symbol, "confidence unavailable")
     if confidence < settings["min_confidence"]:
         return _veto(symbol, f"confidence {confidence:.2f} < {settings['min_confidence']}")
     if signal_score < settings["min_signal_score"]:
@@ -339,20 +392,28 @@ def portfolio_manager_agent(state: TradingState) -> dict:
             "logs": [f"مدير المحفظة[{symbol}]: {decision}"]}
 
 
-def _parse_llm_json(text) -> dict:
+def _parse_llm_json(text):
+    """Parse an LLM reply into a report, or return ``None`` if unusable.
+
+    Returns ``None`` when the text is not a JSON object, or when it cannot be
+    parsed at all. Callers treat ``None`` (the return value) as "retry".
+
+    Signal handling is unchanged from the original contract: a missing or
+    unrecognised signal is coerced to ``HOLD``. Only the ``confidence`` field
+    changed: it is a float in [0, 1] when the model supplied a usable number,
+    and ``None`` when it did not, so "not measured" is no longer stored as 0.0.
+    """
     try:
         if not isinstance(text, str):
             text = str(text)
         m = re.search(r"\{.*\}", text, re.DOTALL)
         data = json.loads(m.group()) if m else json.loads(text)
+        if not isinstance(data, dict):
+            return None
         sig = str(data.get("signal", "HOLD")).upper().strip()
         if sig not in ("BUY", "SELL", "HOLD"):
             sig = "HOLD"
-        try:
-            conf = max(0.0, min(1.0, float(data.get("confidence", 0))))
-        except Exception:
-            conf = 0.0
-        return {"signal": sig, "confidence": conf,
+        return {"signal": sig, "confidence": _as_confidence(data.get("confidence")),
                 "reason": str(data.get("reason", ""))[:200]}
     except Exception:
-        return {"signal": "HOLD", "confidence": 0.0, "reason": "invalid JSON"}
+        return None
