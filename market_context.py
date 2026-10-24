@@ -59,8 +59,7 @@ BIAS_VALUES = ("BULLISH", "BEARISH", "NEUTRAL")
 RISK_VALUES = ("LOW", "MEDIUM", "HIGH")
 
 # The ONLY market features allowed to leave the process. Everything else is
-# dropped before the prompt is built. Keys are the engine's indicator names;
-# values are the (short) labels used in the prompt.
+# dropped before the prompt is built. These are the labels used in the prompt.
 _ALLOWED_MARKET_FIELDS = (
     "last_close",
     "ema20",
@@ -72,7 +71,103 @@ _ALLOWED_MARKET_FIELDS = (
     "bb_bandwidth",
 )
 
+# Accepted input spellings for a prompt label. The engine's indicator dict
+# exposes RSI as ``rsi14`` (see backtest/engine.py:compute_indicators_at),
+# while the prompt uses the shorter ``rsi``. Both are accepted so a caller can
+# pass either the raw engine dict or the canonical label, and the value still
+# reaches the request body.
+_FIELD_ALIASES = {
+    "rsi": ("rsi14", "rsi"),
+}
+
 _MAX_RATIONALE_CHARS = 280
+
+# Hard caps so a malformed or hostile value can never produce an absurd
+# timeout or an unbounded budget. Values outside these ranges are clamped.
+_MAX_TIMEOUT_SECONDS = 120.0
+_MAX_CALLS_PER_MINUTE = 600
+_MAX_CALLS_PER_DAY = 100_000
+
+
+# --------------------------------------------------------------------------
+# Safe coercion (never raises)
+# --------------------------------------------------------------------------
+
+
+def _safe_int(value, default: int, *, minimum: int | None = None,
+              maximum: int | None = None) -> int:
+    """Coerce to int, never raising. Bad input yields ``default``.
+
+    Booleans are rejected (``True`` is not a count). Text is accepted only if
+    it parses as a whole number. The result is clamped to the given bounds.
+    """
+    if isinstance(value, bool):
+        return default
+    result = default
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, float):
+        if value == value and value not in (float("inf"), float("-inf")):
+            result = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                result = int(text, 10)
+            except ValueError:
+                result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _safe_float(value, default: float, *, minimum: float | None = None,
+                maximum: float | None = None) -> float:
+    """Coerce to float, never raising. Bad input yields ``default``."""
+    if isinstance(value, bool):
+        return default
+    result = default
+    if isinstance(value, (int, float)):
+        result = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                result = float(text)
+            except ValueError:
+                result = default
+    if result != result or result in (float("inf"), float("-inf")):
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _safe_flag(value, default: bool = False) -> bool:
+    """Coerce a truthy flag, never raising.
+
+    Accepts real booleans, numbers (``1``/``0``), and the textual forms
+    ``"1"``/``"0"``/``"true"``/``"false"`` (any case). Anything else is
+    ``default`` — so a malformed flag fails closed rather than enabling a
+    feature.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value != value:  # NaN
+            return default
+        return bool(int(value))
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    return default
 
 # --------------------------------------------------------------------------
 # Local usage budget
@@ -197,25 +292,36 @@ def _cfg(settings: dict | None = None) -> dict:
     """Resolve configuration from env (key) and optional settings dict.
 
     The key comes from the environment ONLY. A settings dict can enable/disable
-    and tune limits, but can never supply credentials.
+    and choose the model, but can never supply credentials. This function never
+    raises: a malformed settings object or environment value falls back to a
+    documented default, so a bad value cannot break the caller.
     """
-    s = settings or {}
+    s = settings if isinstance(settings, dict) else {}
+    raw_flag = s.get("ai_context_enabled")
+    if raw_flag is None:
+        raw_flag = os.getenv("AI_CONTEXT_ENABLED", "")
     return {
         "api_key": os.getenv("GEMINI_API_KEY", "") or "",
-        "enabled": bool(int(s.get("ai_context_enabled", 0) or 0)),
+        "enabled": _safe_flag(raw_flag, default=False),
         "model": str(s.get("ai_context_model") or
                      os.getenv("GEMINI_MODEL", "") or DEFAULT_MODEL),
-        "timeout": float(os.getenv("GEMINI_TIMEOUT_SECONDS", "")
-                         or DEFAULT_TIMEOUT_SECONDS),
-        "max_per_minute": int(os.getenv("GEMINI_MAX_CALLS_PER_MINUTE", "")
-                              or DEFAULT_MAX_CALLS_PER_MINUTE),
-        "max_per_day": int(os.getenv("GEMINI_MAX_CALLS_PER_DAY", "")
-                           or DEFAULT_MAX_CALLS_PER_DAY),
+        "timeout": _safe_float(os.getenv("GEMINI_TIMEOUT_SECONDS", ""),
+                               DEFAULT_TIMEOUT_SECONDS,
+                               minimum=1.0, maximum=_MAX_TIMEOUT_SECONDS),
+        "max_per_minute": _safe_int(os.getenv("GEMINI_MAX_CALLS_PER_MINUTE", ""),
+                                    DEFAULT_MAX_CALLS_PER_MINUTE,
+                                    minimum=1, maximum=_MAX_CALLS_PER_MINUTE),
+        "max_per_day": _safe_int(os.getenv("GEMINI_MAX_CALLS_PER_DAY", ""),
+                                 DEFAULT_MAX_CALLS_PER_DAY,
+                                 minimum=1, maximum=_MAX_CALLS_PER_DAY),
     }
 
 
 def is_enabled(settings: dict | None = None) -> bool:
-    """True only when the feature flag is on AND a key is present."""
+    """True only when the feature flag is on AND a key is present.
+
+    Never raises: a malformed settings object or flag reads as disabled.
+    """
     cfg = _cfg(settings)
     return bool(cfg["enabled"] and cfg["api_key"])
 
@@ -231,22 +337,27 @@ def sanitize_market_features(market_data: dict | None) -> dict:
     Anything that is not a finite real number is dropped. This is the single
     choke point that guarantees no account, position, PnL or credential data
     can reach the prompt even if a caller passes a richer dict.
+
+    Input spellings are normalised to the prompt label, so the engine's
+    ``rsi14`` becomes ``rsi`` and is not silently dropped.
     """
     out: dict = {}
     if not isinstance(market_data, dict):
         return out
-    for key in _ALLOWED_MARKET_FIELDS:
-        if key not in market_data:
-            continue
-        val = market_data[key]
-        if isinstance(val, bool):
-            continue
-        if not isinstance(val, (int, float)):
-            continue
-        fval = float(val)
-        if fval != fval or fval in (float("inf"), float("-inf")):  # NaN/Inf
-            continue
-        out[key] = round(fval, 6)
+    for label in _ALLOWED_MARKET_FIELDS:
+        for key in _FIELD_ALIASES.get(label, (label,)):
+            if key not in market_data:
+                continue
+            val = market_data[key]
+            if isinstance(val, bool):
+                continue
+            if not isinstance(val, (int, float)):
+                continue
+            fval = float(val)
+            if fval != fval or fval in (float("inf"), float("-inf")):  # NaN/Inf
+                continue
+            out[label] = round(fval, 6)
+            break
     return out
 
 
@@ -414,7 +525,13 @@ def get_market_context(symbol: str, market_data: dict | None,
         ``advisory_only`` and ``affects_trading``. On any failure,
         ``available`` is False and ``affects_trading`` stays False.
     """
-    cfg = _cfg(settings)
+    try:
+        cfg = _cfg(settings)
+    except Exception:  # _cfg is already safe; this is defence in depth
+        cfg = {"api_key": "", "enabled": False, "model": DEFAULT_MODEL,
+               "timeout": DEFAULT_TIMEOUT_SECONDS,
+               "max_per_minute": DEFAULT_MAX_CALLS_PER_MINUTE,
+               "max_per_day": DEFAULT_MAX_CALLS_PER_DAY}
     model = cfg["model"]
 
     try:
