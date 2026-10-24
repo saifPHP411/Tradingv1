@@ -54,6 +54,7 @@ from backtest.data import load_multi, get_spy_for_period  # noqa: E402
 from backtest.engine import compute_indicators_at  # noqa: E402
 from backtest.metrics import calculate_metrics  # noqa: E402
 from settings import get_all_settings  # noqa: E402
+import execution_costs as ec  # noqa: E402
 
 # Imported for documentation/contract only: the driver never calls the live API.
 import market_context  # noqa: E402,F401  (documents the contract only)
@@ -125,19 +126,13 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
     from execution_costs import (
         entry_fill_price as _entry_fill_impl,
         exit_fill_price as _exit_fill_impl,
-        round_trip_fee as _round_trip_fee,
     )
 
     settings = get_all_settings()
-    fees = float(settings.get("fees_per_share", 0.0))
-    slip_in = float(settings.get("entry_slippage_bps", 0.0))
-    slip_out = float(settings.get("exit_slippage_bps", 0.0))
-    # The canonical cost inputs. This replay must charge the SAME round-trip
-    # cost as backtest/engine.py, so the fill arithmetic is delegated to
-    # execution_costs rather than re-derived here.
-    cost_inputs = {"fees_per_share": fees,
-                   "entry_slippage_bps": slip_in,
-                   "exit_slippage_bps": slip_out}
+    # Resolve the same cost model the engine uses, so both paths charge the
+    # same fee for the same transaction. This replay is long-only, so the entry
+    # is a BUY and the exit is a SELL.
+    cost_inputs, cost_rounding = ec.resolve_engine_costs(settings)
     max_hold = int(settings.get("max_hold_bars", 60))
     min_score = int(settings.get("min_signal_score", 30))
     stop_mult = float(settings.get("stop_atr_multiplier", 2.5))
@@ -213,7 +208,13 @@ def run_arm(symbol: str, df: pd.DataFrame, spy_df: pd.DataFrame | None,
 
         fill_out = _exit_fill_impl(exit_px, False, cost_inputs)
         gross = (fill_out - fill_in) * qty
-        cost = _round_trip_fee(qty, cost_inputs)
+        # Long-only replay: entry is a BUY, exit is a SELL. Charge each side
+        # with the same side-aware model the engine uses, so a sell-only fee is
+        # applied on the exit and never on the entry.
+        cost = (ec.side_fee(qty, fill_in, True, cost_inputs,
+                            rounding=cost_rounding)
+                + ec.side_fee(qty, fill_out, False, cost_inputs,
+                              rounding=cost_rounding))
         net = gross - cost
 
         equity += net

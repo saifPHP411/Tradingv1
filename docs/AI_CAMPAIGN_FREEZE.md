@@ -68,20 +68,23 @@ Marker conventions used below:
 
 `config_snapshot_hash` is the single value that binds the model, `C_MIN`,
 thinking level, token cap, schema version, prompt schema, required fields,
-the three cost inputs and the short-borrow mode. It must be recorded at the
-start of the campaign and must not change during it.
+every cost input, the cost-model version, the regulatory rounding mode and the
+short-borrow mode. It must be recorded at the start of the campaign and must
+not change during it.
 
 At the current defaults the reference hash is:
 
 ```
-2465a88ac2272616b7a3839f93614ebb06e1246bde21141b2fe9d378bf1c7708
+f90fbf5953aa32bfd3219b625b0cc61c7ae44dad0004144d19828942de1cd874
 ```
 
 This value is **illustrative only**. It reflects today's defaults
-(`gemini-3.5-flash-lite`, `minimal`, `1024`, schema `1`, and the cost inputs
-as currently configured). It must be recomputed and re-recorded once the model,
-thinking level, token cap and cost values are decided. It is not a frozen
-campaign hash.
+(`gemini-3.5-flash-lite`, `minimal`, `1024`, schema `1`, cost-model version `2`,
+and the cost inputs as currently configured). It must be recomputed and
+re-recorded once the model, thinking level, token cap and cost values are
+decided. It is not a frozen campaign hash. Note that the cost model was extended
+after this document's first draft, so any earlier recorded value is superseded
+and no longer describes the current model.
 
 ## 1A. Alpaca cost model (audit — documentation only)
 
@@ -515,3 +518,56 @@ must not use campaign symbols or the campaign window.
   risk, or broker-integration file.
 - It does not alter `C_MIN`, `veto_applied`, the fail-open behaviour, or any
   other frozen safety invariant.
+
+## 11. Transaction-aware cost model (implemented, rates unapproved)
+
+`execution_costs.py` now exposes a transaction-aware fee model. It replaces the
+single symmetric per-share fee with named components that can represent the
+real fee shapes. It does **not** claim to match Alpaca's current schedule.
+
+### Components
+
+| Component | Basis | Side | Default |
+|---|---|---|---|
+| `fees_per_share` | per share | both | `0.0` |
+| `sec_fee_rate` | rate x sell notional | sell only | `0.0` |
+| `taf_fee_per_share` | per share | sell only | `0.0` |
+| `taf_max_per_trade` | cap on the TAF charge; `<= 0` = uncapped | sell only | `0.0` |
+| `cat_fee_per_share` | per share | both | `0.0` |
+| `entry_slippage_bps` | bps, direction-signed | both | `5` |
+| `exit_slippage_bps` | bps, direction-signed | both | `5` |
+| short borrow | — | — | `NOT_MODELED` |
+
+### Rounding
+
+`regulatory_rounding` selects `NONE` (legacy) or `UP_TO_CENT`. The TAF cap is
+applied before rounding. `round_up_to_cent` uses `Decimal` so a value such as
+0.206 rounds up to 0.21 rather than down to 0.20, and a non-positive amount
+stays exactly zero.
+
+### Fail-closed
+
+`resolve_cost_inputs(..., strict=True)` raises `CostConfigurationError` when a
+cost setting is missing or malformed. `cost_model_strict` (default `False`)
+selects strict mode for a run. Legacy runs keep the documented zero defaults, so
+existing fixtures are unaffected. Campaign code must set `cost_model_strict`.
+
+### Freezing
+
+`config_snapshot_hash` now binds the cost-model version, every cost input and
+the rounding mode. The previous hash is therefore superseded; any frozen value
+recorded earlier no longer describes the current model.
+
+### Still unresolved (PENDING_USER_DECISION)
+
+- The official SEC, TAF and CAT rates, and the TAF cap.
+- Whether the broker charges a commission at all, and on which sides.
+- The official rounding rule and the account eligibility for each fee.
+- Per-day-per-account fee aggregation and the cent up-rounding it implies.
+- Short borrow rates. Short borrow remains `NOT_MODELED`; a short result is
+  not fully costed.
+
+Until these are confirmed, every rate stays `0.0` and the model must not be
+described as matching Alpaca. The engine and the A/B replay now share the same
+calculation where their scenarios overlap, but the live/paper path still applies
+no cost model, so backtest and paper remain cost-incomparable.

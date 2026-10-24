@@ -351,23 +351,32 @@ fill arithmetic is implemented:
 
 | Function | Meaning |
 |---|---|
-| `COST_SETTING_KEYS` | the three inputs the engine actually consumes |
-| `resolve_cost_inputs(settings)` | extract them safely; never raises |
-| `canonical_cost_inputs(...)` | the canonical, sorted form that gets hashed |
+| `COST_SETTING_KEYS` | the legacy three inputs (commission + both slippage legs) |
+| `FEE_SETTING_KEYS` / `ALL_COST_SETTING_KEYS` | every chargeable component / all of them |
+| `resolve_cost_inputs(settings)` | extract them safely; never raises unless strict |
+| `resolve_cost_inputs(..., strict=True)` | raise `CostConfigurationError` on missing/malformed input |
+| `resolve_cost_options(...)` | the non-numeric options, such as the rounding mode |
+| `resolve_engine_costs(settings)` | the (inputs, rounding) pair a run should use |
+| `canonical_cost_model(...)` | the canonical, sorted form that gets hashed |
 | `entry_fill_price(price, is_buy, inputs)` | entry fill |
 | `exit_fill_price(price, is_buy_exit, inputs)` | exit fill |
-| `entry_fee` / `exit_fee` / `round_trip_fee` | fees per leg and both legs |
+| `side_fee(qty, price, is_buy, inputs, rounding=...)` | one leg's fee, side-aware |
+| `sec_fee` / `taf_fee` / `cat_fee` / `broker_commission` | the named components |
+| `round_up_to_cent(...)` | the regulatory rounding rule |
 | `is_short_borrow_modeled()` | always False today |
 
-The engine is **not** modified. It keeps its inline calls, and a contract test
-asserts those inline calls equal the helpers, so any future drift fails a test
-rather than silently changing results.
+The engine and the A/B replay both charge fees through `side_fee`, so the two
+paths cannot drift on the fee SHAPE. Sizing can still differ, because position
+size depends on equity, which the fees change. The engine's inline fee calls
+are now these helpers rather than a bare per-share multiply.
 
-`evaluation/ab_ai_context.py` now imports the helpers instead of re-deriving
-them, which is what removed the exit-slippage sign bug.
+`evaluation/ab_ai_context.py` imports the helpers instead of re-deriving them,
+which is what removed the exit-slippage sign bug, and now charges the sell-only
+fee on the exit leg only.
 
 A future campaign can therefore use the backtester's cost model by construction:
-there is now one definition of it.
+there is now one definition of it. The rates themselves remain unapproved; see
+`AI_CAMPAIGN_FREEZE.md` section 11.
 
 ## 12. Checklist before the first live Gemini run
 

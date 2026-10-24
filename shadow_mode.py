@@ -158,26 +158,40 @@ def request_body_hash(body: bytes) -> str:
 def config_snapshot_hash(*, model: str, c_min: float, thinking_level: str,
                          max_output_tokens: int, schema_version: int,
                          cost_inputs: dict | None = None,
-                         short_borrow_cost_mode: str | None = None) -> str:
+                         short_borrow_cost_mode: str | None = None,
+                         cost_model_version: int | None = None,
+                         cost_options: dict | None = None) -> str:
     """Hash of everything that must stay frozen for the campaign.
 
     If any of these change, the hash changes, so a later reviewer can prove the
     campaign ran under one configuration.
 
     ``cost_inputs`` covers the execution-cost inputs that change what a round
-    trip costs (fees per share, entry and exit slippage). They belong here
-    because two runs with different costs are different experiments even when
-    the model, prompt and ``C_MIN`` are identical. Passing None yields the
-    neutral defaults, so an old record with no costs still hashes.
+    trip costs (per-share commission, SEC, TAF, CAT, and both slippage legs).
+    They belong here because two runs with different costs are different
+    experiments even when the model, prompt and ``C_MIN`` are identical.
+    Passing None yields the neutral defaults, so an old record with no costs
+    still hashes.
+
+    ``cost_model_version`` records the *meaning* of the cost inputs, so a run
+    under an older cost model cannot be confused with a newer one.
+
+    ``cost_options`` carries non-numeric cost settings such as the regulatory
+    rounding mode, which changes the fee amount and therefore belongs in the
+    snapshot.
 
     ``short_borrow_cost_mode`` records whether short financing was modelled.
     It is part of the snapshot so a campaign cannot quietly claim a cost basis
     it did not use.
     """
-    costs = ec.canonical_cost_inputs(cost_inputs)
+    costs = ec.canonical_cost_model(cost_inputs)
     borrow = (short_borrow_cost_mode
               if short_borrow_cost_mode is not None
               else ec.SHORT_BORROW_COST_MODE)
+    version = (cost_model_version
+               if cost_model_version is not None
+               else ec.COST_MODEL_VERSION)
+    options = ec.resolve_cost_options(cost_options)
     return sha256_hex({
         "model": model,
         "c_min": c_min,
@@ -186,7 +200,9 @@ def config_snapshot_hash(*, model: str, c_min: float, thinking_level: str,
         "schema_version": schema_version,
         "prompt_schema": PROMPT_SCHEMA,
         "required_fields": list(REQUIRED_FIELDS),
+        "cost_model_version": version,
         "cost_inputs": costs,
+        "cost_options": options,
         "short_borrow_cost_mode": borrow,
     })
 
@@ -467,6 +483,8 @@ class ShadowRunner:
             schema_version=SCHEMA_VERSION,
             cost_inputs=ec.resolve_cost_inputs(settings),
             short_borrow_cost_mode=ec.SHORT_BORROW_COST_MODE,
+            cost_model_version=ec.COST_MODEL_VERSION,
+            cost_options=ec.resolve_cost_options(settings),
         )
 
     def _rebuild_features(self, market_data, feature_asof_ts) -> dict:
@@ -606,8 +624,10 @@ class ShadowRunner:
             "prompt_hash": prompt_hash(prompt),
             "request_body_hash": request_body_hash(body),
             "config_snapshot_hash": self._config_hash(cfg, settings),
-            "cost_inputs": ec.canonical_cost_inputs(
+            "cost_model_version": ec.COST_MODEL_VERSION,
+            "cost_inputs": ec.canonical_cost_model(
                 ec.resolve_cost_inputs(settings)),
+            "cost_options": ec.resolve_cost_options(settings),
             "short_borrow_cost_mode": ec.SHORT_BORROW_COST_MODE,
             "git_sha": self._git_sha,
             "request_ts": request_ts,

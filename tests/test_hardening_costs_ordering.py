@@ -178,7 +178,7 @@ def test_b2_cost_inputs_are_canonicalised(log):
     rec = _observe(_runner(log), settings={
         "ai_context_enabled": 1, **COST_SETTINGS,
         "min_signal_score": 70, "take_profit_rr": 2.0})
-    assert set(rec["cost_inputs"]) == set(ec.COST_SETTING_KEYS)
+    assert set(rec["cost_inputs"]) == set(ec.ALL_COST_SETTING_KEYS)
 
 
 def test_b2_current_cost_values_are_unchanged():
