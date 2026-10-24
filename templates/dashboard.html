@@ -333,15 +333,29 @@ async function loadDecisions() {
       const dec = d.final_decision || '—';
       const color = dec.includes('BUY') ? '#34d399' : dec.includes('SELL') ? '#ef4444' : dec.includes('VETO') ? '#fbbf24' : '#94a3b8';
       const time = new Date(d.timestamp).toLocaleString('ar-EG',{hour:'2-digit',minute:'2-digit',month:'short',day:'numeric'});
+      const conf = d.analyst_confidence_display;
+      const confTxt = (conf === null || conf === undefined)
+        ? 'ثقة غير متاحة'
+        : 'ثقة ' + (conf*100).toFixed(0) + '%';
+      const score = d.analyst_signal_score;
+      const scoreTxt = (score === null || score === undefined)
+        ? 'درجة —' : 'درجة ' + score;
+      const stageTxt = d.analyst_llm_called === false
+        ? (d.analyst_gate_stage === 'regime' ? 'سوق هابط'
+           : d.analyst_gate_stage === 'input' ? 'بيانات غير صالحة'
+           : 'درجة الإشارة')
+        : '';
+      const reasonTxt = d.analyst_reason ? String(d.analyst_reason) : '';
       return `<div class="glass p-3 text-xs">
         <div class="flex items-center justify-between mb-1">
           <div class="flex items-center gap-2"><span class="text-slate-500">${time}</span><span class="font-bold">${d.symbol}</span></div>
           <span style="color:${color}" class="font-bold">${dec}</span>
         </div>
         <div class="flex items-center justify-between text-slate-400">
-          <span>ثقة ${(d.analyst_confidence*100).toFixed(0)}%</span>
+          <span>${confTxt} · ${scoreTxt}${stageTxt ? ' · ' + stageTxt : ''}</span>
           ${d.consensus_reached ? '<span style="color:#34d399">✓ إجماع</span>' : '<span style="color:#fbbf24">✗ لا إجماع</span>'}
         </div>
+        ${reasonTxt ? `<div class="mt-1 text-slate-500">${reasonTxt}</div>` : ''}
       </div>`;
     }).join('');
   } catch(e) { console.error(e); }

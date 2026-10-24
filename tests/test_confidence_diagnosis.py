@@ -1,45 +1,46 @@
 """
-Confidence semantics diagnosis (Phase 1.7.1, Task 2).
+Confidence and signal-score representation (Phase 1.7.1, Task 2 -> fix).
 
-These tests PROVE the root cause of "confidence = 0 persists in bot decisions"
-and lock the finding in. They are characterisation tests: they assert the
-current, measured behaviour and do NOT change any signal, threshold, risk rule,
-or trading decision. Nothing here lowers ``min_confidence``, invents a
-confidence value, or produces extra trades.
+The earlier revision of this file proved the defect. This revision locks in
+the FIXED contract. The defect was:
 
-Root cause, established by tracing the value end to end:
+  * Three analyst paths returned HOLD *before the LLM was consulted* and wrote
+    ``confidence = 0.0`` as a placeholder: no valid indicators, signal score
+    below threshold, and BEAR regime. The stored 0.0 was therefore not a
+    measurement at all.
+  * The retry loop accepted a reply only if ``confidence > 0``, so a genuine,
+    well-formed LLM HOLD at confidence 0.0 was retried and recorded as
+    ``invalid_response`` -- identical to a malformed reply.
+  * The template rendered ``analyst_confidence`` unconditionally as a
+    percentage and never read ``analyst_diagnostic``, so a placeholder showed
+    as a measured "0%".
+  * The technical ``signal_score`` had no column, so the UI could not show it.
 
-  1. ``signal_score`` and ``confidence`` are different quantities stored in
-     different places. ``signal_score`` is the deterministic 0-100 technical
-     composite from ``compute_signal_score``. ``confidence`` is the LLM's own
-     self-reported 0-1 number. The decisions table has an
-     ``analyst_confidence`` column but no ``signal_score`` column; the score
-     lives only inside the ``analyst_diagnostic`` JSON blob.
+The fixed contract, asserted below:
 
-  2. Three analyst paths return HOLD *before the LLM is consulted* and hard-code
-     ``confidence = 0.0``: no valid indicators, signal score below threshold,
-     and BEAR regime. In those paths ``confidence`` is a placeholder, not a
-     measurement -- ``diagnostic.llm_called`` is ``False``. Since the score gate
-     is the normal case, this is the usual source of the stored 0.0.
+  * ``confidence`` is ``None`` when not measured, and a float in [0, 1] when it
+    is. ``None`` and ``0.0`` are different: ``0.0`` is a real reading.
+  * A well-formed LLM reply is accepted at any confidence, including 0.0. Only
+    an unparseable reply is retried.
+  * ``signal_score`` is persisted as its own column and returned as its own
+    field, never conflated with ``confidence``.
+  * The API distinguishes ``measured`` / ``placeholder`` / ``unavailable`` /
+    ``unknown`` and never presents a missing value as 0.
+  * Legacy rows with a numeric value and no evidence are ``unknown``; they are
+    NOT relabelled as unavailable.
 
-  3. When the LLM *is* consulted, the retry loop accepts a response only if the
-     signal is valid AND ``confidence > 0``. A genuine LLM HOLD carrying
-     ``confidence = 0.00`` therefore fails the check, is retried, and ends as
-     ``llm_status = "invalid_response"`` with ``confidence = 0.0`` -- identical
-     to a malformed response. "The model said HOLD with zero confidence" and
-     "the model never answered" collapse into the same stored value.
+Nothing here changes a threshold, a risk rule, or an entry condition. A
+BUY/SELL at zero (or missing) confidence is still vetoed downstream. No
+network, no credentials, no broker orders.
 
-  4. The UI renders ``analyst_confidence`` unconditionally as a percentage and
-     never reads ``analyst_diagnostic`` (0 references in the template). So a
-     placeholder 0.0 is displayed as "0%" as though it were a measured
-     confidence, and the diagnostic that would explain it is invisible.
-
-Consequence: the persistent 0% is a semantics/display defect, not a stuck
-trading gate. ``risk_manager_agent`` returns early for HOLD before the
-confidence gate, so a 0.0 confidence never vetoes a HOLD; it only matters for
-BUY/SELL, where 0.0 correctly fails closed.
-
-No network, no credentials, no broker orders.
+Known remaining limitation (documented, NOT silently changed): the exit path in
+``monitor.py`` has its own confidence contract. Its retry loop returns on the
+first parseable reply and defaults a missing confidence to ``0`` in the
+returned dict, and that value gates CLOSE_NOW against
+``llm_exit_min_confidence``. It writes to ``exit_decisions``, never to
+``analyst_confidence``, and it does not surface in the decisions API or the
+dashboard, so it is outside the scope of this fix. Changing it would alter exit
+behaviour, which this task must not do without authorisation.
 """
 import os
 import tempfile
@@ -69,6 +70,11 @@ def _settings(**over):
     return s
 
 
+def _strong_score():
+    return {"score": 85, "trend": 25, "momentum": 20, "rsi": 15, "bb": 8,
+            "volume": 14, "news": 3}
+
+
 class _FakeLLM:
     """Stands in for the external model only; every other path is real."""
 
@@ -84,49 +90,30 @@ class _FakeLLM:
         return _R()
 
 
-# ---------------------------------------------------------------------------
-# 1) confidence and signal_score are distinct quantities
-# ---------------------------------------------------------------------------
-
-def test_signal_score_and_confidence_are_distinct_fields(monkeypatch):
-    """The analyst reports a numeric signal_score alongside an LLM confidence.
-
-    They are not the same number and do not come from the same source.
-    """
-    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
-    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: {
-        "score": 82, "trend": 25, "momentum": 20, "rsi": 15, "bb": 8,
-        "volume": 14, "news": 0,
-    })
-    monkeypatch.setattr(agents, "llm", _FakeLLM(
-        '{"signal":"BUY","confidence":0.55,"reason":"ok"}'))
-
-    report = agents.analyst_agent(
-        {"symbol": "AAA", "market_data": dict(_INDICATORS),
-         "memory_context": ""})["analyst_report"]
-
-    assert report["signal_score"] == 82          # technical composite
-    assert report["confidence"] == pytest.approx(0.55)  # LLM self-report
-    assert report["signal_score"] != report["confidence"]
+def _fresh_db(monkeypatch, name="d.db"):
+    db = Path(tempfile.mkdtemp()) / name
+    monkeypatch.setattr(decision_log, "DB", db)
+    decision_log.init_db()
+    return db
 
 
 # ---------------------------------------------------------------------------
-# 2) the pre-LLM HOLD paths hard-code 0.0 as a placeholder
+# Required case 1: an early HOLD that never consults the LLM
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("label,state,extra", [
+@pytest.mark.parametrize("label,state,extra,stage", [
     ("no valid indicators",
-     {"symbol": "AAA", "market_data": {}, "memory_context": ""}, {}),
+     {"symbol": "AAA", "market_data": {}, "memory_context": ""}, {}, "input"),
     ("signal score below threshold",
      {"symbol": "AAA", "market_data": dict(_INDICATORS), "memory_context": ""},
-     {"score": 12}),
+     {"score": 12}, "signal_score"),
 ])
-def test_pre_llm_hold_paths_report_zero_confidence_placeholder(
-        monkeypatch, label, state, extra):
-    """A HOLD decided before the LLM runs carries confidence 0.0 by default.
+def test_early_hold_without_llm_reports_unavailable_confidence(
+        monkeypatch, label, state, extra, stage):
+    """A HOLD decided before the LLM runs reports confidence None, not 0.0.
 
-    ``diagnostic.llm_called`` is False, which is the only signal that the 0.0
-    is a placeholder rather than a measured value.
+    ``diagnostic.llm_called`` is False, which is the evidence that the value is
+    not a measurement.
     """
     monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
     monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: {
@@ -138,21 +125,19 @@ def test_pre_llm_hold_paths_report_zero_confidence_placeholder(
     report = agents.analyst_agent(state)["analyst_report"]
 
     assert report["signal"] == "HOLD"
-    assert report["confidence"] == 0.0
+    assert report["confidence"] is None
     assert report["diagnostic"]["llm_called"] is False
+    assert report["diagnostic"]["stage"] == stage
     assert agents.llm.calls == 0, "the LLM must not be consulted on this path"
 
 
-def test_bear_gate_reports_zero_confidence_placeholder(monkeypatch):
-    """The BEAR-regime HOLD also returns before the LLM, with confidence 0.0."""
+def test_bear_gate_hold_reports_unavailable_confidence(monkeypatch):
+    """The BEAR-regime HOLD also returns before the LLM, with confidence None."""
     monkeypatch.setattr(agents, "get_all_settings",
                         lambda: _settings(regime_enabled=1))
     monkeypatch.setattr(agents, "get_market_regime", lambda: {"regime": "BEAR"})
     monkeypatch.setattr(agents, "get_news_sentiment", lambda _s: None)
-    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: {
-        "score": 90, "trend": 25, "momentum": 20, "rsi": 15, "bb": 8,
-        "volume": 14, "news": 8,
-    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
     monkeypatch.setattr(agents, "llm", _FakeLLM('{"signal":"BUY","confidence":0.9}'))
 
     report = agents.analyst_agent(
@@ -160,30 +145,24 @@ def test_bear_gate_reports_zero_confidence_placeholder(monkeypatch):
          "memory_context": ""})["analyst_report"]
 
     assert report["signal"] == "HOLD"
-    assert report["confidence"] == 0.0
+    assert report["confidence"] is None
     assert report["diagnostic"]["llm_called"] is False
     assert report["diagnostic"]["stage"] == "regime"
     assert agents.llm.calls == 0
 
 
 # ---------------------------------------------------------------------------
-# 3) a genuine LLM HOLD at zero confidence is indistinguishable from failure
+# Required case 2: a valid LLM HOLD at zero confidence
 # ---------------------------------------------------------------------------
 
-def test_llm_hold_with_zero_confidence_is_treated_as_invalid_response(monkeypatch):
-    """Documents the conflation that produces a misleading 0.0.
+def test_valid_llm_hold_at_zero_confidence_is_accepted(monkeypatch):
+    """A well-formed HOLD at confidence 0.0 is a valid reply, accepted once.
 
-    A well-formed response ``{"signal":"HOLD","confidence":0.0}`` is a valid
-    answer, but the acceptance check requires ``confidence > 0``. The response
-    is therefore retried and finally recorded as ``invalid_response`` with
-    confidence 0.0 -- exactly what a malformed reply produces. This is the
-    limitation to report; the test pins it so a future change is deliberate.
+    Zero is a measured answer meaning "no confidence". It must not be retried
+    and must not be reported as an invalid response.
     """
     monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
-    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: {
-        "score": 85, "trend": 25, "momentum": 20, "rsi": 15, "bb": 8,
-        "volume": 14, "news": 8,
-    })
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
     llm = _FakeLLM('{"signal":"HOLD","confidence":0.0,"reason":"unclear"}')
     monkeypatch.setattr(agents, "llm", llm)
 
@@ -192,24 +171,43 @@ def test_llm_hold_with_zero_confidence_is_treated_as_invalid_response(monkeypatc
          "memory_context": ""})["analyst_report"]
 
     assert report["signal"] == "HOLD"
-    assert report["confidence"] == 0.0
-    assert report["diagnostic"]["llm_called"] is True
-    assert report["diagnostic"]["llm_status"] == "invalid_response"
-    assert report["diagnostic"]["llm_attempts"] == 2
-    assert llm.calls == 2, "the valid-but-zero-confidence reply is retried"
+    assert report["confidence"] == 0.0, "0.0 is a measured value, not None"
+    assert report["confidence"] is not None
+    assert report["diagnostic"]["llm_status"] == "success"
+    assert report["diagnostic"]["llm_attempts"] == 1
+    assert report["diagnostic"]["confidence_available"] is True
+    assert llm.calls == 1, "a valid reply must not be retried"
 
 
-def test_llm_hold_with_nonzero_confidence_is_accepted(monkeypatch):
-    """Control: the same HOLD with confidence > 0 is recorded as success.
+def test_llm_confidence_is_distinct_from_signal_score(monkeypatch):
+    """confidence and signal_score stay separate quantities in the report."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
+    monkeypatch.setattr(agents, "llm", _FakeLLM(
+        '{"signal":"BUY","confidence":0.55,"reason":"ok"}'))
 
-    This isolates confidence (not the HOLD signal) as the discriminator.
+    report = agents.analyst_agent(
+        {"symbol": "AAA", "market_data": dict(_INDICATORS),
+         "memory_context": ""})["analyst_report"]
+
+    assert report["signal_score"] == 85
+    assert report["confidence"] == pytest.approx(0.55)
+    assert report["signal_score"] != report["confidence"]
+
+
+# ---------------------------------------------------------------------------
+# Required case 3: a genuinely invalid LLM reply
+# ---------------------------------------------------------------------------
+
+def test_invalid_llm_reply_is_retried_and_marked_invalid(monkeypatch):
+    """Unparseable output is retried, then recorded as an invalid response.
+
+    The final confidence is None -- "not measured" -- which is now distinct
+    from a valid reply at 0.0.
     """
     monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
-    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: {
-        "score": 85, "trend": 25, "momentum": 20, "rsi": 15, "bb": 8,
-        "volume": 14, "news": 8,
-    })
-    llm = _FakeLLM('{"signal":"HOLD","confidence":0.4,"reason":"mixed"}')
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
+    llm = _FakeLLM("definitely not json")
     monkeypatch.setattr(agents, "llm", llm)
 
     report = agents.analyst_agent(
@@ -217,92 +215,423 @@ def test_llm_hold_with_nonzero_confidence_is_accepted(monkeypatch):
          "memory_context": ""})["analyst_report"]
 
     assert report["signal"] == "HOLD"
-    assert report["confidence"] == pytest.approx(0.4)
-    assert report["diagnostic"]["llm_status"] == "success"
-    assert llm.calls == 1
+    assert report["confidence"] is None
+    assert report["diagnostic"]["llm_status"] == "invalid_response"
+    assert report["diagnostic"]["llm_attempts"] == 2
+    assert report["diagnostic"]["confidence_available"] is False
+    assert llm.calls == 2
+
+
+def test_llm_exception_reports_unavailable_confidence(monkeypatch):
+    """A raised exception yields confidence None and no leaked error text."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
+
+    class BoomLLM:
+        def invoke(self, *a, **k):
+            raise RuntimeError("Authorization: Bearer secret-value")
+
+    monkeypatch.setattr(agents, "llm", BoomLLM())
+    report = agents.analyst_agent(
+        {"symbol": "AAA", "market_data": dict(_INDICATORS),
+         "memory_context": ""})["analyst_report"]
+
+    assert report["confidence"] is None
+    assert report["diagnostic"]["llm_status"] == "error"
+    assert report["diagnostic"]["confidence_available"] is False
+    assert "secret-value" not in str(report)
+
+
+def test_parser_distinguishes_invalid_from_zero_confidence():
+    """The parser returns None for junk, and 0.0 for an explicit zero."""
+    assert agents._parse_llm_json("not json") is None
+    assert agents._parse_llm_json("[]") is None
+    parsed = agents._parse_llm_json('{"signal":"HOLD","confidence":0.0}')
+    assert parsed is not None
+    assert parsed["confidence"] == 0.0
+    missing = agents._parse_llm_json('{"signal":"HOLD"}')
+    assert missing is not None and missing["confidence"] is None
 
 
 # ---------------------------------------------------------------------------
-# 4) the 0.0 reaches the DB, the API and the UI unchanged
+# Required case 4: persistence and retrieval without conflation
 # ---------------------------------------------------------------------------
 
-def test_placeholder_zero_is_persisted_and_rendered_as_zero_percent(monkeypatch):
-    """The stored 0.0 is written verbatim and the template shows "0%".
-
-    The decisions row has no signal_score column, so the UI cannot tell a
-    score-gate HOLD from a low-confidence LLM HOLD.
-    """
-    db = Path(tempfile.mkdtemp()) / "ui.db"
-    monkeypatch.setattr(decision_log, "DB", db)
-    decision_log.init_db()
-
-    state = {
+def test_signal_score_and_confidence_persist_separately(monkeypatch):
+    """Both quantities round-trip through the DB without being mixed."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
         "symbol": "AAA",
-        "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+        "analyst_report": {"signal": "BUY", "confidence": 0.8,
+                           "reason": "trend", "signal_score": 85,
+                           "diagnostic": {"stage": "llm", "llm_called": True,
+                                          "signal_score": 85}},
+        "risk_report": {"approved": True, "veto": False, "reason": "ok"},
+        "final_decision": "EXECUTE_BUY", "consensus_reached": True,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence"] == pytest.approx(0.8)
+    assert row["analyst_signal_score"] == pytest.approx(85)
+    assert row["analyst_confidence"] != row["analyst_signal_score"]
+    assert row["analyst_confidence_source"] == "measured"
+
+
+def test_missing_confidence_is_stored_as_null_not_zero(monkeypatch):
+    """An unmeasured confidence is NULL in the DB, never coerced to 0.0."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": None,
+                           "reason": "signal score below threshold",
+                           "signal_score": 12,
+                           "diagnostic": {"stage": "signal_score",
+                                          "llm_called": False,
+                                          "signal_score": 12}},
+        "risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
+        "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence"] is None
+    assert row["analyst_confidence_source"] == "placeholder"
+    assert row["analyst_confidence_display"] is None
+    assert row["analyst_signal_score"] == pytest.approx(12)
+
+
+def test_signal_score_falls_back_to_diagnostic(monkeypatch):
+    """If signal_score is absent at the top level, the diagnostic supplies it."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": None,
+                           "reason": "x",
+                           "diagnostic": {"stage": "signal_score",
+                                          "llm_called": False,
+                                          "signal_score": 44}},
+        "risk_report": {}, "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_signal_score"] == pytest.approx(44)
+
+
+# ---------------------------------------------------------------------------
+# Required case 5: missing values in the API and the UI
+# ---------------------------------------------------------------------------
+
+def test_api_marks_placeholder_confidence_and_exposes_score(monkeypatch):
+    """The API tells a placeholder apart from a measurement, and shows score."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": None,
                            "reason": "signal score below threshold (12 < 70)",
                            "signal_score": 12,
                            "diagnostic": {"stage": "signal_score",
                                           "llm_called": False,
-                                          "signal_score": 12, "threshold": 70}},
-        "risk_report": {"approved": False, "veto": False,
-                        "reason": "analyst HOLD"},
-        "final_decision": "HOLD", "consensus_reached": False,
-        "market_data": {"last_close": 100.0},
-    }
-    decision_log.log_decision(state, None)
+                                          "signal_score": 12}},
+        "risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
+        "final_decision": "HOLD", "consensus_reached": False, "market_data": {},
+    }, None)
+
     row = decision_log.recent_decisions(1)[0]
-
-    assert row["analyst_confidence"] == 0.0
+    assert row["analyst_confidence_available"] is False
+    assert row["analyst_confidence_display"] is None
+    assert row["analyst_llm_called"] is False
+    assert row["analyst_signal_score"] == pytest.approx(12)
+    # The original keys are untouched, so existing clients keep working.
     assert row["analyst_signal"] == "HOLD"
-    # The technical score is not a column; it is buried in the diagnostic JSON.
-    assert "signal_score" not in row
-    assert '"signal_score": 12' in row["analyst_diagnostic"]
+    assert row["final_decision"] == "HOLD"
 
-    # The template formats analyst_confidence directly and ignores the
-    # diagnostic entirely, so the placeholder renders as a measured "0%".
+
+def test_measured_zero_is_reported_as_measured_zero(monkeypatch):
+    """A genuine 0.0 from the LLM is 'measured' and displayed as 0, not hidden."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": 0.0, "reason": "unclear",
+                           "signal_score": 85,
+                           "diagnostic": {"stage": "llm", "llm_called": True,
+                                          "signal_score": 85}},
+        "risk_report": {}, "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence_source"] == "measured"
+    assert row["analyst_confidence_display"] == 0.0
+    assert row["analyst_confidence_available"] is True
+
+
+def test_template_shows_confidence_and_score_separately():
+    """The dashboard reads the display field and the score field, and never
+    multiplies the raw column (which would show NULL as 0%)."""
     tpl = _TEMPLATE.read_text(encoding="utf-8")
-    assert "d.analyst_confidence*100" in tpl
-    assert "analyst_diagnostic" not in tpl
+    assert "d.analyst_confidence_display" in tpl
+    assert "d.analyst_signal_score" in tpl
+    assert "d.analyst_gate_stage" in tpl
+    assert "ثقة غير متاحة" in tpl
+    assert "d.analyst_confidence*100" not in tpl
+
+
+def test_api_exposes_gate_stage_for_a_pre_llm_hold(monkeypatch):
+    """The gate stage is derived server-side, so the UI need not parse JSON."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": None, "reason": "bear",
+                           "signal_score": 80,
+                           "diagnostic": {"stage": "regime", "llm_called": False,
+                                          "signal_score": 80}},
+        "risk_report": {}, "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_gate_stage"] == "regime"
+    assert row["analyst_llm_called"] is False
+
+
+def test_api_does_not_report_a_gate_stage_when_the_llm_was_called(monkeypatch):
+    """A measured row has no gate stage, so the UI shows no gate label."""
+    _fresh_db(monkeypatch)
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": 0.0, "reason": "unclear",
+                           "signal_score": 85,
+                           "diagnostic": {"stage": "llm", "llm_called": True,
+                                          "signal_score": 85}},
+        "risk_report": {}, "final_decision": "HOLD", "consensus_reached": False,
+        "market_data": {},
+    }, None)
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_gate_stage"] is None
+    assert row["analyst_llm_called"] is True
 
 
 # ---------------------------------------------------------------------------
-# 5) the zero does not itself block trading; the gates stay separate
+# Required case 6: historical rows with zero or missing values
 # ---------------------------------------------------------------------------
 
-def test_hold_returns_before_the_confidence_gate(monkeypatch):
-    """A HOLD with confidence 0.0 is an analyst decision, not a risk veto.
+def test_legacy_numeric_zero_is_not_assumed_unavailable(monkeypatch):
+    """A legacy row with 0.0 and no llm_called evidence stays 'unknown'.
 
-    The confidence gate is never reached for HOLD, so the persistent 0.0 is
-    not what keeps the bot out of trades.
+    We must not claim it was unavailable; the data does not prove that.
     """
-    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    _fresh_db(monkeypatch)
+    with decision_log._conn() as conn:
+        conn.execute(
+            "INSERT INTO decisions (timestamp, symbol, analyst_signal, "
+            "analyst_confidence, analyst_reason, final_decision) "
+            "VALUES (?,?,?,?,?,?)",
+            ("2025-01-01T00:00:00+00:00", "OLD", "HOLD", 0.0, "legacy", "HOLD"))
+        conn.commit()
 
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence"] == 0.0
+    assert row["analyst_confidence_source"] == "unknown"
+    assert row["analyst_confidence_available"] is True
+    assert row["analyst_confidence_display"] == 0.0
+    assert row["analyst_signal_score"] is None
+
+
+def test_legacy_null_confidence_is_unavailable(monkeypatch):
+    """A legacy row whose confidence is NULL is reported unavailable."""
+    _fresh_db(monkeypatch)
+    with decision_log._conn() as conn:
+        conn.execute(
+            "INSERT INTO decisions (timestamp, symbol, analyst_signal, "
+            "analyst_confidence, analyst_reason, final_decision) "
+            "VALUES (?,?,?,?,?,?)",
+            ("2025-01-01T00:00:00+00:00", "OLD", "HOLD", None, "legacy", "HOLD"))
+        conn.commit()
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence"] is None
+    assert row["analyst_confidence_source"] == "unavailable"
+    assert row["analyst_confidence_display"] is None
+
+
+def test_migration_adds_signal_score_column_to_existing_db(monkeypatch):
+    """init_db() adds analyst_signal_score to a pre-existing decisions table."""
+    db = Path(tempfile.mkdtemp()) / "legacy.db"
+    monkeypatch.setattr(decision_log, "DB", db)
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, symbol TEXT,
+            analyst_signal TEXT, analyst_confidence REAL, analyst_reason TEXT,
+            risk_approved INTEGER, risk_veto INTEGER, risk_reason TEXT,
+            final_decision TEXT, consensus_reached INTEGER,
+            order_details TEXT, broker_result TEXT, market_data TEXT)""")
+        conn.commit()
+
+    decision_log.init_db()  # must migrate, not raise
+
+    with decision_log._conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(decisions)")}
+    assert "analyst_signal_score" in cols
+    assert "analyst_diagnostic" in cols
+
+
+def test_annotation_tolerates_corrupt_diagnostic_json(monkeypatch):
+    """A row with unparseable diagnostic JSON still annotates without error."""
+    _fresh_db(monkeypatch)
+    with decision_log._conn() as conn:
+        conn.execute(
+            "INSERT INTO decisions (timestamp, symbol, analyst_confidence, "
+            "analyst_diagnostic, final_decision) VALUES (?,?,?,?,?)",
+            ("2025-01-01T00:00:00+00:00", "OLD", 0.5, "{not json", "HOLD"))
+        conn.commit()
+
+    row = decision_log.recent_decisions(1)[0]
+    assert row["analyst_confidence_source"] == "unknown"
+    assert row["analyst_confidence_display"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Required case 7: entry threshold and risk rules unchanged
+# ---------------------------------------------------------------------------
+
+def test_hold_still_returns_before_the_confidence_gate(monkeypatch):
+    """HOLD remains an analyst decision, not a confidence veto."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
     out = agents.risk_manager_agent({
         "symbol": "AAA", "market_data": dict(_INDICATORS),
-        "analyst_report": {"signal": "HOLD", "confidence": 0.0,
+        "analyst_report": {"signal": "HOLD", "confidence": None,
                            "signal_score": 95, "regime": "BULL"},
     })["risk_report"]
-
     assert out["approved"] is False
     assert out["veto"] is False
     assert out["reason"] == "analyst HOLD"
 
 
-def test_confidence_gate_still_fails_closed_for_non_hold(monkeypatch):
-    """For a BUY, zero confidence is still vetoed. That behaviour is unchanged.
-
-    This confirms the diagnosis targets reporting, not the entry gate: the gate
-    uses the LLM's confidence for actionable signals, and low confidence must
-    keep failing closed.
-    """
+def test_missing_confidence_vetoes_an_actionable_signal(monkeypatch):
+    """A BUY with no measured confidence fails closed."""
     monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    out = agents.risk_manager_agent({
+        "symbol": "AAA", "market_data": dict(_INDICATORS),
+        "analyst_report": {"signal": "BUY", "confidence": None,
+                           "signal_score": 95, "regime": "BULL"},
+    })["risk_report"]
+    assert out["approved"] is False
+    assert out["veto"] is True
+    assert out["reason"] == "confidence unavailable"
 
+
+def test_low_confidence_still_vetoed_against_the_same_threshold(monkeypatch):
+    """The min_confidence gate is unchanged: 0.0 < 0.7 is still a veto."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
     out = agents.risk_manager_agent({
         "symbol": "AAA", "market_data": dict(_INDICATORS),
         "analyst_report": {"signal": "BUY", "confidence": 0.0,
                            "signal_score": 95, "regime": "BULL"},
     })["risk_report"]
+    assert out["veto"] is True
+    assert "confidence 0.00 < 0.7" in out["reason"]
 
+
+def test_accepting_a_zero_confidence_reply_does_not_bypass_risk_gates(monkeypatch):
+    """End to end: a valid LLM BUY at 0.0 is accepted by the analyst but still
+    vetoed by the risk manager. Accepting the reply admits no trade."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
+    monkeypatch.setattr(agents, "llm", _FakeLLM(
+        '{"signal":"BUY","confidence":0.0,"reason":"weak"}'))
+
+    report = agents.analyst_agent(
+        {"symbol": "AAA", "market_data": dict(_INDICATORS),
+         "memory_context": ""})["analyst_report"]
+    assert report["signal"] == "BUY"
+    assert report["confidence"] == 0.0
+
+    risk = agents.risk_manager_agent({
+        "symbol": "AAA", "market_data": dict(_INDICATORS),
+        "analyst_report": report,
+    })["risk_report"]
+    assert risk["approved"] is False
+    assert risk["veto"] is True
+
+
+# ---------------------------------------------------------------------------
+# Required case 8: no broker orders during these tests
+# ---------------------------------------------------------------------------
+
+def test_no_broker_order_is_submitted(monkeypatch):
+    """A tripwire on the broker client: these tests must never trade."""
+    import broker
+
+    def _forbidden(*a, **k):
+        raise AssertionError("a broker order was submitted during the tests")
+
+    for name in dir(broker):
+        if name.startswith("execute"):
+            monkeypatch.setattr(broker, name, _forbidden, raising=False)
+
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
+    monkeypatch.setattr(agents, "llm", _FakeLLM(
+        '{"signal":"BUY","confidence":0.9,"reason":"ok"}'))
+    agents.analyst_agent({"symbol": "AAA", "market_data": dict(_INDICATORS),
+                          "memory_context": ""})
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the real FastAPI app, not just the helpers
+# ---------------------------------------------------------------------------
+
+def test_real_api_endpoint_exposes_separated_fields(monkeypatch, tmp_path):
+    """The live /api/decisions endpoint returns confidence and score apart, and
+    the dashboard page still renders. Exercises the real app object."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "api.db"))
+    monkeypatch.setenv("GRAPH_DB_PATH", str(tmp_path / "graph.db"))
+    monkeypatch.setattr(decision_log, "DB", tmp_path / "api.db")
+    decision_log.init_db()
+    decision_log.log_decision({
+        "symbol": "AAA",
+        "analyst_report": {"signal": "HOLD", "confidence": None,
+                           "reason": "signal score below threshold (12 < 70)",
+                           "signal_score": 12,
+                           "diagnostic": {"stage": "signal_score",
+                                          "llm_called": False, "signal_score": 12}},
+        "risk_report": {"approved": False, "veto": False, "reason": "analyst HOLD"},
+        "final_decision": "HOLD", "consensus_reached": False, "market_data": {},
+    }, None)
+
+    import app as appmod
+    from fastapi.testclient import TestClient
+
+    client = TestClient(appmod.app)
+    resp = client.get("/api/decisions?limit=5")
+    assert resp.status_code == 200
+    row = resp.json()[0]
+    assert row["analyst_confidence"] is None
+    assert row["analyst_confidence_source"] == "placeholder"
+    assert row["analyst_confidence_display"] is None
+    assert row["analyst_signal_score"] == pytest.approx(12)
+    assert row["analyst_gate_stage"] == "signal_score"
+    # Backward compatibility: the original keys are still present.
+    assert row["analyst_signal"] == "HOLD"
+    assert row["final_decision"] == "HOLD"
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "analyst_confidence_display" in page.text
+
+
+def test_non_numeric_confidence_fails_closed_without_crashing(monkeypatch):
+    """A malformed confidence on an actionable signal is vetoed, not a crash."""
+    monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
+    out = agents.risk_manager_agent({
+        "symbol": "AAA", "market_data": dict(_INDICATORS),
+        "analyst_report": {"signal": "BUY", "confidence": "not-a-number",
+                           "signal_score": 95, "regime": "BULL"},
+    })["risk_report"]
     assert out["approved"] is False
     assert out["veto"] is True
-    assert "confidence" in out["reason"]
+    assert out["reason"] == "confidence unavailable"
