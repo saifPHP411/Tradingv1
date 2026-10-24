@@ -145,6 +145,21 @@ borrow cost for shorts, and no spread model beyond the fixed-bps slippage.
 | Do short and long pay the same? | Yes. The same `fees_per_share` and the same bps are used; only the slippage *sign* differs. There is no borrow cost, so shorts are in fact modelled as cheaper than reality. |
 | Do backtester and forward/paper use the same model? | **No.** The backtester applies costs. The live/paper path (`monitor.py`, `broker.py`, `app.py`, `main.py`, `backtester.py`) contains **no** reference to fees or slippage at all — costs there are whatever the broker does. |
 
+### Alpaca-specific confirmation (documentation only)
+
+Two official statements sharpen the two rows above. See
+`docs/AI_CAMPAIGN_FREEZE.md` §1A for the full audit and source URLs.
+
+- **Commission is conditional.** Alpaca's disclosure scopes commission-free
+  trading to *self-directed individual cash* accounts trading *US-listed
+  securities through an API*; partner-established accounts and non-retail flow
+  may differ. The user's account eligibility is unconfirmed, so a zero-commission
+  assumption is `PENDING_USER_DECISION`, not a fact.
+- **Paper does not reproduce these costs.** Alpaca states paper trading does not
+  account for regulatory fees (along with market impact, latency slippage, queue
+  position and price improvement). That is the forward/paper row above, confirmed
+  by the broker.
+
 ### Measured impact on the A==C fixture (8 trades)
 
 | Scenario | End equity | Delta |
@@ -176,27 +191,37 @@ slippage path already works. `FEES_PER_SHARE` was **not** changed by this audit.
 
 ## 5. Proposed campaign cost model (not applied)
 
+> **Superseded in part by the Alpaca audit in
+> `docs/AI_CAMPAIGN_FREEZE.md` §1A.** The earlier "$0.005 per share,
+> Alpaca-style per-share commission" row below was a *placeholder guess* made
+> before the broker's official schedule was read. It must not be used. Alpaca's
+> commission is **conditional on account type**, and its regulatory fees
+> (SEC / FINRA TAF / CAT) are **separate components with their own basis**, not
+> a flat per-share commission. Treat the row below as withdrawn.
+
 Explicit, freezable, and expressible in the existing settings keys so no code
 change is needed beyond the constant above.
 
 | Component | Proposed value | Where it lives | Rationale |
 |---|---|---|---|
-| Per-share fee | $0.005 | `FEES_PER_SHARE` | Alpaca-style per-share commission; applies on entry and exit |
+| Per-share fee | **withdrawn — see freeze doc §1A** | `FEES_PER_SHARE` | was a placeholder; real treatment is conditional commission plus separately-based regulatory fees |
 | Entry slippage | 5 bps | `ENTRY_SLIPPAGE_BPS` | unchanged; conservative for liquid large caps |
 | Exit slippage | 5 bps | `EXIT_SLIPPAGE_BPS` | unchanged; symmetric |
 | Short borrow cost | **not modelled** | — | must be stated as a limitation, not hidden |
 | Spread beyond slippage | **not modelled** | — | folded into the bps assumption |
-| Regulatory fees | **not modelled** | — | small; state as a limitation |
+| Regulatory fees | **not modelled** | — | must be recorded as fee *types* with their own basis, not as a flat per-share number |
 
-Freeze requirements: the four values above, recorded in the campaign's
-`config_snapshot_hash`, which already covers `C_MIN`, model, thinking level,
-token cap and schema. Costs are **not** currently part of that hash; the
-campaign must record the cost values alongside it (see blocker B2).
+Freeze requirements: the cost values, recorded in the campaign's
+`config_snapshot_hash`. Costs are **now part of that hash** (blocker B2 was
+fixed in the hardening pass: the hash covers `fees_per_share`,
+`entry_slippage_bps`, `exit_slippage_bps` and `short_borrow_cost_mode`), and
+each Shadow record also stores the `cost_inputs` it used.
 
 Two honest caveats:
 
-- A $0.005/share fee is a *choice*, not a measurement. It must be justified
-  against the broker's actual schedule before the run, and written down.
+- A per-share fee is a *choice*, not a measurement. It must be justified
+  against the broker's actual schedule before the run, and written down. The
+  current placeholder `0.0` must not be carried forward unexamined.
 - Shorts genuinely cost more (borrow). If the campaign trades shorts, the
   result is optimistic by an unquantified amount, and the report must say so.
 
@@ -289,13 +314,13 @@ deliberate omission.
 
 | # | Blocker | Why it blocks | Suggested resolution (needs approval) |
 |---|---|---|---|
-| B1 | Cost model is not campaign-realistic (`FEES_PER_SHARE = 0.0`) | Understates per-trade cost, which flatters any filter that removes trades | Set the per-share fee deliberately; freeze it. **Still open — no value chosen** |
+| B1 | Cost model is not campaign-realistic (`FEES_PER_SHARE = 0.0`) | Understates per-trade cost, which flatters any filter that removes trades | Set the per-share fee deliberately; freeze it. **Still open — no value chosen.** Alpaca commission is conditional on account type and regulatory fees are separate components; see `docs/AI_CAMPAIGN_FREEZE.md` §1A |
 | B2 | ~~Costs are outside `config_snapshot_hash`~~ | — | **FIXED.** The hash now covers fees, both slippage legs and the short-borrow mode; each record also stores its cost inputs |
 | B3 | ~~Timestamp ordering is recorded, not enforced~~ | — | **FIXED.** `observe()` raises `ShadowOrderingError` before any call or write |
 | B4 | ~~No `feature_source` wired~~ | — | **CONTRACT FIXED.** Documented and tested; mismatch is flagged and diagnosed. A real source is still the runner's job (B5) |
 | B5 | No campaign runner | Nothing can start a run | Build it only after B1 and the freeze list are agreed |
 | B6 | Live-API facts unverified | Whether the model accepts `thinkingConfig`, and whether 1024 tokens suffices, is unknown | One manual, watched smoke call before the campaign |
-| B7 | Short borrow cost not modelled | Short results are optimistic by an unquantified amount | **DOCUMENTED, not modelled.** Every record carries `short_borrow_cost_mode = "NOT_MODELED"`. See the long-only proposal below |
+| B7 | Short borrow cost not modelled | Short results are optimistic by an unquantified amount | **DOCUMENTED, not modelled.** Every record carries `short_borrow_cost_mode = "NOT_MODELED"`. Alpaca charges $0 borrow on easy-to-borrow shares and does not currently offer shorting in hard-to-borrow names, which bounds the omission but does not remove it. See the long-only proposal below |
 | B8 | ~~Backtester and live/paper cost models differ~~ | — | **FIXED for the two code paths that exist.** A shared `execution_costs` module; the replay delegates to it. The live/paper path still applies no cost of its own (B8b) |
 | B8b | The live/paper path applies no cost model at all | A forward result is whatever the broker charges, not what the backtest assumed | Out of scope for this pass; must be documented, never silently equated with the backtest |
 | B9 | Symbol set, window `T0`, primary metric not chosen | No pre-registration is possible yet | Decide and freeze before the run |
