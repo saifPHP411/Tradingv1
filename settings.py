@@ -31,6 +31,8 @@ from config import (
     EXIT_SLIPPAGE_BPS as C_EXIT_SLIPPAGE,
     MAX_HOLD_BARS as C_MAX_HOLD,
     ENABLE_SHORT as C_ENABLE_SHORT,
+    AI_CONTEXT_ENABLED as C_AI_CONTEXT_ENABLED,
+    GEMINI_MODEL as C_GEMINI_MODEL,
     get_trading_mode,
 )
 
@@ -70,6 +72,10 @@ DEFAULTS = {
     "trading_capital": "0",
     "regime_enabled": "1",
     "news_enabled": "1",
+    # AI market context is ADVISORY-ONLY and OFF by default. It is not read by
+    # the strategy, execution engine or risk sizing.
+    "ai_context_enabled": "1" if C_AI_CONTEXT_ENABLED else "0",
+    "ai_context_model": C_GEMINI_MODEL,
 }
 
 # Keys from old versions that MUST NOT influence trading anymore.
@@ -169,6 +175,9 @@ def get_all_settings() -> dict:
         "trading_capital": float(get_setting("trading_capital")),
         "regime_enabled": int(get_setting("regime_enabled")),
         "news_enabled": int(get_setting("news_enabled")),
+        # Advisory-only AI context. Not consumed by strategy/execution/risk.
+        "ai_context_enabled": int(get_setting("ai_context_enabled")),
+        "ai_context_model": get_setting("ai_context_model"),
         # explicit flags
         "dry_run": is_dry_run(),
         "trading_mode": get_trading_mode(),

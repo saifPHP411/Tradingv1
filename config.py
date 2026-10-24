@@ -16,6 +16,13 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
+# ============ Gemini AI market context (OPTIONAL, ADVISORY, OFF BY DEFAULT) ============
+# The API key is read from the environment only; it is never stored in code.
+# The feature is disabled unless explicitly enabled here AND a key is present.
+# It is advisory-only and is NOT wired into strategy/execution/risk.
+AI_CONTEXT_ENABLED = os.getenv("AI_CONTEXT_ENABLED", "false").lower() == "true"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
 # ============ Trading Mode — SINGLE SOURCE ============
 # BACKTEST: no broker calls (used by backtester/engine)
 # PAPER:    Alpaca Paper Trading — targets the paper endpoint, CAN submit
