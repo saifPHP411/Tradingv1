@@ -563,22 +563,49 @@ def test_accepting_a_zero_confidence_reply_does_not_bypass_risk_gates(monkeypatc
 # ---------------------------------------------------------------------------
 
 def test_no_broker_order_is_submitted(monkeypatch):
-    """A tripwire on the broker client: these tests must never trade."""
+    """Tripwire: the analyst flow must not reach an order-submitting broker
+    entry point.
+
+    The earlier revision of this test had no assertion and exercised only
+    ``analyst_agent``, which never imports ``broker`` -- so it could not fail.
+    This version guards the real entry points, self-checks that the tripwire
+    actually fires, and asserts the flow produced a signal, so the test fails
+    if it stops exercising anything.
+    """
     import broker
 
+    calls = []
+
     def _forbidden(*a, **k):
+        calls.append(1)
         raise AssertionError("a broker order was submitted during the tests")
 
-    for name in dir(broker):
-        if name.startswith("execute"):
-            monkeypatch.setattr(broker, name, _forbidden, raising=False)
+    entry_points = [
+        "execute_order", "_submit_entry", "_submit_stop",
+        "_attach_protection", "_emergency_close_and_verify", "move_broker_stop",
+    ]
+    guarded = [name for name in entry_points if hasattr(broker, name)]
+    assert guarded, "no broker order entry points found to guard"
+    for name in guarded:
+        monkeypatch.setattr(broker, name, _forbidden)
+
+    # Self-check: the tripwire must actually fire when a guarded point is hit,
+    # otherwise this test would silently stop protecting anything.
+    with pytest.raises(AssertionError):
+        getattr(broker, guarded[0])()
+    calls.clear()
 
     monkeypatch.setattr(agents, "get_all_settings", lambda: _settings())
     monkeypatch.setattr(agents, "compute_signal_score", lambda *a, **k: _strong_score())
     monkeypatch.setattr(agents, "llm", _FakeLLM(
         '{"signal":"BUY","confidence":0.9,"reason":"ok"}'))
-    agents.analyst_agent({"symbol": "AAA", "market_data": dict(_INDICATORS),
-                          "memory_context": ""})
+    report = agents.analyst_agent({"symbol": "AAA",
+                                   "market_data": dict(_INDICATORS),
+                                   "memory_context": ""})["analyst_report"]
+
+    # The flow really ran (a real signal), and it never reached the broker.
+    assert report["signal"] == "BUY"
+    assert calls == [], "the analyst flow reached a broker order entry point"
 
 
 # ---------------------------------------------------------------------------
